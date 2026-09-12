@@ -52,7 +52,9 @@ from __future__ import annotations
 import contextlib
 import os
 import socket
+import sys
 import traceback
+import urllib.parse
 from typing import Any, Callable, Iterator, Optional
 
 
@@ -117,6 +119,33 @@ def _refuse(what: str, detail: str) -> "LiveProviderCallBlocked":
     )
 
 
+def _request_target() -> str:
+    """Recover the intended HTTP host when DNS is resolving a proxy.
+
+    urllib resolves the configured proxy rather than the request host.  Naming
+    only that proxy made the fail-closed diagnostic conceal which billable
+    endpoint the test was attempting to reach.  Walk only the active call
+    stack and retain only a hostname, never a path, query, or credential.
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        for value in frame.f_locals.values():
+            try:
+                get_url = getattr(value, "get_full_url", None)
+            except BaseException:
+                continue
+            if not callable(get_url):
+                continue
+            try:
+                hostname = urllib.parse.urlsplit(get_url()).hostname
+            except BaseException:
+                continue
+            if hostname and not _is_loopback(hostname):
+                return hostname
+        frame = frame.f_back
+    return ""
+
+
 class _Guard:
     """Installed process-wide for the duration of a suite."""
 
@@ -131,8 +160,10 @@ class _Guard:
 
         def getaddrinfo(host, port, *args, **kwargs):
             if not _is_loopback(host):
+                target = _request_target()
+                suffix = f"; request target {target}" if target and target != host else ""
                 raise _refuse("resolve a remote provider host",
-                              f"getaddrinfo {host}:{port}")
+                              f"getaddrinfo {host}:{port}{suffix}")
             return real_getaddrinfo(host, port, *args, **kwargs)
 
         def connect(sock, address):
