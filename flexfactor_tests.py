@@ -5,6 +5,7 @@ Run:  python flexfactor_tests.py
 Uses the hermetic module-load pattern: register the module in sys.modules
 BEFORE exec_module, or @dataclass with future annotations dies at import.
 """
+import argparse
 import contextlib
 import hashlib
 import importlib.util
@@ -1636,6 +1637,30 @@ class RotationDefaultProviderTests(unittest.TestCase):
         self.assertEqual(ids, {"groq/llama-x"})
         self.assertNotIn("builtin/openai-gpt-5-6-sol", ids)
         self.assertNotIn("builtin/anthropic-fable-5-1", ids)
+
+    def test_sensitive_repository_filters_cloud_routes_before_selection(self):
+        self._write_catalog([self._route("groq/llama-x"),
+                             self._route("ollama/qwen-local", api="ollama", auth_env=None)])
+        class LocalArgs(self.Args):
+            _source_local_only = True
+        with mock.patch.object(ff, "_route_unusable_reason", return_value=""):
+            provider = ff._build_rotating_provider(LocalArgs, None, "best", quiet=True)
+        self.assertIsNotNone(provider)
+        self.assertEqual([r.api for r in provider.rotator.catalog.routes], ["ollama"])
+        self.assertIs(provider.payload_guard, ff._egress_gate)
+
+    def test_sensitive_repository_never_falls_back_to_only_cloud_capacity(self):
+        self._write_catalog([self._route("groq/llama-x")])
+        class LocalArgs(self.Args):
+            _source_local_only = True
+        self.assertIsNone(ff._build_rotating_provider(LocalArgs, None, "best", quiet=True))
+
+    def test_local_factory_uses_the_endpoint_that_the_catalog_health_probe_checks(self):
+        import flexfactor_rotation as fr
+        raw = self._route("ollama/qwen-local", api="ollama", auth_env=None)
+        raw["base_url"] = "http://127.0.0.1:54321"
+        provider = ff._rotation_route_provider(fr.Route.from_json(raw))
+        self.assertEqual(provider.base_url, raw["base_url"])
 
     def test_ai_time_exhausted_route_is_not_selectable(self):
         import flexfactor_rotation as fr
@@ -10390,6 +10415,95 @@ class EgressScanTests(unittest.TestCase):
                                    return_value=os.path.join(_HERE, "no-such-dir")):
                 self.assertEqual(self.eg._load_policy_allow(),
                                  set(self.eg.ALL_CATEGORIES))
+
+
+class RepositorySourceClassificationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        subprocess.run(["git", "init", "-q", self.root], check=True)
+        self.secret = "creds: AKIAJQ7WZ5X2K9V4M3TN"
+        self.policy = mock.patch.object(ff._egress, "_load_policy_allow", return_value=set())
+        self.policy.start()
+        self.addCleanup(self.policy.stop)
+
+    def write(self, rel, text):
+        path = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_secret_outside_selected_source_makes_the_whole_repository_local(self):
+        self.write("main.py", "print('hello')\n")
+        self.write(".config/unusual.data", self.secret)
+        args = argparse.Namespace(file="main.py")
+        scoped = ff._model_args_for_repository(args, self.root)
+        self.assertTrue(scoped._source_local_only)
+        self.assertFalse(hasattr(args, "_source_local_only"))
+        self.assertEqual(scoped._source_classification["classification"], "sensitive")
+        self.assertNotIn(self.secret, json.dumps(scoped._source_classification))
+
+    def test_ordinary_source_keeps_the_normal_ladder(self):
+        self.write("main.py", "print('hello')\n")
+        scoped = ff._model_args_for_repository(argparse.Namespace(), self.root)
+        self.assertFalse(scoped._source_local_only)
+        self.assertEqual(scoped._source_classification["classification"], "ordinary")
+
+    def test_incomplete_classification_is_local_and_never_assumed_ordinary(self):
+        self.write("main.py", "print('hello')\n")
+        with mock.patch.object(ff, "_read_complete_structural_text", return_value=(None, "unreadable")):
+            scoped = ff._model_args_for_repository(argparse.Namespace(), self.root)
+        self.assertTrue(scoped._source_local_only)
+        self.assertEqual(scoped._source_classification["classification"], "unknown")
+
+    def test_failed_git_inventory_cannot_hide_sensitive_vendor_files(self):
+        self.write("main.py", "print('hello')\n")
+        self.write("vendor/settings.txt", self.secret)
+        with mock.patch.object(ff, "_git_real_files", return_value=None):
+            scoped = ff._model_args_for_repository(argparse.Namespace(), self.root)
+        self.assertTrue(scoped._source_local_only)
+        self.assertEqual(scoped._source_classification["classification"], "unknown")
+
+    def test_generated_research_queries_never_bypass_the_egress_gate(self):
+        competitors = ff._competitors_module()
+        with mock.patch.object(ff, "EGRESS_MODE", "block"), \
+             mock.patch.object(ff.urllib.request, "urlopen") as outbound, \
+             mock.patch.object(competitors, "_WEB_BACKENDS", (("record", outbound),)):
+            with self.assertRaises(ff.EgressBlockedError):
+                ff.repo_rewards_search("https://search.example.invalid", self.secret)
+            hits, backend, skipped = competitors.web_search(self.secret)
+            self.assertEqual((hits, backend), ([], ""))
+            self.assertIn("egress", skipped)
+            with self.assertRaises(ff.EgressBlockedError):
+                competitors.github_repo_search(self.secret, opener=outbound)
+            with self.assertRaises(ff.EgressBlockedError):
+                competitors.fetch_evidence_document(
+                    "https://example.invalid/?token=" + self.secret.split()[-1], opener=outbound)
+            outbound.assert_not_called()
+
+    def test_research_redaction_preserves_generic_search_without_source_tokens(self):
+        competitors = ff._competitors_module()
+        queries = []
+        def search(query, _limit, _opener):
+            queries.append(query)
+            return [{"url": "https://example.invalid", "title": "result"}]
+        with mock.patch.object(ff, "EGRESS_MODE", "redact"), \
+             mock.patch.object(competitors, "_WEB_BACKENDS", (("record", search),)):
+            hits, _, _ = competitors.web_search(self.secret)
+        self.assertTrue(hits)
+        self.assertEqual(len(queries), 1)
+        self.assertNotIn(self.secret.split()[-1], queries[0])
+        self.assertIn("EGRESS-REDACTED", queries[0])
+
+    def test_explicit_sharing_or_redaction_authorizes_the_cloud_exception(self):
+        self.write("main.py", self.secret)
+        for flag in ("allow_sensitive", "redact"):
+            with self.subTest(flag=flag):
+                scoped = ff._model_args_for_repository(argparse.Namespace(**{flag: True}), self.root)
+                self.assertFalse(scoped._source_local_only)
+                self.assertEqual(scoped._source_classification["classification"], "sensitive")
+                self.assertEqual(scoped._source_classification["exception"], flag)
 
 
 class EgressEvalFixtureTests(unittest.TestCase):

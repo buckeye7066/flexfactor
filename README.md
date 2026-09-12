@@ -1,7 +1,7 @@
 # FlexFactor
 
 FlexFactor is a managed, purpose-driven code improvement system with four
-interfaces: Refactor, Scout, Audit, and Production Ready. Version 0.6.2 uses one
+interfaces: Refactor, Scout, Audit, and Production Ready. Version 0.6.3 uses one
 quality-first model ladder, one durable orchestrator, and one fail-closed
 publication contract on desktop and in the signed Android app.
 
@@ -20,8 +20,9 @@ publication contract on desktop and in the signed Android app.
   non-regular, and unreadable entries remain explicitly accounted. Every later
   pass covers exactly the files whose verified bytes changed in the preceding
   pass.
-- Between passes 1 and 2, FlexFactor researches the top three corroborated
-  competitors. Scout executes public product/documentation URL searches; Repo
+- Between passes 1 and 2, FlexFactor researches the configured number of
+  corroborated competitors (25 by default; explicit run limits are honored).
+  Scout executes public product/documentation URL searches; Repo
   Rewards separately executes repository searches. FlexFactor fetches the
   resulting competitor pages before gleaning ideas and attempts the strongest
   purpose-compatible, licence-safe capabilities. Those edits pass the same

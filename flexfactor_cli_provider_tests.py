@@ -38,6 +38,9 @@ Two things now make that structurally impossible, and BOTH are load-bearing:
 from __future__ import annotations
 
 import contextlib
+import asyncio
+import http.client
+import http.server
 import io
 import json
 import os
@@ -47,9 +50,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -898,6 +903,122 @@ class TheGuardItselfMustFireTests(unittest.TestCase):
             client.close()
         finally:
             server.close()
+
+    @contextlib.contextmanager
+    def local_http_fixture(self):
+        """A recording proxy that never forwards anything off this machine."""
+        requests = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_CONNECT(self):
+                requests.append((self.command, self.path))
+                self.send_error(502, "Fixture never forwards connections")
+
+            def do_GET(self):
+                requests.append((self.command, self.path))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"local fixture")
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            yield server.server_address, requests
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+
+    def test_remote_http_via_loopback_proxy_is_blocked_before_forwarding(self):
+        with self.local_http_fixture() as (address, requests):
+            proxy = "http://%s:%s" % address
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy}))
+            with self.assertRaises(nolive.LiveProviderCallBlocked):
+                opener.open("http://provider.invalid/inference", timeout=2)
+            self.assertEqual(requests, [])
+
+    def test_httpx_sync_proxies_cannot_forward_remote_destinations(self):
+        import httpx
+
+        for scheme in ("http", "https"):
+            with self.subTest(scheme=scheme), self.local_http_fixture() as (address, requests):
+                with httpx.Client(proxy=f"http://{address[0]}:{address[1]}",
+                                  trust_env=False, timeout=2) as client:
+                    with self.assertRaises(nolive.LiveProviderCallBlocked):
+                        client.get(f"{scheme}://provider.invalid/inference")
+                self.assertEqual(requests, [])
+
+    def test_httpx_async_proxies_cannot_forward_remote_destinations(self):
+        import httpx
+
+        async def request(proxy, url):
+            async with httpx.AsyncClient(proxy=proxy, trust_env=False, timeout=2) as client:
+                await client.get(url)
+
+        for scheme in ("http", "https"):
+            with self.subTest(scheme=scheme), self.local_http_fixture() as (address, requests):
+                with self.assertRaises(nolive.LiveProviderCallBlocked):
+                    asyncio.run(request(f"http://{address[0]}:{address[1]}",
+                                        f"{scheme}://provider.invalid/inference"))
+                self.assertEqual(requests, [])
+
+    def test_httpx_local_fixtures_and_mock_transports_remain_usable(self):
+        import httpx
+
+        async def request(url):
+            async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+                return (await client.get(url)).status_code
+
+        with self.local_http_fixture() as (address, requests):
+            url = f"http://{address[0]}:{address[1]}/fixture"
+            with httpx.Client(trust_env=False, timeout=2) as client:
+                self.assertEqual(client.get(url).status_code, 200)
+            self.assertEqual(asyncio.run(request(url)), 200)
+            self.assertEqual(len(requests), 2)
+        with httpx.Client(transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, text="mock"))) as client:
+            self.assertEqual(client.get("https://provider.invalid").text, "mock")
+
+    def test_remote_https_tunnel_via_loopback_is_blocked_before_connect(self):
+        with self.local_http_fixture() as (address, requests):
+            connection = http.client.HTTPSConnection(*address, timeout=2)
+            connection.set_tunnel("provider.invalid", 443)
+            try:
+                with self.assertRaises(nolive.LiveProviderCallBlocked):
+                    connection.request("GET", "/inference")
+                self.assertEqual(requests, [])
+            finally:
+                connection.close()
+
+    def test_explicit_connect_to_remote_authority_is_blocked(self):
+        with self.local_http_fixture() as (address, requests):
+            connection = http.client.HTTPConnection(*address, timeout=2)
+            try:
+                with self.assertRaises(nolive.LiveProviderCallBlocked):
+                    connection.request("CONNECT", "provider.invalid:443")
+                self.assertEqual(requests, [])
+            finally:
+                connection.close()
+
+    def test_dns_name_starting_with_127_is_not_a_loopback_address(self):
+        with self.local_http_fixture() as (address, requests):
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler(
+                {"http": "http://%s:%s" % address}))
+            with self.assertRaises(nolive.LiveProviderCallBlocked):
+                opener.open("http://127.provider.invalid/inference", timeout=2)
+            self.assertEqual(requests, [])
+
+    def test_local_http_fixture_remains_usable(self):
+        with self.local_http_fixture() as (address, requests):
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open("http://%s:%s/fixture" % address, timeout=2) as response:
+                self.assertEqual(response.read(), b"local fixture")
+            self.assertEqual(requests, [("GET", "/fixture")])
 
     def test_the_subscription_client_has_exactly_one_construction_site(self):
         """`CliProvider.__init__` must delegate, or the seam moves back inside

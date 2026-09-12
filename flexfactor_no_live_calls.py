@@ -40,8 +40,9 @@ WHY IT IS WRITTEN THIS WAY
    this repository, so the failure reads as "this line built a network-capable
    client" rather than "something, somewhere, tried to open a socket".
 
-3. LOOPBACK IS ALLOWED. A local socket is never a billable provider call, and
-   several suites legitimately talk to 127.0.0.1. Everything else is refused.
+3. LOCAL FIXTURES ARE ALLOWED. Several suites legitimately talk to 127.0.0.1.
+   A loopback proxy can still forward a billable request, so HTTP destinations
+   and CONNECT tunnel targets are checked before the socket is opened too.
 
 4. IT IS NOT A SKIP AND IT IS NOT A DRY RUN. Nothing here makes a provider
    pretend to answer. It only makes "this test run was about to spend money" an
@@ -50,9 +51,12 @@ WHY IT IS WRITTEN THIS WAY
 from __future__ import annotations
 
 import contextlib
+import http.client
+import ipaddress
 import os
 import socket
 import traceback
+import urllib.parse
 from typing import Any, Callable, Iterator, Optional
 
 
@@ -78,7 +82,10 @@ def _is_loopback(host: Any) -> bool:
         return True
     if text in _LOOPBACK_HOSTS:
         return True
-    return text.startswith("127.")
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
 
 
 #: How many repository frames to name. One is not enough: the innermost frame
@@ -124,7 +131,7 @@ class _Guard:
         self._undo: list[Callable[[], None]] = []
         self.installed = False
 
-    # -- the two seams ----------------------------------------------------
+    # -- transport and credential seams ----------------------------------
     def _guard_sockets(self) -> None:
         real_getaddrinfo = socket.getaddrinfo
         real_connect = socket.socket.connect
@@ -163,11 +170,70 @@ class _Guard:
         cs.load_exportable_oauth = blocked
         self._undo.append(lambda: setattr(cs, "load_exportable_oauth", real))
 
+    def _guard_http_destinations(self) -> None:
+        """Check the requested host, not just a forward proxy's socket address."""
+        real_putrequest = http.client.HTTPConnection.putrequest
+        real_tunnel = http.client.HTTPConnection._tunnel
+
+        def putrequest(connection, method, url, *args, **kwargs):
+            destination = "//" + url if method.upper() == "CONNECT" else url
+            host = (urllib.parse.urlsplit(destination).hostname
+                    or connection._tunnel_host or connection.host)
+            if not _is_loopback(host):
+                raise _refuse("request a remote provider", f"HTTP {host}")
+            return real_putrequest(connection, method, url, *args, **kwargs)
+
+        def tunnel(connection):
+            if not _is_loopback(connection._tunnel_host):
+                raise _refuse("tunnel to a remote provider",
+                              f"CONNECT {connection._tunnel_host}")
+            return real_tunnel(connection)
+
+        http.client.HTTPConnection.putrequest = putrequest
+        http.client.HTTPConnection._tunnel = tunnel
+        self._undo.append(lambda: setattr(http.client.HTTPConnection,
+                                          "putrequest", real_putrequest))
+        self._undo.append(lambda: setattr(http.client.HTTPConnection,
+                                          "_tunnel", real_tunnel))
+
+    def _guard_httpx_transports(self) -> None:
+        """SDK requests must not escape via HTTPX's independent proxy stack."""
+        try:
+            import httpx
+        except ImportError:
+            # HTTPX is optional in stdlib-only installations. The OpenAI and
+            # Anthropic SDKs require it, so their transports cannot run there.
+            return
+        real_sync = httpx.HTTPTransport.handle_request
+        real_async = httpx.AsyncHTTPTransport.handle_async_request
+
+        def check(request):
+            if not _is_loopback(request.url.host):
+                raise _refuse("request a remote provider",
+                              f"HTTPX {request.url.host}")
+
+        def handle_request(transport, request):
+            check(request)
+            return real_sync(transport, request)
+
+        async def handle_async_request(transport, request):
+            check(request)
+            return await real_async(transport, request)
+
+        httpx.HTTPTransport.handle_request = handle_request
+        httpx.AsyncHTTPTransport.handle_async_request = handle_async_request
+        self._undo.append(lambda: setattr(httpx.HTTPTransport,
+                                          "handle_request", real_sync))
+        self._undo.append(lambda: setattr(httpx.AsyncHTTPTransport,
+                                          "handle_async_request", real_async))
+
     # -- lifecycle --------------------------------------------------------
     def install(self) -> None:
         if self.installed:
             return
         self._guard_sockets()
+        self._guard_http_destinations()
+        self._guard_httpx_transports()
         self._guard_host_credential()
         self.installed = True
 

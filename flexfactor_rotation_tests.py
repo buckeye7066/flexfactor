@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 
 import flexfactor_rotation as R
 
@@ -676,6 +677,44 @@ class RotatingProviderTests(RotationTestCase):
                                       route("b/one", "pool-b")))
         results = {prov.complete("x") for _ in range(2)}
         self.assertEqual(results, {"completed by a/one", "completed by b/one"})
+
+    def test_cloud_payloads_are_gated_before_any_provider_is_constructed(self):
+        class EgressBlockedError(RuntimeError):
+            pass
+
+        def guard(text):
+            if "PRIVATE" in text:
+                raise EgressBlockedError("sensitive payload")
+            return text
+
+        for api in ("openai", "anthropic", "codex-cli", "claude-code", "copilot-cli", "cursor"):
+            for method, args in (("complete", ("PRIVATE",)),
+                                 ("grade", ("PRIVATE",)),
+                                 ("structured", ("system", "PRIVATE", {}))):
+                with self.subTest(api=api, method=method):
+                    candidate = replace(route("cloud/gpt-model", "pool"), api=api)
+                    built = []
+                    provider = R.RotatingProvider(
+                        self.rotator(catalog(candidate)),
+                        lambda selected: built.append(selected), payload_guard=guard,
+                        judge_tier=R.FRONTIER)
+                    with self.assertRaises(EgressBlockedError):
+                        getattr(provider, method)(*args)
+                    self.assertEqual(built, [])
+
+    def test_payload_redaction_reaches_the_adapter_and_local_source_is_preserved(self):
+        class Recorder:
+            def structured(self, system, prompt, schema):
+                return system, prompt, schema
+
+        for api, expected in (("cursor", "MASKED"), ("ollama", "PRIVATE")):
+            with self.subTest(api=api):
+                candidate = replace(route("model/qwen", "pool"), api=api)
+                provider = R.RotatingProvider(
+                    self.rotator(catalog(candidate)), lambda _: Recorder(),
+                    payload_guard=lambda text: text.replace("PRIVATE", "MASKED"))
+                self.assertEqual(provider.structured("PRIVATE", "PRIVATE", {"description": "PRIVATE"}),
+                                 (expected, expected, {"description": expected}))
 
     def test_validated_shape_failure_moves_the_same_call_to_the_next_model(self):
         class StructuredOutputShapeError(RuntimeError):
