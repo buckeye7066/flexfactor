@@ -36,7 +36,8 @@ class ResumeCarriesTheRunsCommittedRepairs(unittest.TestCase):
     tests for changed behavior..." and generated nothing, and
     `selected-capabilities-delivered` reported "target stats_utils.py was not
     changed" about a file the run itself had committed - so publication could
-    never follow the repair.
+    never follow the repair. The review on #185 added the provenance, path,
+    anchor, test-evidence and baseline cases below.
     """
 
     def setUp(self):
@@ -45,12 +46,16 @@ class ResumeCarriesTheRunsCommittedRepairs(unittest.TestCase):
         os.makedirs(self.repo)
         self.git("init", "-q", "-b", "main")
         self.write("stats_utils.py", "def mean(v):\n    return sum(v) // len(v)\n")
+        self.write("cli.py", "print('mean')\n")
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "base")
         self.start = self.git("rev-parse", "HEAD")
         self.runs = os.path.join(self._tmp.name, "runs")
         self.checkpoint = ffrs.new_run(self.runs, program="demo", project_dir=self.repo,
                                        mode="prodready", policy="test-policy")
+        # Process 1 starts: the anchor is recorded.
+        self.assertEqual(
+            ff._resume_carried_changes(self.checkpoint, self.repo, self.start), ([], []))
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -67,44 +72,114 @@ class ResumeCarriesTheRunsCommittedRepairs(unittest.TestCase):
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
 
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
     def reloaded(self):
         return ffrs.load(self.runs, self.checkpoint.run_id)
 
-    def test_a_fresh_run_records_where_it_started_and_carries_nothing(self):
-        self.assertEqual(
-            ff._resume_carried_changes(self.checkpoint, self.repo, self.start), [])
+    def repair_stats_utils(self):
+        self.write("stats_utils.py", "def mean(v):\n    return sum(v) / len(v)\n")
+        ff._resume_record_applied(self.checkpoint, {"stats_utils.py"}, set())
+
+    def test_a_fresh_run_records_where_it_started(self):
         self.assertEqual(self.reloaded().data.get("start_commit"), self.start)
 
-    def test_a_resumed_process_carries_what_its_earlier_process_committed(self):
-        ff._resume_carried_changes(self.checkpoint, self.repo, self.start)
-        self.write("stats_utils.py", "def mean(v):\n    return sum(v) / len(v)\n")
+    def test_a_resumed_process_carries_the_repairs_flexfactor_recorded(self):
+        self.repair_stats_utils()
         self.write("tests/test_stats_utils.py", "def test_mean():\n    pass\n")
         self.write("demo_audit_report.md", "# report\n")
-        self.git("add", "-A")
-        self.git("commit", "-q", "-m", "FlexFactor audit cycle 1")
-        head = self.git("rev-parse", "HEAD")
+        head = self.commit("FlexFactor audit cycle 1")
         # The kill: a new process reloads the checkpoint from disk.
-        carried = ff._resume_carried_changes(self.reloaded(), self.repo, head)
-        self.assertEqual(carried, ["stats_utils.py"],
-                         "only first-party sources carry; tests and reports are not repairs")
+        self.assertEqual(ff._resume_carried_changes(self.reloaded(), self.repo, head),
+                         (["stats_utils.py"], []))
 
-    def test_rewritten_history_carries_nothing_and_reanchors(self):
-        ff._resume_carried_changes(self.checkpoint, self.repo, self.start)
-        self.git("checkout", "-q", "--orphan", "rewritten")
-        self.write("stats_utils.py", "x = 1\n")
-        self.git("add", "-A")
-        self.git("commit", "-q", "-m", "unrelated history")
+    def test_a_commit_flexfactor_did_not_make_is_never_attributed(self):
+        self.repair_stats_utils()
+        self.commit("FlexFactor audit cycle 1")
+        # A human or autoclean commit lands while the run is down.
+        self.write("cli.py", "print('edited by someone else')\n")
+        head = self.commit("owner edit during the downtime")
+        carried, _ = ff._resume_carried_changes(self.reloaded(), self.repo, head)
+        self.assertEqual(carried, ["stats_utils.py"])
+
+    def test_a_recorded_repair_that_was_never_committed_carries_nothing(self):
+        self.repair_stats_utils()  # recorded, then killed before its commit
+        self.write("cli.py", "print('other')\n")
+        self.git("add", "cli.py")
+        self.git("commit", "-q", "-m", "unrelated commit")
         head = self.git("rev-parse", "HEAD")
-        self.assertEqual(ff._resume_carried_changes(self.reloaded(), self.repo, head), [])
-        self.assertEqual(self.reloaded().data.get("start_commit"), head)
+        self.assertEqual(ff._resume_carried_changes(self.reloaded(), self.repo, head), ([], []))
+
+    def test_an_unverified_repair_stays_unverified(self):
+        self.write("stats_utils.py", "def mean(v):\n    return sum(v) / len(v)\n")
+        ff._resume_record_applied(self.checkpoint, {"stats_utils.py"}, {"stats_utils.py"})
+        head = self.commit("FlexFactor audit cycle 1")
+        self.assertEqual(ff._resume_carried_changes(self.reloaded(), self.repo, head),
+                         (["stats_utils.py"], ["stats_utils.py"]))
+
+    def test_a_path_git_would_quote_is_still_carried(self):
+        rel = "statistik_\u00fc.py"
+        self.write(rel, "x = 1\n")
+        ff._resume_record_applied(self.checkpoint, {rel}, set())
+        head = self.commit("FlexFactor audit cycle 1")
+        carried, _ = ff._resume_carried_changes(self.reloaded(), self.repo, head)
+        self.assertEqual(carried, [rel])
+
+    def test_a_branch_switch_carries_nothing_and_keeps_the_anchor(self):
+        self.repair_stats_utils()
+        self.commit("FlexFactor audit cycle 1")
+        self.git("checkout", "-q", "--orphan", "elsewhere")
+        self.write("stats_utils.py", "x = 1\n")
+        head = self.commit("unrelated history")
+        self.assertEqual(ff._resume_carried_changes(self.reloaded(), self.repo, head), ([], []))
+        self.assertEqual(self.reloaded().data.get("start_commit"), self.start)
 
     def test_no_checkpoint_carries_nothing(self):
-        self.assertEqual(ff._resume_carried_changes(None, self.repo, self.start), [])
+        self.assertEqual(ff._resume_carried_changes(None, self.repo, self.start), ([], []))
 
-    def test_the_audit_seeds_its_evidence_from_the_carried_changes(self):
+    def test_credited_test_evidence_carries_while_its_bytes_are_unchanged(self):
+        self.repair_stats_utils()
+        test_rel = "tests/test_stats_utils_mean.py"
+        self.write(test_rel, "# FLEXFACTOR_CAPABILITY:competitor-1-mean\n"
+                             "def test_mean():\n    pass\n")
+        ff._resume_record_test_evidence(
+            self.checkpoint, self.repo, [test_rel], {"stats_utils.py": [test_rel]},
+            {"competitor-1-mean": [test_rel]})
+        self.commit("FlexFactor unit tests")
+        restored = ff._resume_carried_test_evidence(self.reloaded(), self.repo, ["stats_utils.py"])
+        self.assertEqual(restored, ([test_rel], {"stats_utils.py": [test_rel]},
+                                    {"competitor-1-mean": [test_rel]}))
+        self.assertEqual(ff._resume_carried_test_evidence(self.reloaded(), self.repo, []),
+                         ([], {}, {}), "no carried source, no carried test")
+        self.write(test_rel, "def test_mean():\n    assert False\n")
+        self.assertEqual(
+            ff._resume_carried_test_evidence(self.reloaded(), self.repo, ["stats_utils.py"]),
+            ([], {}, {}), "edited bytes are not the credited test")
+
+    def test_a_resume_measures_progress_from_the_first_baseline(self):
+        first = {"criteria_met": 0, "criteria_total": 2, "gaps": [{"title": "mean"}]}
+        self.assertIs(ff._resume_purpose_baseline(self.checkpoint, first, []), first)
+        repaired_tree = {"criteria_met": 2, "criteria_total": 2, "gaps": []}
+        self.assertEqual(
+            ff._resume_purpose_baseline(self.reloaded(), repaired_tree, ["stats_utils.py"]),
+            first)
+        self.assertIs(ff._resume_purpose_baseline(self.reloaded(), repaired_tree, []),
+                      repaired_tree, "nothing carried: the live baseline is the interval")
+
+    def test_the_audit_wires_every_recording_and_restoring_point(self):
         source = inspect.getsource(ff.audit_one_program)
         self.assertIn("_resume_carried_changes(", source)
         self.assertIn("applied_set: set[str] = set(resume_carried_sources)", source)
+        self.assertIn("unverified_set: set[str] = set(resume_carried_unverified)", source)
+        self.assertGreaterEqual(
+            source.count("_resume_record_applied(checkpoint, applied_set, unverified_set)"), 5)
+        self.assertIn("_resume_carried_test_evidence(", source)
+        self.assertIn("if rel not in tests_by_source", source)
+        self.assertGreaterEqual(source.count("_resume_record_test_evidence("), 2)
+        self.assertIn('met_before = (purpose_movement_baseline or {}).get("criteria_met")', source)
         self.assertIn(") | set(applied_set)", source)
         self.assertIn(") | set(unverified_set)", source)
 

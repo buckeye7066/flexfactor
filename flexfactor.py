@@ -1040,8 +1040,8 @@ def _resume_checkpoint_for(rs_module, recovered: dict | None, *, program: str,
 
 
 def _resume_carried_changes(checkpoint, project_dir: str,
-                            initial_commit: str | None) -> list[str]:
-    """First-party sources THIS run already committed before an interruption.
+                            initial_commit: str | None) -> tuple[list[str], list[str]]:
+    """(applied, unverified) repairs THIS run committed before an interruption.
 
     A resumed process starts with an empty applied set, although earlier
     processes of the same run committed verified repairs. Live demo run
@@ -1052,36 +1052,142 @@ def _resume_carried_changes(checkpoint, project_dir: str,
     "target stats_utils.py was not changed". The run could never publish the
     repairs it had made.
 
-    The evidence is git, not the checkpoint's say-so. The checkpoint records
-    the commit the run STARTED from; the carried set is exactly the
-    first-party sources changed between that commit and this process's HEAD.
-    Only commits `_commit_and_sync` let through a passing publication gate
-    exist on that range. A recorded start that is no longer an ancestor of
-    HEAD (history rewritten between processes) proves nothing, carries
-    nothing, and is re-anchored at the current HEAD.
+    Provenance comes from FlexFactor and presence from git (review on #185):
+
+    - the checkpoint lists the files FlexFactor's own fixer applied
+      (`_resume_record_applied`, written at every applied-set update), so an
+      autoclean commit or a human/CI commit that landed while the run was
+      down is never attributed to the run - ancestry is not authorship;
+    - a recorded file carries only while `start_commit..HEAD` still changes
+      it, so a repair killed before its commit, or reverted during the
+      downtime, carries nothing;
+    - paths come from `git diff -z`, never from quoted line output.
+
+    The anchor is never rewritten once recorded. A HEAD that does not descend
+    from it (another branch checked out) carries nothing and keeps the anchor
+    for a resume on the original line; a git error is UNKNOWN, not a rewrite,
+    and is treated the same way.
     """
     data = getattr(checkpoint, "data", None)
     if not isinstance(data, dict) or not initial_commit:
-        return []
+        return [], []
     recorded = str(data.get("start_commit") or "").strip()
-    if recorded == initial_commit:
-        return []
-    if recorded:
-        ancestry = _git(["merge-base", "--is-ancestor", recorded, initial_commit],
-                        project_dir)
-        if ancestry.returncode == 0:
-            diff = _git(["diff", "--name-only", "--no-renames",
-                         f"{recorded}..{initial_commit}"], project_dir)
-            if diff.returncode == 0:
-                return _existing_changed_sources(
-                    project_dir, (diff.stdout or "").splitlines())
-            return []
+    if not recorded:
+        try:
+            checkpoint.set(start_commit=initial_commit)
+            checkpoint.save(force=True)
+        except Exception:  # noqa: BLE001 - checkpointing is protection, never a new failure mode
+            pass
+        return [], []
+    applied = sorted({_canon_rel(p) for p in (data.get("applied_files") or [])
+                      if isinstance(p, str) and p.strip()})
+    if recorded == initial_commit or not applied:
+        return [], []
+    ancestry = _git(["merge-base", "--is-ancestor", recorded, initial_commit], project_dir)
+    if ancestry.returncode != 0:
+        return [], []
+    diff = _git(["diff", "--name-only", "-z", "--no-renames",
+                 f"{recorded}..{initial_commit}", "--", *applied], project_dir)
+    if diff.returncode != 0:
+        return [], []
+    still_changed = {_canon_rel(p) for p in (diff.stdout or "").split("\0") if p}
+    carried = _existing_changed_sources(
+        project_dir, [p for p in applied if p in still_changed])
+    unverified = {_canon_rel(p) for p in (data.get("unverified_files") or [])
+                  if isinstance(p, str)}
+    return carried, [p for p in carried if p in unverified]
+
+
+def _resume_record_applied(checkpoint, applied_set, unverified_set) -> None:
+    """Record what FlexFactor's own fixer applied, so a resume can tell this
+    run's repairs from anything else that lands on the branch (see
+    `_resume_carried_changes`). Recorded BEFORE the commit that publishes
+    them: a kill in between leaves a recorded file git still shows unchanged,
+    which carries nothing."""
+    if checkpoint is None:
+        return
     try:
-        checkpoint.set(start_commit=initial_commit)
+        checkpoint.set(applied_files=sorted(applied_set),
+                       unverified_files=sorted(unverified_set))
         checkpoint.save(force=True)
     except Exception:  # noqa: BLE001 - checkpointing is protection, never a new failure mode
         pass
-    return []
+
+
+def _resume_record_test_evidence(checkpoint, project_dir: str, test_files,
+                                 tests_by_source, tests_by_capability) -> None:
+    """Record the focused tests this run credited, bound to their exact bytes."""
+    if checkpoint is None:
+        return
+    try:
+        shas = {rel: _file_sha_contained(project_dir, rel) for rel in test_files}
+        checkpoint.set(test_evidence={
+            "test_files": list(test_files),
+            "tests_by_source": {k: list(v) for k, v in tests_by_source.items()},
+            "tests_by_capability": {k: list(v) for k, v in tests_by_capability.items()},
+            "sha": {rel: sha for rel, sha in shas.items() if sha},
+        })
+        checkpoint.save(force=True)
+    except Exception:  # noqa: BLE001 - checkpointing is protection, never a new failure mode
+        pass
+
+
+def _resume_carried_test_evidence(checkpoint, project_dir: str,
+                                  carried_sources) -> tuple[list[str], dict, dict]:
+    """(test_files, tests_by_source, tests_by_capability) an earlier process of
+    this run generated, ran and credited for a carried repair (review on #185).
+
+    Without it a resume after the unit-test phase had to regenerate them - and
+    a generated test may never overwrite an existing file, so a regenerated
+    batch naming the same path was refused outright, and a provider outage
+    left selected-capabilities-delivered blocked on tests the run already had.
+    A test carries only while its bytes are exactly the ones credited and its
+    source is still a carried repair; the final suite still has to run it.
+    """
+    data = getattr(checkpoint, "data", None)
+    record = data.get("test_evidence") if isinstance(data, dict) else None
+    carried = set(carried_sources or ())
+    if not carried or not isinstance(record, dict):
+        return [], {}, {}
+    shas = record.get("sha") or {}
+    by_source: dict[str, list[str]] = {}
+    for source, tests in (record.get("tests_by_source") or {}).items():
+        if source not in carried:
+            continue
+        keep = [t for t in (tests or [])
+                if shas.get(t) and _file_sha_contained(project_dir, t) == shas.get(t)]
+        if keep:
+            by_source[source] = keep
+    kept = {t for tests in by_source.values() for t in tests}
+    by_capability = {cap: [t for t in (tests or []) if t in kept]
+                     for cap, tests in (record.get("tests_by_capability") or {}).items()}
+    by_capability = {cap: tests for cap, tests in by_capability.items() if tests}
+    ordered = [t for t in (record.get("test_files") or []) if t in kept]
+    return ordered, by_source, by_capability
+
+
+def _resume_purpose_baseline(checkpoint, measured, carried_sources):
+    """The purpose baseline run-level progress is measured from (review on #185).
+
+    A resumed run that carries committed repairs measures its live baseline on
+    the already-repaired tree, so comparing that with the final assessment
+    under-reported the run's movement while applied_set claimed the repairs.
+    The first process records its pre-repair baseline, and a resume that
+    carries repairs measures from it. Bridging keeps the live measurement,
+    because only the live tree's gaps are still work."""
+    data = getattr(checkpoint, "data", None)
+    if not isinstance(data, dict):
+        return measured
+    recorded = data.get("purpose_before")
+    if carried_sources and isinstance(recorded, dict):
+        return recorded
+    if isinstance(measured, dict) and not isinstance(recorded, dict):
+        try:
+            checkpoint.set(purpose_before=json.loads(json.dumps(measured)))
+            checkpoint.save(force=True)
+        except Exception:  # noqa: BLE001 - an unserializable baseline is simply not recorded
+            pass
+    return measured
 
 
 # --------------------------------------------------------------------------- #
@@ -20426,7 +20532,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             result["error"] = "could not resolve the exact pre-mutation commit"
             print(f"{pfx}error: {result['error']}", file=sys.stderr)
             return result
-        resume_carried_sources = _resume_carried_changes(
+        resume_carried_sources, resume_carried_unverified = _resume_carried_changes(
             checkpoint, project_dir, initial_commit)
         if resume_carried_sources:
             print(f"{pfx}resume: {len(resume_carried_sources)} source file(s) this run "
@@ -20852,7 +20958,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # committed (git-proven by _resume_carried_changes), so focused
         # regression tests and capability delivery still see those repairs.
         applied_set: set[str] = set(resume_carried_sources)
-        unverified_set: set[str] = set()
+        unverified_set: set[str] = set(resume_carried_unverified)
         fix_notes: list[str] = []
         run_clean: set[str] = set()  # files confirmed clean THIS run (drop from review)
         run_clean_sha: dict[str, str] = {}  # rel -> sha of the EXACT bytes reviewed clean
@@ -21100,6 +21206,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                                  if _sample_errors else ""))
                     print(f"{pfx}WARNING: {detail}")
                     purpose_assessment_errors.append(detail)
+        # Progress is measured over the SAME interval as applied_set. A resumed
+        # run that carries committed repairs reuses the baseline its first
+        # process measured before them; bridging below still acts on the live
+        # measurement, because only the live tree's gaps are work.
+        purpose_movement_baseline = _resume_purpose_baseline(
+            checkpoint, purpose_before, resume_carried_sources)
         purpose_files: list[str] = []
         if purpose_before:
             b_gaps = purpose_before.get("gaps") or []
@@ -21174,6 +21286,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     applied_set |= set(applied_p)
                     unverified_set |= set(unver_p)
                     fix_notes += notes_p
+                    _resume_record_applied(checkpoint, applied_set, unverified_set)
                     bridged_early = sorted(set(applied_p))
                     if git and applied_p:
                         s = _commit_and_sync(project_dir, branch, prev_branch, args,
@@ -21686,6 +21799,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 applied_set |= set(applied_c)
                 unverified_set |= set(unver_c)
                 fix_notes += notes_c
+                _resume_record_applied(checkpoint, applied_set, unverified_set)
                 if applied_c:
                     any_applied_this_cycle = True
                 # Master Prompt 83/88: a verifier outage must label the run failed and
@@ -21810,6 +21924,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 applied_set.update(competitor_gate["applied"])
                 unverified_set.update(competitor_gate["unverified"])
                 fix_notes.extend(competitor_gate["notes"])
+                _resume_record_applied(checkpoint, applied_set, unverified_set)
                 bridged_early = sorted(
                     set(bridged_early) | set(competitor_gate["applied"])
                 )
@@ -22034,6 +22149,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     applied_set |= set(applied_g)
                     unverified_set |= set(unver_g)
                     fix_notes += notes_g
+                    _resume_record_applied(checkpoint, applied_set, unverified_set)
                     bridged_files = sorted(set(applied_g))
                     applied_files = sorted(applied_set)
                     unverified_files = sorted(unverified_set)
@@ -22109,6 +22225,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     fix_notes += notes_r
                     applied_set |= set(applied_r)
                     unverified_set |= set(unver_r)
+                    _resume_record_applied(checkpoint, applied_set, unverified_set)
                     if git and applied_r:
                         s = _commit_and_sync(project_dir, branch, prev_branch, args,
                                              f"purpose bridge rescan round {bridge_round}", stack)
@@ -22187,11 +22304,18 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     "behavior": str(_idea.get("what_it_does") or ""),
                     "verification_plan": str(_idea.get("verification_plan") or ""),
                 })
-        test_files: list[str] = []
+        # Focused tests an earlier process of this run generated, ran and
+        # credited carry forward while their bytes are unchanged (see
+        # _resume_carried_test_evidence). Their sources are not regenerated:
+        # a generated test may never overwrite an existing file.
+        test_files, tests_by_source, tests_by_capability = _resume_carried_test_evidence(
+            checkpoint, project_dir, resume_carried_sources)
+        if test_files:
+            print(f"{pfx}resume: {len(test_files)} focused regression test(s) credited "
+                  "before the interruption still stand unchanged: "
+                  + ", ".join(test_files[:10]))
         generated_test_files: list[str] = []
         test_creation_receipts: dict[str, os.stat_result] = {}
-        tests_by_source: dict[str, list[str]] = {}
-        tests_by_capability: dict[str, list[str]] = {}
         generated_test_candidates: list[dict] = []
         generated_test_batch_refused = False
         test_status = None
@@ -22200,10 +22324,13 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             print(f"{pfx}Generating focused regression tests for changed behavior...")
             if checkpoint is not None:
                 checkpoint.set_phase("unit tests", spend_usd=round(meter.usd, 6))
-            changed_for_tests = _existing_changed_sources(
-                project_dir,
-                set(applied_set) | set(bridged_early) | set(bridged_files),
-            )
+            changed_for_tests = [
+                rel for rel in _existing_changed_sources(
+                    project_dir,
+                    set(applied_set) | set(bridged_early) | set(bridged_files),
+                )
+                if rel not in tests_by_source
+            ]
             test_candidates, omitted = _test_generation_scope(
                 changed_for_tests, args.max_test_modules)
             if omitted:
@@ -22334,6 +22461,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         for _capability_id, _paths in _capability_test_evidence.items():
                             tests_by_capability.setdefault(
                                 _capability_id, []).extend(_paths)
+            _resume_record_test_evidence(checkpoint, project_dir, test_files,
+                                         tests_by_source, tests_by_capability)
             if generated_test_files:
                 ok, log = generated_test_status, generated_test_log
                 test_status = ok
@@ -22378,6 +22507,7 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                         test_creation_receipts = {}
                         tests_by_source = {}
                         tests_by_capability = {}
+                        _resume_record_test_evidence(checkpoint, project_dir, [], {}, {})
                         # THE VERDICT DIED WITH THE FILES IT DESCRIBED.
                         #
                         # This block's own comment promises the rollback happens
@@ -23310,10 +23440,10 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
         # CLOSED, not defects fixed. "A run that fixes 498 files and closes zero
         # criteria did not do the job." Both measurements come from the same
         # assessor against the same owner-authored criteria, before vs after.
-        met_before = (purpose_before or {}).get("criteria_met")
+        met_before = (purpose_movement_baseline or {}).get("criteria_met")
         met_after = (purpose_gap or {}).get("criteria_met")
         total_crit = ((purpose_gap or {}).get("criteria_total")
-                      or (purpose_before or {}).get("criteria_total"))
+                      or (purpose_movement_baseline or {}).get("criteria_total"))
         if met_before is not None and met_after is not None and total_crit:
             closed = met_after - met_before
             audit["criteria_closed"] = closed
@@ -23322,12 +23452,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             # scored 2/10, 0/10, 3/10 on three consecutive runs, so a bare
             # "+3 criteria closed" can be pure noise. The band is the widest
             # spread actually observed across this run's own samples.
-            band = _criteria_noise_band(purpose_before, purpose_gap)
+            band = _criteria_noise_band(purpose_movement_baseline, purpose_gap)
             _fp_mod = _purpose_module()
             real = (_fp_mod.movement_is_real(met_before, met_after, band)
                     if _fp_mod is not None and hasattr(_fp_mod, "movement_is_real")
                     else None)
-            unmeasured = (purpose_before or {}).get("criteria_noise_band") is None or \
+            unmeasured = (purpose_movement_baseline or {}).get("criteria_noise_band") is None or \
                          (purpose_gap or {}).get("criteria_noise_band") is None
             audit["criteria_noise_band"] = None if unmeasured else band
             audit["criteria_movement_is_real"] = None if unmeasured else bool(real)
