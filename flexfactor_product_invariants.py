@@ -325,13 +325,33 @@ def evaluate_product_invariants(*, purpose_enabled: bool,
             "risk_level": risk_level,
             "risk_reason": risk_reason,
         }
-        missing = [key for key, value in required_review.items() if not value]
-        if risk_level not in {"low", "medium", "high"}:
-            missing.append("valid risk_level")
-        if already_present not in {True, False}:
-            missing.append("already_present decision")
-        if accepted and risk_level in {"medium", "high"} and not mitigation:
-            missing.append("risk_mitigation")
+        if not accepted and competitor.get("evidence_status") != "verified":
+            # PROVENANCE REJECTION. research_competitors() refuses to act on a
+            # name no reachable source corroborated: it writes a stub idea
+            # ("(no source-backed idea)", no behaviour, no plans, no risk) and
+            # forces accept=False with a NOT ACTED ON reason. Demanding an
+            # adoption review of that stub demanded a wiring plan for a product
+            # FlexFactor had just declined to believe exists, so this gate could
+            # never pass while any candidate was unverified. Live demo run
+            # tinystats-demo-20260911-182701-000449-34728-0000: 8 of the 9
+            # blocked rows were exactly these stubs. The decision this gate
+            # exists to see is the rejection itself, so its reason is required.
+            missing = [] if required_review["purpose_reason"] else ["rejection reason"]
+        else:
+            # Wiring and verification plans describe how a capability would be
+            # BUILT and PROVEN. They are required for every selected capability;
+            # a rejected one is never built, and the decision the remediation
+            # names - purpose-fit, duplication, evidence and adoption risk - is
+            # still demanded in full.
+            plan_keys = {"wiring_plan", "verification_plan"}
+            missing = [key for key, value in required_review.items()
+                       if not value and (accepted or key not in plan_keys)]
+            if risk_level not in {"low", "medium", "high"}:
+                missing.append("valid risk_level")
+            if already_present not in {True, False}:
+                missing.append("already_present decision")
+            if accepted and risk_level in {"medium", "high"} and not mitigation:
+                missing.append("risk_mitigation")
         if missing:
             review_failures.append(f"{name}: missing {', '.join(sorted(set(missing)))}")
 

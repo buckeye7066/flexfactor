@@ -446,6 +446,91 @@ class ProductInvariantTests(unittest.TestCase):
         self.assertEqual(len(result["rejected_capabilities"]), 5)
         self.assertEqual(result["selected_capabilities"], [])
 
+    @staticmethod
+    def _unverified_stub(name="Recalled Rival", reason=None):
+        """Exactly what research_competitors() writes for a name no reachable
+        source corroborated (flexfactor_competitors._extract's no-document
+        stub, then the unverified NOT ACTED ON override)."""
+        return {
+            "name": name,
+            "evidence_status": "unverified",
+            "evidence_urls": [],
+            "reuse_mode": "clean-room-from-documented-behavior",
+            "license": "UNKNOWN",
+            "license_source": "",
+            "bridge_status": "rejected",
+            "entered_fix_stream": False,
+            "idea": {
+                "error": "no competitor source page could be fetched",
+                "accept": False,
+                "idea_title": "(no source-backed idea)",
+                "what_it_does": "",
+                "why_valuable": "",
+                "evidence_basis": "No fetched source document was available.",
+                "evidence_refs": [],
+                "purpose_reason": (
+                    "NOT ACTED ON: search results alone do not establish a capability."
+                    if reason is None else reason
+                ),
+            },
+        }
+
+    def test_an_unverified_candidate_rejected_for_provenance_does_not_block(self):
+        """Live demo run tinystats-demo-20260911-182701-000449-34728-0000: 8 of 9
+        fit-risk blockers were these stubs, so the gate could never pass while any
+        candidate was unverified."""
+        ledger = research()
+        ledger["competitors"].append(self._unverified_stub())
+        result = evaluate(competitor_research=ledger)
+        self.assertNotIn("competitive-fit-risk-reviewed",
+                         {g["id"] for g in result["blockers"]})
+        self.assertTrue(result["ready"], result["blockers"])
+
+    def test_an_unverified_candidate_with_no_recorded_reason_still_blocks(self):
+        ledger = research()
+        ledger["competitors"].append(self._unverified_stub(reason=""))
+        result = evaluate(competitor_research=ledger)
+        blocker = next(g for g in result["blockers"]
+                       if g["id"] == "competitive-fit-risk-reviewed")
+        self.assertIn("rejection reason", blocker["evidence"])
+
+    def test_a_rejected_corroborated_candidate_needs_no_adoption_plans(self):
+        """ministat in the same run: corroborated, rejected with a purpose reason,
+        risk and duplication decision - blocked only for plans it would never use."""
+        ledger = research()
+        rival = ledger["competitors"][1]
+        self.assertFalse(rival["idea"]["accept"])
+        rival["idea"].pop("wiring_plan")
+        rival["idea"].pop("verification_plan")
+        result = evaluate(competitor_research=ledger)
+        self.assertTrue(result["ready"], result["blockers"])
+
+    def test_a_rejected_corroborated_candidate_still_needs_its_risk_decision(self):
+        ledger = research()
+        ledger["competitors"][1]["idea"].pop("risk_reason")
+        result = evaluate(competitor_research=ledger)
+        blocker = next(g for g in result["blockers"]
+                       if g["id"] == "competitive-fit-risk-reviewed")
+        self.assertIn("risk_reason", blocker["evidence"])
+
+    def test_a_selected_candidate_still_needs_both_plans(self):
+        item = competitor()
+        item["idea"].pop("wiring_plan")
+        result = evaluate(competitor_research=research(item))
+        blocker = next(g for g in result["blockers"]
+                       if g["id"] == "competitive-fit-risk-reviewed")
+        self.assertIn("wiring_plan", blocker["evidence"])
+
+    def test_an_unverified_candidate_can_never_be_selected_by_this_exemption(self):
+        stub = self._unverified_stub()
+        stub["idea"]["accept"] = True
+        ledger = research()
+        ledger["competitors"].append(stub)
+        result = evaluate(competitor_research=ledger)
+        self.assertFalse(result["ready"])
+        evidence = " ".join(g["evidence"] for g in result["blockers"])
+        self.assertIn("selected without corroboration", evidence)
+
     def test_runtime_hard_wires_the_invariant_into_completion_and_release(self):
         runtime = Path(__file__).with_name("flexfactor.py")
         competitors = Path(__file__).with_name("flexfactor_competitors.py")
