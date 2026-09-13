@@ -52,6 +52,67 @@ def _ok(cp) -> bool:
     return getattr(cp, "returncode", 1) == 0
 
 
+def _snapshot_attributes(git: GitRunner, project_dir: str, *, sources: tuple[str, ...] = ()
+                         ) -> dict[str, dict[str, str]]:
+    """Union attributes/paths from every tree a reset or checkout can expose."""
+    listing = git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], project_dir)
+    if not _ok(listing):
+        raise RuntimeError("could not list paths for WIP attribute preflight")
+    paths = set(p for p in (getattr(listing, "stdout", "") or "").split("\0") if p)
+    trees = set(sources)
+    head = git(["rev-parse", "--verify", "-q", "HEAD"], project_dir)
+    if _ok(head) and _out(head):
+        trees.add(_out(head))
+    elif getattr(head, "returncode", 2) != 1:
+        raise RuntimeError("could not resolve HEAD for WIP attribute preflight")
+    for tree in sorted(trees):
+        listing = git(["ls-tree", "-r", "--name-only", "-z", tree], project_dir)
+        if not _ok(listing):
+            raise RuntimeError("could not list source-tree paths for WIP attribute preflight")
+        paths.update(p for p in (getattr(listing, "stdout", "") or "").split("\0") if p)
+    paths = sorted(paths)
+    attributes: dict[str, dict[str, str]] = {}
+    selectors = [[], ["--cached"], *[["--source=" + tree] for tree in sorted(trees)]]
+    for selector in selectors:
+        for offset in range(0, len(paths), 100):
+            checked = git(["check-attr", *selector, "-z", "--all", "--",
+                           *paths[offset:offset + 100]], project_dir)
+            if not _ok(checked):
+                raise RuntimeError("Git cannot inspect all WIP source-tree attributes")
+            fields = (getattr(checked, "stdout", "") or "").split("\0")
+            if fields[-1:] == [""]:
+                fields.pop()
+            if len(fields) % 3:
+                raise RuntimeError("invalid WIP path attributes")
+            for i in range(0, len(fields), 3):
+                path, attribute, value = fields[i:i + 3]
+                values = attributes.setdefault(path, {})
+                # An unset working-tree attribute must not mask an executable
+                # attribute that reset/checkout restores from a source tree.
+                if value not in ("unset", "unspecified") or attribute not in values:
+                    values[attribute] = value
+    return attributes
+
+
+def _active_attribute(attributes: dict[str, str], names: tuple[str, ...]) -> str:
+    return next((name for name in names
+                 if attributes.get(name, "unspecified") not in ("unspecified", "unset")), "")
+
+
+def snapshot_preflight(git: GitRunner, project_dir: str, *, sources: tuple[str, ...] = ()
+                       ) -> tuple[bool, str]:
+    """Reject executable/content-transforming attributes before even Git status."""
+    try:
+        attributes = _snapshot_attributes(git, project_dir, sources=sources)
+    except Exception as exc:
+        return False, str(exc)
+    for path, values in attributes.items():
+        attribute = _active_attribute(values, ("filter", "working-tree-encoding", "ident"))
+        if attribute:
+            return False, f"{path}: {attribute} cannot be safely snapshotted without transformations"
+    return True, ""
+
+
 def snapshot_ref_name(sha_or_id: str | None = None) -> str:
     tail = (sha_or_id or uuid.uuid4().hex)[:12]
     return f"{WIP_REF_PREFIX}{tail}"
@@ -149,6 +210,18 @@ def publish_allowed(git: GitRunner, project_dir: str, *,
                        "refuse push/merge")
     if anc is None:
         return False, "could not prove WIP snapshot is absent from branch history"
+    # Partially staged bytes live in a second orphan commit. Its ancestry
+    # must be excluded independently; merging it does not merge the main WIP
+    # snapshot, so checking only the latter can publish owner staged work.
+    message = git(["show", "-s", "--format=%B", snapshot_id], project_dir)
+    if not _ok(message):
+        return False, "could not read WIP snapshot index metadata"
+    index = re.search(r"^FlexFactor-WIP-Index: ([0-9a-f]{40,64})$", _out(message), re.M)
+    if index:
+        index_ancestor = snapshot_is_ancestor_of(git, project_dir, index[1], branch)
+        if index_ancestor is not False:
+            return False, ("WIP index snapshot is an ancestor of the branch" if index_ancestor
+                           else "could not prove WIP index snapshot is absent from branch history")
     # Also refuse if HEAD equals the snapshot (should never happen with orphan design)
     head = git(["rev-parse", "HEAD"], project_dir)
     snap = resolve_snapshot_sha(git, project_dir, snapshot_id)
@@ -164,20 +237,45 @@ def capture_orphan_wip_snapshot(git: GitRunner, project_dir: str
     only tool changes.
 
     Returns (ok, ref_name_or_none, secret_findings).
-    On failure before the ref exists the worktree is left in the original
-    dirty state (only the staging area is reset) and ref is None. If the ref
+    On failure before the ref exists the worktree and original staging state
+    are preserved and ref is None. If the ref
     was written but the worktree could not be returned to HEAD, ok is False
     and ref is STILL returned: the snapshot is safe and recoverable, the tree
     is simply not clean, and the caller must not proceed as if it were.
 
-    IGNORED FILES ARE NOT CAPTURED. `git add -A` honours .gitignore, and the
-    matching `git clean -fd` (no -x) leaves ignored files on disk untouched,
-    so they survive the run in place rather than in the snapshot.
+    Ignored files stay on disk. Dirty nested repositories and in-progress Git
+    operations are refused because a tree object cannot preserve their state.
     """
-    # Record porcelain fingerprint for restore verification callers.
+    safe, reason = snapshot_preflight(git, project_dir)
+    if not safe:
+        print(f"[flexfactor-wip] REFUSED snapshot - {reason}", file=_sys.stderr)
+        return False, None, []
+    attributes = _snapshot_attributes(git, project_dir)
+    # Keep the original index in its own orphan commit. A working-tree-only
+    # snapshot loses staged bytes whenever a path is partially staged.
     before = git(["status", "--porcelain", "-uall"], project_dir)
     if not _ok(before):
         return False, None, []
+    # An orphan tree cannot represent merge/rebase metadata, even after all
+    # conflicted paths have been staged. A hard reset would discard that state.
+    metadata = git(["rev-parse", "--absolute-git-dir"], project_dir)
+    if not _ok(metadata) or not _out(metadata):
+        return False, None, []
+    if any(os.path.exists(os.path.join(_out(metadata), marker)) for marker in (
+            "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")):
+        return False, None, []
+    # status -uall emits individual files except gitlinks/embedded repos. Their
+    # inner work is NOT stored by git add; never claim that it was captured.
+    for line in (getattr(before, "stdout", "") or "").splitlines():
+        for raw_path in line[3:].split(" -> "):
+            rel = _unquote_porcelain_path(raw_path)
+            path = os.path.join(project_dir, rel)
+            if os.path.isdir(path) and not os.path.islink(path):
+                return False, None, []
+            if _active_attribute(attributes.get(rel, {}), ("text", "eol", "crlf")):
+                print(f"[flexfactor-wip] REFUSED snapshot - {rel}: newline attributes "
+                      "cannot guarantee exact owner bytes", file=_sys.stderr)
+                return False, None, []
     # Untracked paths captured into the snapshot. After the orphan commit they
     # are removed INDIVIDUALLY (never `git clean`, which FlexFactor's command
     # policy classifies destructive because it would also nuke unrelated
@@ -185,41 +283,63 @@ def capture_orphan_wip_snapshot(git: GitRunner, project_dir: str
     untracked = [line[3:] for line in _out(before).splitlines()
                  if line.startswith("?? ")]
 
-    add = git(["add", "-A"], project_dir)
-    if not _ok(add):
+    index = git(["write-tree"], project_dir)
+    base = git(["rev-parse", "HEAD"], project_dir)
+    if not _ok(index) or not _out(index) or not _ok(base):
         return False, None, []
-    write = git(["write-tree"], project_dir)
-    if not _ok(write) or not _out(write):
-        git(["reset"], project_dir)
+    index_commit = git(["commit-tree", _out(index), "-m",
+                        "[FlexFactor] orphan WIP index"], project_dir)
+    if not _ok(index_commit) or not _out(index_commit):
         return False, None, []
-    tree = _out(write)
-    # ORPHAN: no -p parent. This commit can never be an ancestor of the
-    # sandbox branch unless someone explicitly merges it.
-    commit = git([
-        "commit-tree", tree, "-m", DIRTY_SNAPSHOT_MSG,
-    ], project_dir)
-    if not _ok(commit) or not _out(commit):
-        git(["reset"], project_dir)
+    ref = snapshot_ref_name()
+    index_ref = ref + "-index"
+    if not _ok(git(["update-ref", index_ref, _out(index_commit)], project_dir)):
         return False, None, []
-    sha = _out(commit)
-    ref = snapshot_ref_name(sha)
-    upd = git(["update-ref", ref, sha], project_dir)
-    if not _ok(upd):
-        git(["reset"], project_dir)
-        return False, None, []
-
-    secrets = scan_tree_for_secrets(git, project_dir, sha)
-
-    # Return worktree to HEAD (sandbox base) so later commits are tool-only.
-    # Mixed reset unstages; hard reset restores tracked files; clean removes
-    # untracked that we captured into the orphan tree.
-    hard = git(["reset", "--hard", "HEAD"], project_dir)
-    if not _ok(hard):
-        return False, ref, secrets  # ref kept: the work is recoverable
-    failed = _remove_captured_untracked(project_dir, untracked)
-    if failed:
-        return False, ref, secrets  # ref kept; worktree still holds the leftovers
-    return True, ref, secrets
+    captured = False
+    cleaned = False
+    secrets = []
+    try:
+        if not _ok(git(["-c", "core.autocrlf=false", "add", "-A"], project_dir)):
+            return False, None, []
+        write = git(["write-tree"], project_dir)
+        if not _ok(write) or not _out(write):
+            return False, None, []
+        # Both commits have NO parents; neither can enter candidate ancestry.
+        message = (DIRTY_SNAPSHOT_MSG + "\nFlexFactor-WIP-Base: " + _out(base)
+                   + "\nFlexFactor-WIP-Index: " + _out(index_commit))
+        commit = git(["commit-tree", _out(write), "-m", message], project_dir)
+        if not _ok(commit) or not _out(commit):
+            return False, None, []
+        if not _ok(git(["update-ref", ref, _out(commit)], project_dir)):
+            return False, None, []
+        captured = True
+        secrets = scan_tree_for_secrets(git, project_dir, _out(commit))
+        for finding in scan_tree_for_secrets(git, project_dir, _out(index_commit)):
+            if finding not in secrets:
+                secrets.append(finding)
+        # Only captured owner paths may be removed. Ignored files stay put.
+        if not _ok(git(["reset", "--hard", "--no-recurse-submodules", "HEAD"], project_dir)):
+            return False, ref, secrets
+        if _remove_captured_untracked(project_dir, untracked):
+            return False, ref, secrets
+        cleaned = True
+        return True, ref, secrets
+    except Exception:
+        return False, ref if captured else None, secrets
+    finally:
+        restored_index = True
+        if not cleaned:
+            # read-tree changes only the index; never discard owner bytes to
+            # recover from a staging/write-tree/ref failure.
+            try:
+                restored_index = _ok(git(["read-tree", _out(index)], project_dir))
+            except Exception:
+                restored_index = False
+            if not restored_index:
+                print(f"[flexfactor-wip] original index retained under {index_ref}; "
+                      "index restoration failed", file=_sys.stderr)
+        if not captured and restored_index:
+            git(["update-ref", "-d", index_ref], project_dir)
 
 
 def _unquote_porcelain_path(raw: str) -> str:
@@ -262,7 +382,8 @@ def refuse_removal_reason(project_dir: str, rel: str) -> str:
     """'' when `rel` is a safe removal target under `project_dir`, else WHY not.
 
     This is the last thing standing between a bad input and a real deletion.
-    `_remove_captured_untracked` deletes whatever it is handed, recursively, and
+    `_remove_captured_untracked` unlinks individual captured files and refuses
+    replacement directories; this guard also rejects unsafe path names, since
     nothing upstream proves those paths are safe: they are sliced out of
     `git status --porcelain` TEXT (`line[3:]`), so a malformed line, an
     unexpected porcelain shape, or git having run against the WRONG repository
@@ -325,12 +446,10 @@ def _remove_captured_untracked(project_dir: str, untracked: list[str]) -> list[s
             if os.path.islink(full) or os.path.isfile(full):
                 os.unlink(full)
             elif os.path.isdir(full):
-                for root, ds, fs in os.walk(full, topdown=False):
-                    for f in fs:
-                        os.unlink(os.path.join(root, f))
-                    for d in ds:
-                        os.rmdir(os.path.join(root, d))
-                os.rmdir(full)
+                # A captured file may have been replaced with a directory;
+                # none of its children has an individual preservation proof.
+                failed.append(rel)
+                continue
         except OSError:
             failed.append(rel)
             continue
@@ -353,6 +472,57 @@ def restore_orphan_wip_snapshot(git: GitRunner, project_dir: str,
     sha = resolve_snapshot_sha(git, project_dir, snapshot_id)
     if not sha:
         return False
+    message = git(["show", "-s", "--format=%B", sha], project_dir)
+    if not _ok(message):
+        return False
+    base = re.search(r"^FlexFactor-WIP-Base: ([0-9a-f]{40,64})$", _out(message), re.M)
+    index = re.search(r"^FlexFactor-WIP-Index: ([0-9a-f]{40,64})$", _out(message), re.M)
+    sources = (sha, index[1]) if index else (sha,)
+    safe, _reason = snapshot_preflight(git, project_dir, sources=sources)
+    if not safe:
+        return False
+    attributes = _snapshot_attributes(git, project_dir, sources=sources)
+    if base and index:
+        # Restore ONLY owner-dirty paths, retaining clean paths fixed by the
+        # run. Replacing the entire orphan tree silently reverses those fixes.
+        changed = set()
+        staged_paths = set()
+        for treeish in (sha, index[1]):
+            diff = git(["diff", "--name-only", "-z", "--no-renames",
+                        base[1], treeish], project_dir)
+            if not _ok(diff):
+                return False
+            paths = {p for p in (getattr(diff, "stdout", "") or "").split("\0") if p}
+            changed.update(paths)
+            if treeish == index[1]:
+                staged_paths = paths
+        listing = git(["ls-tree", "-r", "--name-only", "-z", sha], project_dir)
+        if not _ok(listing):
+            return False
+        present = set((getattr(listing, "stdout", "") or "").split("\0"))
+        if any(_active_attribute(attributes.get(path, {}), ("text", "eol", "crlf")) for path in changed):
+            return False
+        for path in sorted(changed):
+            # Parent symlinks must not redirect checkout/removal outside the
+            # repository, even when the ref was retained across an interruption.
+            if refuse_removal_reason(project_dir, path):
+                return False
+            if path in present:
+                if not _ok(git(["-c", "core.autocrlf=false", "checkout", sha, "--",
+                                ":(literal)" + path], project_dir)):
+                    return False
+            else:
+                full = os.path.join(project_dir, path.replace("/", os.sep))
+                if os.path.isdir(full) and not os.path.islink(full):
+                    return False  # never recursively delete a replacement directory
+                if os.path.lexists(full):
+                    os.unlink(full)
+            # This restores the original staged blob independently of the
+            # worktree blob (including staged additions/deletions and MM files).
+            index_source = index[1] if path in staged_paths else "HEAD"
+            if not _ok(git(["reset", index_source, "--", ":(literal)" + path], project_dir)):
+                return False
+        return True
     # Materialize orphan tree into index+worktree, then unstage so the dirty
     # state matches a pre-run porcelain snapshot (modified + untracked).
     # First: remove tracked files that the WIP deleted (present in HEAD, absent
@@ -392,25 +562,34 @@ def drop_wip_ref(git: GitRunner, project_dir: str, snapshot_id: str) -> bool:
     if not is_wip_snapshot_ref(snapshot_id):
         return False
     cp = git(["update-ref", "-d", snapshot_id], project_dir)
-    return _ok(cp)
+    if not _ok(cp):
+        return False
+    return _ok(git(["update-ref", "-d", snapshot_id + "-index"], project_dir))
 
 
 def porcelain_fingerprint(git: GitRunner, project_dir: str) -> str:
     """Stable fingerprint of dirty state for byte-for-byte restore proofs."""
+    safe, reason = snapshot_preflight(git, project_dir)
+    if not safe:
+        raise RuntimeError("could not fingerprint owner WIP safely: " + reason)
     # quotePath=false: otherwise non-ASCII paths arrive octal-escaped and hash
     # as "missing" even though the file is right there.
-    st = git(["-c", "core.quotePath=false", "status", "--porcelain", "-uall"],
+    st = git(["status", "--porcelain=v1", "-z", "-uall"],
              project_dir)
-    text = _out(st) if _ok(st) else ""
-    lines = sorted(l for l in text.splitlines() if l.strip())
+    if not _ok(st):
+        raise RuntimeError("could not fingerprint owner WIP status")
+    records = iter((getattr(st, "stdout", "") or "").split("\0"))
+    lines = []
+    for record in records:
+        if not record:
+            continue
+        lines.append((record, record[3:]))
+        if "R" in record[:2] or "C" in record[:2]:
+            original = next(records, "")
+            lines.append(("original " + original, original))
     # Include content hashes for each dirty path so "same names" isn't enough.
     parts = []
-    for line in lines:
-        # porcelain: XY PATH or XY ORIG -> PATH
-        path = line[3:]
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        path = path.strip().strip('"')
+    for line, path in sorted(lines):
         full = os.path.join(project_dir, path.replace("/", os.sep))
         h = "missing"
         try:
@@ -424,5 +603,11 @@ def porcelain_fingerprint(git: GitRunner, project_dir: str) -> str:
                 h = "dir"
         except OSError:
             h = "unreadable"
-        parts.append(f"{line}|{h}")
+        staged_bytes = ""
+        if line[:1] not in (" ", "?"):
+            staged = git(["ls-files", "--stage", "-z", "--", ":(literal)" + path], project_dir)
+            if not _ok(staged):
+                raise RuntimeError("could not fingerprint owner WIP index")
+            staged_bytes = getattr(staged, "stdout", "") or ""
+        parts.append(f"{line}|{h}|{staged_bytes}")
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()

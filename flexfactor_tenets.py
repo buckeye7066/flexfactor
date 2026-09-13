@@ -2078,13 +2078,18 @@ def _program_identity(value: str | os.PathLike[str]) -> str:
 def _resolved_cli_program_dir(program: str) -> Path | None:
     """Resolve every CLI-supported program form through FlexFactor's resolver."""
     try:
+        cleaned = str(program or "").strip().strip('"')
+        if not cleaned:
+            return None
+        # Enumeration already has a resolved directory in ordinary audits.
+        # Do not turn that authoritative path back into a name-discovery query.
+        direct = Path(cleaned).expanduser()
+        if direct.is_dir():
+            return direct.resolve(strict=True)
         import flexfactor
 
         resolver = getattr(flexfactor, "resolve_project_dir", None)
         if not callable(resolver):
-            return None
-        cleaned = str(program or "").strip().strip('"')
-        if not cleaned:
             return None
         hint = cleaned.rstrip("/\\").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
         hint = re.sub(r"\.lnk$", "", hint, flags=re.IGNORECASE)
@@ -2097,10 +2102,14 @@ def _resolved_cli_program_dir(program: str) -> Path | None:
         return None
 
 
-def _program_candidates(programs: Sequence[str]) -> list[tuple[int, str, str, str]]:
+def _program_candidates(
+    programs: Sequence[str], *, resolved_programs: Mapping[str, Path] | None = None,
+) -> list[tuple[int, str, str, str]]:
     candidates: list[tuple[int, str, str, str]] = []
     for index, program in enumerate(programs):
-        resolved = _resolved_cli_program_dir(program)
+        resolved = (resolved_programs or {}).get(str(program).strip().casefold())
+        if resolved is None:
+            resolved = _resolved_cli_program_dir(program)
         cleaned = str(program or "").strip().strip('"')
         if resolved is not None:
             candidate_full = os.path.normcase(str(resolved))
@@ -2130,10 +2139,12 @@ def _matching_program_index(
     project: str | os.PathLike[str],
     *,
     program: str = "",
+    candidates: Sequence[tuple[int, str, str, str]] | None = None,
 ) -> int | None:
     root = Path(project).expanduser().resolve(strict=False)
     root_full = os.path.normcase(str(root))
-    candidates = _program_candidates(programs)
+    if candidates is None:
+        candidates = _program_candidates(programs)
     exact = [index for index, _program, full, _identity in candidates
              if full == root_full]
     if len(exact) == 1:
@@ -2168,12 +2179,16 @@ def _routed_session_task(
     project: str | os.PathLike[str],
     *,
     program: str = "",
+    candidates: Sequence[tuple[int, str, str, str]] | None = None,
 ) -> str | None:
     """Return only the session instruction routed to this exact target."""
-    selected = _matching_program_index(programs, project, program=program)
+    if candidates is None:
+        candidates = _program_candidates(programs)
+    selected = _matching_program_index(
+        programs, project, program=program, candidates=candidates,
+    )
     if selected is None:
         return None
-    candidates = _program_candidates(programs)
     root = Path(project).expanduser().resolve(strict=False)
     root_full = os.path.normcase(str(root))
     targets: list[tuple[str, str]] = []
@@ -2249,6 +2264,7 @@ def _argv_task(
     *,
     project: str | os.PathLike[str] | None = None,
     program: str = "",
+    candidates: Sequence[tuple[int, str, str, str]] | None = None,
 ) -> str:
     override = os.environ.get("FLEXFACTOR_TENETS_TASK", "").strip()
     if override:
@@ -2269,7 +2285,8 @@ def _argv_task(
         if project is None or not programs:
             return session_prompts[0]
         routed_task = _routed_session_task(
-            session_prompts[0], programs, project, program=program
+            session_prompts[0], programs, project, program=program,
+            candidates=candidates,
         )
         if routed_task:
             return routed_task
@@ -2293,7 +2310,7 @@ def _argv_task(
             # a fallback when it identifies exactly one program; two checkouts
             # named "app" must never receive each other's repair objective.
             selected = _matching_program_index(
-                programs, project, program=program
+                programs, project, program=program, candidates=candidates,
             )
             if selected is not None and selected < len(guiding_prompts):
                 return guiding_prompts[selected]
@@ -2438,14 +2455,20 @@ def install(module_globals: MutableMapping[str, Any], *, argv: Sequence[str] | N
                 current_program = str(
                     module_globals.get("_FLEXFACTOR_TENETS_PROGRAM") or ""
                 ).strip()
-                task = _argv_task(
-                    effective_argv, project=root, program=current_program
-                )
                 programs = _argv_values(effective_argv, "--program")
+                candidates = _program_candidates(
+                    programs,
+                    resolved_programs={current_program.casefold(): root}
+                    if current_program else None,
+                )
+                task = _argv_task(
+                    effective_argv, project=root, program=current_program,
+                    candidates=candidates,
+                )
                 selected_roots = tuple(
                     full
                     for _index, _program, full, _identity
-                    in _program_candidates(programs)
+                    in candidates
                     if full
                 )
                 result = cached_tenets_context(
