@@ -202,7 +202,9 @@ jobs:
                    test_stale_runtime_recurrence.py \
                    test_build_target.py \
                    test_source_app_update.py \
-                   tests/test_cursor_provider.py; do
+                   tests/test_cursor_provider.py \
+                   tests/test_subscription_cli_env.py \
+                   tests/test_subscription_priority.py; do
             if [ ! -f "$t" ]; then echo "MISSING required test module: $t"; exit 1; fi
             echo "=== $t"
             if [ "$t" = "flexfactor_dashboard_tests.py" ] && [ "$RUNNER_OS" = "Linux" ]; then

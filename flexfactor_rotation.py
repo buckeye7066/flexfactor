@@ -18,8 +18,8 @@ alternating between them exhausts it at exactly the same rate as hammering one.
 So selection walks POOLS, and only picks a model once a pool is chosen.
 
 Best-available mode is an explicit product policy, not an accidental retry.
-It consumes the strongest usable paid/subscription capacity first, descends
-through weaker paid tiers only when that capacity is unavailable, and reaches
+It consumes eligible subscription capacity before separately metered API
+capacity, strongest to weakest inside each billing class, and reaches
 free/local capacity last. Quota and credit refusals cool their real allowance,
 so the next attempt continues down the ladder instead of hammering it.
 """
@@ -784,16 +784,17 @@ class Rotator:
 
             start = TIER_CHAIN.index(requested)
             tiers = TIER_CHAIN[start:]
-            # Best-available is a single descending ladder: every paid or
-            # subscription tier, strongest first, followed by every free tier.
+            # Owner policy: use every eligible subscription tier before any
+            # metered API tier; genuinely free/local capacity remains last.
             # The ordinary rotator keeps its original per-tier behavior.
-            cost_phases = (True, False) if paid_first and allow_paid else (None,)
-            for paid_capacity in cost_phases:
+            cost_phases = ((True, SUBSCRIPTION), (True, PAID_METERED), (False, None)) \
+                if paid_first and allow_paid else ((None, None),)
+            for paid_capacity, cost_class in cost_phases:
                 for depth, candidate_tier in enumerate(tiers):
                     selection = self._pick_in_tier(
                         candidate_tier, allow_paid, state, now, reasons, intent,
                         paid_first=paid_first,
-                        paid_capacity=paid_capacity)
+                        paid_capacity=paid_capacity, cost_class=cost_class)
                     if selection is None:
                         continue
                     selection.requested_tier = requested
@@ -920,10 +921,13 @@ class Rotator:
                       now: float, reasons: Dict[str, str],
                       intent: Optional[CallIntent] = None,
                       paid_first: bool = False,
-                      paid_capacity: Optional[bool] = None) -> Optional[Selection]:
+                      paid_capacity: Optional[bool] = None,
+                      cost_class: Optional[str] = None) -> Optional[Selection]:
         candidates: List[Route] = []
         for route in self.catalog.routes:
             if route.tier != tier:
+                continue
+            if cost_class is not None and route.cost_class != cost_class:
                 continue
             if not route.enabled:
                 reasons.setdefault(route.pool, route.disabled_reason or "disabled")

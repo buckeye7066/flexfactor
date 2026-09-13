@@ -23,7 +23,7 @@
     },
     {
       "id": "cb-3",
-      "text": "Every model call follows one strongest-paid-to-free ladder within source policy. Cloud SDK, CLI, Cursor and research payloads cross the egress gate.",
+      "text": "Owner coding uses subscriptions before metered APIs and then free/local, strongest first per class. All cloud, CLI, Cursor and research payloads obey the egress gate.",
       "confidence": "verified",
       "evidence_refs": [
         1,
@@ -239,7 +239,7 @@
     "A. Queue 1-30 targets sequentially; never overlap targets.",
     "B. Pass 1 covers the repository; passes 2-6 equal the prior verified delta.",
     "C. Evaluate the configured corroborated-competitor target between passes 1 and 2; the default is 25 and explicit run limits are honored.",
-    "D. Use one strongest-paid-to-free/local model ladder.",
+    "D. Owner coding uses subscriptions, metered APIs, then free/local.",
     "E. Target-controlled commands cross the execution broker.",
     "F. Analyze every relevant file completely or name the blocker.",
     "G. Cite purpose sources, contradictions, unknowns, and confidence before mutation.",
@@ -307,9 +307,9 @@
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "dabbc752bf50cb9cfb97562e089200ee049315fff5721f0079e548da86e55cd2",
-      "observed_at": "2026-09-12T05:43:04.970890+00:00",
-      "excerpt": "Model ladder and author exclusion."
+      "content_hash": "1b9695e89126d18b7bb33c4cb5e14a6f02af2585af6f1712494ca0db41614b8e",
+      "observed_at": "2026-09-13T13:06:26.550734+00:00",
+      "excerpt": "Subscription-first ladder and author exclusion."
     },
     {
       "kind": "source",
