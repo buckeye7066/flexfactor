@@ -220,7 +220,7 @@ def publish_allowed(git: GitRunner, project_dir: str, *,
     if index:
         index_ancestor = snapshot_is_ancestor_of(git, project_dir, index[1], branch)
         if index_ancestor is not False:
-            return False, ("WIP index snapshot is an ancestor of the branch" if index_ancestor
+            return False, ("WIP index snapshot is an ancestor of the branch" if index_ancestor is True
                            else "could not prove WIP index snapshot is absent from branch history")
     # Also refuse if HEAD equals the snapshot (should never happen with orphan design)
     head = git(["rev-parse", "HEAD"], project_dir)
@@ -255,6 +255,21 @@ def capture_orphan_wip_snapshot(git: GitRunner, project_dir: str
     # snapshot loses staged bytes whenever a path is partially staged.
     before = git(["status", "--porcelain", "-uall"], project_dir)
     if not _ok(before):
+        return False, None, []
+    # write-tree omits intent-to-add entries, including ones deleted on disk.
+    # Ask Git for the actual index distinction instead of guessing from status.
+    intent_views = []
+    for mode in ("--ita-visible-in-index", "--ita-invisible-in-index"):
+        view = git(["diff", "--cached", "--name-only", "-z", "--no-ext-diff",
+                    "--no-textconv", mode], project_dir)
+        if not _ok(view) or not isinstance(getattr(view, "stdout", None), str):
+            print("[flexfactor-wip] REFUSED snapshot - cannot inspect intent-to-add "
+                  "index entries", file=_sys.stderr)
+            return False, None, []
+        intent_views.append(view.stdout)
+    if intent_views[0] != intent_views[1]:
+        print("[flexfactor-wip] REFUSED snapshot - intent-to-add index entries "
+              "cannot be represented by an orphan tree", file=_sys.stderr)
         return False, None, []
     # An orphan tree cannot represent merge/rebase metadata, even after all
     # conflicted paths have been staged. A hard reset would discard that state.
