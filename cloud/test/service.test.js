@@ -659,10 +659,11 @@ for (const newerRef of ["android-v3.5.10", "android-v3.6.0", "android-v4.0.0"]) 
     const current = installedWorkflow();
     current.body.content = Buffer.from(mobileWorkflow().replace(ENGINE_REF, newerRef)).toString("base64");
     const fetcher = queuedFetch([
+    missingRequestClaim(),
       { body: { workflow_runs: [] } },
       { body: { default_branch: "main" } },
       resolvedRef(), missingRequestClaim(), createdRequestClaim(), current,
-      storedClaim(validRun()), { status: 204 },
+      { status: 204 }, { status: 204 },
     ]);
     await assert.rejects(
       () => dispatch("gho_dispatch_token", validRun(), {}, fetcher, async () => {}),
@@ -670,6 +671,8 @@ for (const newerRef of ["android-v3.5.10", "android-v3.6.0", "android-v4.0.0"]) 
     );
     assert.equal(fetcher.calls.some(({ url, options }) =>
       options.method !== "GET" && /\/contents\/|\/git\/refs|\/pulls|\/dispatches|\/secrets\//.test(url)), false);
+    assert.match(fetcher.calls[0].url, /actions\/variables\/FLEXFACTOR_RUN_/);
+    assert.match(fetcher.calls.at(-2).url, /actions\/variables\/FLEXFACTOR_STEERING_/);
     assert.equal(fetcher.calls.at(-1).options.method, "DELETE");
     assert.match(fetcher.calls.at(-1).url, /actions\/variables\/FLEXFACTOR_RUN_/);
   });
@@ -679,6 +682,7 @@ test("an older installed runner is upgraded and dispatched", async () => {
   const current = installedWorkflow();
   current.body.content = Buffer.from(mobileWorkflow().replace(ENGINE_REF, "android-v3.5.3")).toString("base64");
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } }, { body: { default_branch: "main" } },
     resolvedRef(), missingRequestClaim(), createdRequestClaim(), current,
     { status: 200, body: {} }, acceptedDispatch(987654), markedRequestClaim(),
@@ -695,16 +699,17 @@ test("protected-branch retry preserves an engine upgraded during the initial wri
   const newer = installedWorkflow();
   newer.body.content = Buffer.from(mobileWorkflow().replace(ENGINE_REF, "android-v4.0.0")).toString("base64");
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } }, { body: { default_branch: "main" } },
     resolvedRef(), missingRequestClaim(), createdRequestClaim(), old,
     { status: 409, body: { message: "Protected branch changed" } },
     { body: { owner: { login: "owner" } } }, { body: { object: { sha: "b".repeat(40) } } },
-    newer, storedClaim(validRun()), { status: 204 },
+    newer, { status: 204 }, { status: 204 },
   ]);
   await assert.rejects(
     () => dispatch("gho_dispatch_token", validRun(), {}, fetcher, async () => {}),
     (error) => error instanceof ServiceError && error.code === "engine_downgrade_blocked",
   );
   assert.equal(fetcher.calls.some(({ url }) => /\/git\/refs$|\/pulls$|\/dispatches$/.test(url)), false);
-  assert.match(fetcher.calls[9].url, new RegExp(`ref=${"b".repeat(40)}$`));
+  assert.match(fetcher.calls[10].url, new RegExp(`ref=${"b".repeat(40)}$`));
 });

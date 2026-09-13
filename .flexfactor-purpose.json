@@ -328,8 +328,8 @@
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
-      "content_hash": "2c41ffae2f3edcf97372c2aed48eadb209a207fbabc56b767c17883e5e690eb5",
-      "observed_at": "2026-09-13T12:57:12Z",
+      "content_hash": "22a35acd7b134fecc4976438462130149039c18d75dfb73d53dc014b9c275519",
+      "observed_at": "2026-09-13T13:44:00.227462+00:00",
       "excerpt": "Dispatch, downgrade guard, and scoped cleanup."
     },
     {
@@ -342,8 +342,8 @@
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MainActivity.java",
-      "content_hash": "723ebabf97b63fb8f335188b04ca3a57366cc26a34df774c78443385f7f91973",
-      "observed_at": "2026-09-09T03:25:58.981361+00:00",
+      "content_hash": "e8141429044cc49d2eede1fc7ea78da99ebd0e2313ec1797cbbffc93816a5422",
+      "observed_at": "2026-09-13T13:44:00.228496+00:00",
       "excerpt": "Android dispatch recovery."
     },
     {
