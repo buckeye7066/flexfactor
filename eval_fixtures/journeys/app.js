@@ -19,6 +19,7 @@ const { URL } = require('url');
 const querystring = require('querystring');
 
 const state = { submissions: [], received: [], deletes: 0 };
+const replayField = 'proof\\"field';
 
 function page(title, body) {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${title}</title>
@@ -84,12 +85,14 @@ const server = http.createServer(async (req, res) => {
 <label for="name">Name</label><input id="name" name="name" type="text" required>
 <label for="email">Email</label><input id="email" name="email" type="email" required>
 <label for="message">Message</label><textarea id="message" name="message"></textarea>
+<label for="proof">Reference</label><input id="proof" name="proof\\&quot;field" type="text">
 <button type="submit">Submit</button></form>`));
     }
     const body = await readBody(req);
-    const rec = { name: String(body.name || ''), email: String(body.email || ''), message: String(body.message || ''), at: Date.now() };
+    const rec = { name: String(body.name || ''), email: String(body.email || ''), message: String(body.message || ''), replay: String(body[replayField] || ''), at: Date.now() };
     state.received.push({ ...rec, messageLength: rec.message.length, message: rec.message.slice(0, 80) });
     if (!rec.name || !rec.email) return send(res, 400, page('Error', '<h1>Contact</h1><p role="alert">Missing required fields</p>'));
+    if (!rec.replay) return send(res, 400, page('Error', '<h1>Contact</h1><p role="alert">Missing reference</p>'));
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rec.email)) return send(res, 400, page('Error', '<h1>Contact</h1><p role="alert">Invalid email</p>'));
     if (rec.message.length > 5000) return send(res, 413, page('Error', '<h1>Contact</h1><p role="alert">Message too long</p>'));
     if (state.submissions.some((s) => s.email === rec.email)) return send(res, 409, page('Duplicate', '<h1>Contact</h1><p role="alert">Duplicate submission</p>'));

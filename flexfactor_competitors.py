@@ -91,11 +91,28 @@ _FIRECRAWL_SEARCH_URL = "https://api.firecrawl.dev/v2/search"
 # can never drift from the competitor reuse gate. The module-level default below
 # keeps this file usable standalone.
 _COMPATIBLE_ORACLE: list = [None]
+_EGRESS_GUARD: list = [None]
 
 
 def set_license_oracle(fn) -> None:
     """flexfactor installs `_license_compatible` here at import time."""
     _COMPATIBLE_ORACLE[0] = fn
+
+
+def set_egress_guard(fn) -> None:
+    """Use the caller's explicit sharing/redaction policy for derived queries."""
+    _EGRESS_GUARD[0] = fn
+
+
+def _guard_discovery_text(text: str) -> str:
+    """Local-model output is still source-derived when it becomes a search."""
+    if _EGRESS_GUARD[0] is not None:
+        return _EGRESS_GUARD[0](text)
+    import flexfactor_egress
+    action, output, _findings = flexfactor_egress.gate_text(text, mode="block")
+    if action == "blocked":
+        raise RuntimeError("flexfactor_egress_blocked: sensitive research query or URL")
+    return output
 
 
 # --------------------------------------------------------------------------- #
@@ -420,6 +437,7 @@ def fetch_evidence_document(url: str, title: str = "", opener=None) -> dict:
     from which a capability idea may be gleaned: exact URL, content digest,
     bounded visible text, and a stable ID the model must cite.
     """
+    url = _guard_discovery_text(url)
     if not _public_evidence_url(url):
         raise RuntimeError("refused non-public competitor evidence URL")
     transport = opener or _default_evidence_opener
@@ -615,6 +633,10 @@ def web_search(query: str, limit: int = 6, opener=None, *,
     """
     opener = opener or _default_opener
     skipped: dict[str, str] = {}
+    try:
+        query = _guard_discovery_text(query)
+    except Exception as exc:
+        return [], "", {"egress": str(exc)}
     for name, fn in _WEB_BACKENDS:
         try:
             if name == "firecrawl":
@@ -661,6 +683,7 @@ def github_repo_search(query: str, limit: int = 5, opener=None) -> list[dict]:
     GITHUB_TOKEN/GH_TOKEN in the environment is used when present purely to
     raise the rate limit; it is never required.
     """
+    query = _guard_discovery_text(query)
     opener = opener or _default_opener
     # RELEVANCE, NOT POPULARITY. `sort=stars` asks GitHub for the most-starred
     # repositories that match AT ALL, and for a descriptive query that is a list

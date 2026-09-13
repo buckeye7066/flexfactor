@@ -1476,9 +1476,11 @@ class RotatingProvider:
                  on_route: Optional[Callable[[Selection], None]] = None,
                  on_error: Optional[Callable[[Route, BaseException], None]] = None,
                  paid_first: bool = False,
-                 role_coordinator: Optional[RoleCoordinator] = None):
+                 role_coordinator: Optional[RoleCoordinator] = None,
+                 payload_guard: Optional[Callable[[str], str]] = None):
         self.rotator = rotator
         self._factory = factory
+        self.payload_guard = payload_guard
         self._tier = tier
         self._judge_tier = judge_tier
         self._allow_paid = allow_paid
@@ -1599,6 +1601,19 @@ class RotatingProvider:
         return intent
 
     # -- plumbing ----------------------------------------------------------
+    def _guard_payload(self, value):
+        """Apply the source policy at the shared boundary, including CLI routes."""
+        if isinstance(value, str):
+            return self.payload_guard(value)
+        if isinstance(value, tuple):
+            return tuple(self._guard_payload(item) for item in value)
+        if isinstance(value, list):
+            return [self._guard_payload(item) for item in value]
+        if isinstance(value, dict):
+            return {self._guard_payload(key): self._guard_payload(item)
+                    for key, item in value.items()}
+        return value
+
     def _provider_for(self, route: Route) -> Any:
         # Locked: parallel reviews call through one RotatingProvider, and an
         # unlocked check-then-build would construct the same route's provider
@@ -1741,7 +1756,11 @@ class RotatingProvider:
             if self._on_route:
                 self._on_route(selection)
             try:
-                result = getattr(self._provider_for(route), method)(*args, **kwargs)
+                call_args, call_kwargs = args, kwargs
+                if self.payload_guard is not None and route.api != "ollama":
+                    call_args = self._guard_payload(args)
+                    call_kwargs = self._guard_payload(kwargs)
+                result = getattr(self._provider_for(route), method)(*call_args, **call_kwargs)
                 if result_validator is not None:
                     # Run semantic/schema validation BEFORE reporting the route
                     # successful. CLI/Cursor adapters cannot import FlexFactor's

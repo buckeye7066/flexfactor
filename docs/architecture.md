@@ -1,6 +1,6 @@
 # FlexFactor architecture
 
-This document describes the 0.6.2 engine, Android 3.5.3 client, and 1.1.3
+This document describes the 0.6.3 engine, Android 3.5.5 client, and 1.1.4
 managed control plane.
 
 ## Execution topology
@@ -10,7 +10,7 @@ managed control plane.
 | Desktop/CLI | Four-mode request entry, local evidence display | A second model policy or unverified success |
 | Android APK | OAuth UI, encrypted sessions/keys, 30-target durable queue, run history, signed updates | Target toolchains, generic GitHub access, plaintext cloud secrets |
 | FlexFactor Cloud | Device OAuth exchange/refresh, bounded repository discovery, caller installation, idempotent dispatch, status/artifact/steering proxy | Persistent token storage, target execution, provider plaintext |
-| Sequential orchestrator | Target admission, pass ordering, exact delta scopes, top-three competitor boundary, durable receipts | Model/provider choice by workers |
+| Sequential orchestrator | Target admission, pass ordering, exact delta scopes, configured competitor boundary, durable receipts | Model/provider choice by workers |
 | Ephemeral runner | Exact tagged engine, target checkout, builds/tests/browser tooling, evidence, publication | Owner OAuth session or mobile UI state |
 | GitHub default branch | Authoritative landing proof for the reviewed SHA | Acceptance of unreviewed or red candidates |
 
@@ -26,7 +26,7 @@ PowerShell launchers all use that same dispatcher.
 2. persist every state transition atomically;
 3. admit only `next_index`, with at most one active target;
 4. require pass 1 to be the complete repository;
-5. require the top-three competitor gate before pass 2;
+5. require the configured competitor gate before pass 2 (25 by default);
 6. require each later scope to equal the preceding verified edit delta;
 7. reject pass 7 or any skipped/overlapping transition;
 8. recover an interrupted target as a fresh attempt without losing its receipt.
@@ -64,8 +64,8 @@ Audit and Production Ready follow this order:
 4. create baseline inventory, purpose, code index, and executable gate status;
 5. run semantic pass 1 across the entire repository;
 6. commit only build/suite-verified checkpoints locally;
-7. research and attempt the top three corroborated, purpose-compatible,
-   licence-safe competitor capabilities;
+7. research the configured corroborated-competitor target and attempt
+   purpose-compatible, licence-safe capabilities;
 8. run up to five exact-delta follow-up passes;
 9. execute native tests, coverage, browser journeys, rescan, blast-radius,
    secret, purpose, and readiness gates;

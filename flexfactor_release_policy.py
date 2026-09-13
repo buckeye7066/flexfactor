@@ -168,12 +168,12 @@ _EXPOSED_MARKUP_ATTRIBUTES = {
 _SCRIPT_BLOCK = re.compile(
     r'''<script\b(?P<attributes>'''
     r'''(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?)\s*>'''
-    r'''(?P<body>[\s\S]*?)</script\s*>''',
+    r'''(?P<body>[\s\S]*?)</script(?=[\t\n\f\r />])[^>]*>''',
     re.IGNORECASE,
 )
 _STYLE_BLOCK = re.compile(
     r'''<style\b(?P<attributes>(?:\s+(?:"[^"]*"|'[^']*'|[^'">])*)?)\s*>'''
-    r'''(?P<body>[\s\S]*?)</style\s*>''',
+    r'''(?P<body>[\s\S]*?)</style(?=[\t\n\f\r />])[^>]*>''',
     re.IGNORECASE,
 )
 _RCDATA_ELEMENT = re.compile(

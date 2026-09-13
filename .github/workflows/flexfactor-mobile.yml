@@ -50,7 +50,7 @@ permissions:
 
 jobs:
   flexfactor:
-    uses: buckeye7066/flexfactor/.github/workflows/mobile-run.yml@android-v3.5.4
+    uses: buckeye7066/flexfactor/.github/workflows/mobile-run.yml@android-v3.5.5
     with:
       request_id: ${{ inputs.request_id }}
       mode: ${{ inputs.mode }}

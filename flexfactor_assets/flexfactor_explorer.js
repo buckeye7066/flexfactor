@@ -635,7 +635,10 @@ function sampleValue(kind, field) {
       const data = form.replayData || {};
       for (const [name, value] of Object.entries(data)) {
         if (typeof value !== 'string' || value.includes('…(')) continue;
-        const el = loc.locator(`[name="${name.replace(/"/g, '\\"')}"], #${CSS_escape(name)}`).first();
+        // Field names are page-controlled. Escape the complete value with the
+        // browser's CSS parser rules, including backslashes and control bytes.
+        const escaped = await page.evaluate((value) => CSS.escape(value), name);
+        const el = loc.locator(`[name="${escaped}"], [id="${escaped}"]`).first();
         if (await el.count()) await el.fill(value, { timeout: 3000 }).catch(() => {});
       }
       const obs = await submitAndObserve(page, loc, form);
@@ -649,7 +652,6 @@ function sampleValue(kind, field) {
     await bestEffortClose(page, `duplicate form page ${form.action || form.url}`);
     return result;
   }
-  function CSS_escape(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`); }
 
   // ---- destructive controls (isolated only) ---------------------------------------------
   async function runDestructiveControls() {

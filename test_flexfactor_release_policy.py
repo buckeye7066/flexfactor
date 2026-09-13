@@ -526,6 +526,19 @@ class ReleaseLanguageDecoderTests(unittest.TestCase):
                     policy.matching_labels(source.encode(), "page.html"),
                 )
 
+    def test_inline_copy_survives_browser_accepted_end_tag_attributes(self):
+        first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
+        second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))
+        for ending in ("\t\n bar", " data-x=ignored", "/"):
+            for tag, body in (
+                ("script", f'out.textContent = "{first}" + " {second}";'),
+                ("style", f'.x::after {{ content: "{first} " "{second}"; }}'),
+            ):
+                with self.subTest(tag=tag, ending=ending):
+                    source = f"<{tag}>{body}</{tag}{ending}>"
+                    self.assertIn("manual_gate", policy.matching_labels(
+                        source.encode(), "page.html"))
+
     def test_attributes_embedded_css_and_python_literals_are_rendered(self):
         first = "".join(map(chr, (109, 97, 110, 117, 97, 108)))
         second = "".join(map(chr, (97, 112, 112, 114, 111, 118, 97, 108)))

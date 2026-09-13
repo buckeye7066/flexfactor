@@ -1,6 +1,6 @@
 # Purpose & Acceptance Contract — FlexFactor
 
-**Version:** 0.4
+**Version:** 0.5
 **Application:** FlexFactor  
 **Executor:** Cursor  
 **Repository:** buckeye7066/flexfactor (default `main`)  
@@ -23,8 +23,9 @@ evidence and deterministic rollback.
 3. Repository-supplied installs, builds, tests, and scripts run inside enforced
    resource, network, path, process, and time containment on Windows and Linux.
 4. Batch and project budgets, immutable manifests, exact commands and evidence,
-   and deterministic rollback are required. Report-only/apply-off is the
-   default; mutation requires explicit apply authorization.
+   and deterministic rollback are required. Audit and Production Ready always
+   attempt real repair and publication; report-only and dry-run paths are
+   absent. Scout requires explicit authorization before applying proposals.
 5. The full Windows and Linux suite covers verifier outage, dirty worktrees,
    cancellation, timeout, partial failure, and backward compatibility.
 6. Audit and apply are unambiguous, and every modification is tied to its
@@ -42,11 +43,12 @@ test, and publication gates remain mandatory.
 
 ## Resolved authority conflict
 
-An earlier checked-in revision required every Audit and Production Ready run to
-apply changes and denied a report-only path. That contradicted the owner's
-current baseline and bridge plan. The owner directive controls: report-only is
-the default, apply must be explicit, and mandatory-mutation behavior remains a
-gap until corrected.
+An earlier checked-in revision incorrectly claimed report-only was the owner
+default. The standing owner directive, reaffirmed by the September 12 Obsidian
+handoff, requires every Audit and Production Ready run to be real, with no
+dry-run or report-only option. Existing repair/publication behavior implements
+that directive; it is not a gap. Verification and explicit Scout apply
+authorization remain mandatory.
 
 ## Forbidden substitutes
 

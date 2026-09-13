@@ -1,4 +1,4 @@
-# FlexFactor - Evidence model (0.6.2)
+# FlexFactor - Evidence model (0.6.3)
 
 Two artifacts per run: the **run manifest** (`<slug>_run_manifest_<stamp>.json`
 written into the target dir by `_write_run_manifest`, never overwritten) and the
@@ -31,6 +31,7 @@ New in this tree:
 | `purpose_mutation_authorized` | `mutation_authorized_by_purpose()` | bool; false => gap cap forced to 0 |
 | `purpose_evidence_summary` | cache of `gather_purpose_evidence` | counts of sources / contradictions / unknowns / integrations |
 | `trust_repo_override` | `--trust-repo` (audit, production ready, and scout) | bool |
+| `source_classification` | repository scan before provider construction | ordinary/sensitive/unknown, scanned-file count, categories, unreadable paths, explicit exception, and local-only decision; no source bytes |
 
 ## 2. Evidence bundle artifacts
 
@@ -66,8 +67,8 @@ Gate (`direct_function_gate`): `complete` iff `total == direct + blocked`
 are reported). `merge_into_function_coverage` sets
 `function_coverage_basis` = `direct-tool-evidence` when any direct row exists,
 else `module-execution-only (NOT direct)`; `coverage_run` meta records the
-commands tried, rc, refusals and artifacts. Limitation: the audit path passes
-`blocked={}`.
+commands tried, rc, refusals and artifacts. Audit passes the coverage runner's
+named `blocked` reasons through the direct-function gate.
 
 ## 5. Journey matrix
 
@@ -106,6 +107,5 @@ was restored, the release status and its unmet list.
 
 CANNOT: "sandboxed" on Windows; "all functions exercised" without
 `direct_gate.complete`; approval from a partial/blocked chunk; PRODUCTION READY
-with any critical unknown; a pass from a gate that did not run; on this tree,
-a passing `independent-final-review` gate on the audit path (head_matches
-defect).
+with any critical unknown; or a pass from a gate that did not run. Audit checks
+`head_matches` using the Git argv adapter before accepting final review.

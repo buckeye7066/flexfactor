@@ -320,6 +320,10 @@ class ExplorerIntegrationTests(unittest.TestCase):
         # duplicate submission recorded + rejected by the backend (409)
         self.assertEqual(cases["duplicate"]["httpStatus"], 409, cases["duplicate"])
         self.assertTrue(cases["duplicate"]["rejected"])
+        replayed = [row["replay"] for row in backend["received"] if row["email"] == email]
+        self.assertEqual(len(replayed), 2, replayed)
+        self.assertTrue(replayed[0])
+        self.assertEqual(replayed[0], replayed[1])
         dup = [f for f in r["findings"] if f["kind"] == "duplicate-submission"]
         self.assertEqual(len(dup), 1, r["findings"])
         self.assertEqual(dup[0]["form"], "/contact")

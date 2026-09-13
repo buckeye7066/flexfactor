@@ -25,18 +25,20 @@ provides reproducible evidence and deterministic rollback.
 3. Every mode establishes an evidence-cited understanding of the target's
    primary users, core journeys, purpose, and acceptance criteria before it can
    mutate the program.
-4. The top three corroborated competitors are considered after pass 1 and
-   before pass 2. Scout searches public product/documentation URLs; Repo Rewards
+4. The configured corroborated-competitor target is considered after pass 1
+   and before pass 2; the default is 25 and explicit run limits are honored.
+   Scout searches public product/documentation URLs; Repo Rewards
    separately searches repositories. Ideas require a relevant fetched source
    and an exact evidence citation. Only purpose-compatible and licence-safe
    capabilities may be implemented, through normal verification.
 5. Model selection is one strongest-to-weakest ladder: paid/subscription
    capacity first while available, then lower paid tiers, then free/local.
    Workers cannot select paid/free/provider side paths.
-6. Report-only is the default. Mutation requires explicit apply authorization,
-   Git, `origin`, a named branch, and a resolvable authoritative default branch.
-   Once apply is authorized, publication proof is mandatory; a local-only
-   change is not success.
+6. Audit and Production Ready perform real repair and publication on every
+   run. They have no report-only or dry-run path. Refactor also applies verified
+   changes; Scout discovery requires explicit authorization before applying.
+   Applying modes require Git, `origin`, a named branch, and a resolvable
+   authoritative default branch. A local-only change is not success.
 7. Model output is untrusted. A candidate must pass the target's real build and
    strongest suite; an absent gate is not a pass.
 8. The complete candidate patch is reviewed in content-addressed chunks against
@@ -62,8 +64,9 @@ whole-repository/delta contract applies to the repository repair loop in Audit
 and Production Ready; Refactor's bounded reps stay scoped to its selected file,
 and Scout stays a discovery/proposal flow until apply is authorized.
 
-Audit must therefore have a real report-only journey, and every applying mode
-must make the transition from report to mutation explicit and auditable.
+Audit and Production Ready must attempt real corrections while preserving
+verification and publication gates. This does not authorize invented edits
+when the target is already correct, or retention of an unverified candidate.
 
 ## Completion evidence
 
@@ -122,12 +125,13 @@ Only these owner-facing states are valid:
 
 ## Owner-authority reconciliation
 
-An earlier checked-in contract reversed the owner requirement by requiring a
-real apply journey for every Audit and Production Ready invocation and denying
-a report-only path. The current owner directive controls: report-only/apply-off
-is the default, and mutation requires explicit apply authorization. Existing
-mandatory-mutation behavior is an implementation gap, not a product
-requirement; the contradiction remains recorded in the structured contract.
+An earlier checked-in contract incorrectly described report-only/apply-off as
+the owner default. The standing owner instruction, reaffirmed in the September
+12 Obsidian handoff, is that every Audit and Production Ready run is real: no
+dry runs and no report-only mode. The implemented apply/publication behavior
+follows that instruction. Scout's explicit apply authorization remains part
+of its discovery workflow. The corrected contradiction is recorded in the
+structured contract.
 
 The required compatibility matrix is also explicit: Windows and Linux must
 cover verifier outage, dirty worktrees, cancellation, timeout, partial failure,
