@@ -52,14 +52,19 @@ class OwnerWipPreservationTests(unittest.TestCase):
         self.assertEqual(wip.porcelain_fingerprint(ff._git, self.root), fingerprint)
 
     def test_intent_to_add_index_entry_is_preserved_or_refused(self):
-        (Path(self.root) / "intent.txt").write_bytes(b"owner intent-to-add bytes\n")
-        git(["add", "-N", "intent.txt"], self.root)
-        before = self.state()
-        self.assertIn(" A intent.txt", before[1])
-        ok, ref, _ = wip.capture_orphan_wip_snapshot(ff._git, self.root)
-        if ok:
-            self.assertTrue(wip.restore_orphan_wip_snapshot(ff._git, self.root, ref))
-        self.assertEqual(self.state(), before)
+        for deleted in (False, True):
+            with self.subTest(deleted=deleted):
+                path = Path(self.root) / "intent.txt"
+                path.write_bytes(b"owner intent-to-add bytes\n")
+                git(["add", "-N", "intent.txt"], self.root)
+                if deleted:
+                    path.unlink()
+                before = self.state()
+                self.assertIn((" D" if deleted else " A") + " intent.txt", before[1])
+                ok, ref, _ = wip.capture_orphan_wip_snapshot(ff._git, self.root)
+                if ok:
+                    self.assertTrue(wip.restore_orphan_wip_snapshot(ff._git, self.root, ref))
+                self.assertEqual(self.state(), before)
 
     def test_capture_failure_preserves_original_index_and_worktree(self):
         before = self.dirty()
