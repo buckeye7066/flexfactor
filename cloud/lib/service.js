@@ -1,5 +1,6 @@
 import {
   API_VERSION,
+  ENGINE_REF,
   MAX_ARTIFACT_BYTES,
   OAUTH_CLIENT_ID,
   WORKFLOW_FILE,
@@ -500,18 +501,28 @@ async function installWorkflowThroughPullRequest(token, repository, baseBranch, 
     throw new ServiceError(409, "protected_branch_unresolved",
       "The protected target branch could not be resolved.");
   }
+  // Recheck the exact base commit before creating a branch: the first write
+  // may have raced an engine upgrade on the protected default branch.
+  const contentPath = `/repos/${repository}/contents/${WORKFLOW_PATH}`;
+  const existing = await githubRaw(token, "GET",
+    `${contentPath}?ref=${encode(baseSha)}`, undefined, fetchImpl);
+  if (existing.status !== 200 && existing.status !== 404) {
+    throw new ServiceError(existing.status >= 500 ? 502 : existing.status,
+      "github_request_failed", safeGitHubError(existing));
+  }
+  if (existing.status === 200) {
+    const current = parseJson(existing.body, "GitHub");
+    if (typeof current.content === "string") {
+      const actual = Buffer.from(current.content.replace(/\n/g, ""), "base64").toString("utf8");
+      if (actual === expected) return false;
+      assertNoEngineDowngrade(actual);
+    }
+  }
   const installBranch = `flexfactor/mobile-runner-${crypto.randomUUID().slice(0, 8)}`;
   await githubJson(token, "POST", `/repos/${repository}/git/refs`, {
     ref: `refs/heads/${installBranch}`,
     sha: baseSha,
   }, fetchImpl);
-  const contentPath = `/repos/${repository}/contents/${WORKFLOW_PATH}`;
-  const existing = await githubRaw(token, "GET",
-    `${contentPath}?ref=${encode(installBranch)}`, undefined, fetchImpl);
-  if (existing.status !== 200 && existing.status !== 404) {
-    throw new ServiceError(existing.status >= 500 ? 502 : existing.status,
-      "github_request_failed", safeGitHubError(existing));
-  }
   const write = {
     message: "Install FlexFactor Mobile runner",
     content: Buffer.from(expected, "utf8").toString("base64"),
@@ -555,6 +566,23 @@ async function installWorkflowThroughPullRequest(token, repository, baseBranch, 
     `This repository protects ${baseBranch}. FlexFactor opened the runner installation PR${pull.html_url ? `: ${pull.html_url}` : "."} GitHub's configured approvals must complete before its first phone run.`);
 }
 
+function assertNoEngineDowngrade(workflow) {
+  // A rolled-back control plane must never replace a newer installed engine.
+  // Compare numeric components, not strings (3.5.10 is newer than 3.5.5).
+  const expected = ENGINE_REF.slice("android-v".length).split(".").map(BigInt);
+  const pins = workflow.matchAll(/^[ \t]*uses:[ \t]*["']?buckeye7066\/flexfactor\/\.github\/workflows\/mobile-run\.yml@(android-v(\d+)\.(\d+)\.(\d+))["']?[ \t]*(?:#.*)?\r?$/gmi);
+  for (const pin of pins) {
+    const installed = pin.slice(2, 5).map(BigInt);
+    for (let part = 0; part < 3; part += 1) {
+      if (installed[part] < expected[part]) break;
+      if (installed[part] > expected[part]) {
+        throw new ServiceError(409, "engine_downgrade_blocked",
+          `This repository already uses ${pin[1]}, newer than the cloud engine ${ENGINE_REF}. Update the FlexFactor cloud service before retrying; the installed runner was preserved.`);
+      }
+    }
+  }
+}
+
 async function ensureTargetWorkflow(token, repository, branch, fetchImpl) {
   const path = `/repos/${repository}/contents/${WORKFLOW_PATH}?ref=${encode(branch)}`;
   const existing = await githubRaw(token, "GET", path, undefined, fetchImpl);
@@ -566,6 +594,7 @@ async function ensureTargetWorkflow(token, repository, branch, fetchImpl) {
     if (typeof current.content === "string") {
       const actual = Buffer.from(current.content.replace(/\n/g, ""), "base64").toString("utf8");
       if (actual === expected) return false;
+      assertNoEngineDowngrade(actual);
     }
   } else if (existing.status !== 404) {
     throw new ServiceError(existing.status >= 500 ? 502 : existing.status,

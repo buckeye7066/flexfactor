@@ -53,9 +53,32 @@ jobs:
         if: github.event_name != 'pull_request'
         shell: bash
         run: |
-          health=$(curl --fail --silent --show-error --retry 3 \
-            https://flexfactor-cloud.vercel.app/api/health)
-          jq -e '.ok == true and .oauth_device_configured == true' <<<"$health"
+          node --input-type=module <<'JS'
+          import assert from "node:assert/strict";
+          import { setTimeout as delay } from "node:timers/promises";
+          import { ENGINE_REF, SERVICE_NAME, SERVICE_VERSION } from "./cloud/lib/config.js";
+          let lastError;
+          for (let attempt = 0; attempt < 18; attempt += 1) {
+            try {
+              const response = await fetch("https://flexfactor-cloud.vercel.app/api/health", {
+                signal: AbortSignal.timeout(15000),
+              });
+              assert.equal(response.status, 200);
+              const health = await response.json();
+              assert.equal(health.ok, true);
+              assert.equal(health.oauth_device_configured, true);
+              assert.equal(health.service, SERVICE_NAME);
+              assert.equal(health.version, SERVICE_VERSION);
+              assert.equal(health.engine_ref, ENGINE_REF);
+              console.log(JSON.stringify(health));
+              process.exit(0);
+            } catch (error) {
+              lastError = error;
+              if (attempt < 17) await delay(5000);
+            }
+          }
+          throw lastError;
+          JS
       - name: Install pinned provider SDKs + the package
         shell: bash
         run: |
