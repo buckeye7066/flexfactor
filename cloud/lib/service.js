@@ -22,7 +22,8 @@ const RUN_FIELDS = new Set([
 const ALLOWED_SECRETS = new Set(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
 const REPOSITORY_PAGE_SIZE = 100;
 const MAX_REPOSITORY_PAGES = 100;
-const MAX_IDEMPOTENCY_SCAN_PAGES = 10;
+const MAX_IDEMPOTENCY_SCAN_PAGES = 100;
+const DISPATCH_PENDING_MS = 15 * 60 * 1000;
 const REQUEST_VARIABLE_PREFIX = "FLEXFACTOR_RUN_";
 
 export class ServiceError extends Error {
@@ -68,14 +69,8 @@ function parseJson(buffer, label = "upstream") {
 }
 
 function safeGitHubError(result) {
-  let detail = "";
-  try {
-    const parsed = JSON.parse(result.body.toString("utf8"));
-    if (typeof parsed.message === "string") detail = parsed.message.trim().slice(0, 160);
-  } catch {
-    // The status is sufficient; never reflect an arbitrary upstream body.
-  }
-  return `GitHub request failed (HTTP ${result.status})${detail ? `: ${detail}` : "."}`;
+  // Upstream error text can echo credentials or other request content.
+  return `GitHub request failed (HTTP ${result.status}).`;
 }
 
 async function responseBytes(response, maximum) {
@@ -193,9 +188,20 @@ async function oauthTokenRequest(parameters, fetchImpl = fetch) {
 
 function normalizedOAuthToken(value) {
   if (typeof value.access_token !== "string" || !value.access_token.trim()) {
-    const error = typeof value.error === "string" ? value.error : "oauth_exchange_failed";
-    const description = typeof value.error_description === "string"
-      ? value.error_description.trim().slice(0, 240) : "GitHub did not return an access token.";
+    const messages = new Map([
+      ["authorization_pending", "Waiting for GitHub device authorization."],
+      ["slow_down", "Wait before checking GitHub device authorization again."],
+      ["expired_token", "The GitHub device code has expired. Start sign-in again."],
+      ["access_denied", "GitHub authorization was declined. Start sign-in again."],
+      ["bad_refresh_token", "The GitHub session could not be refreshed. Sign in again."],
+      ["invalid_grant", "The GitHub session is no longer valid. Sign in again."],
+      ["incorrect_device_code", "The GitHub device code is invalid. Start sign-in again."],
+      ["incorrect_client_credentials", "GitHub could not identify the sign-in application."],
+      ["unsupported_grant_type", "GitHub does not support this sign-in request."],
+      ["device_flow_disabled", "GitHub device sign-in is unavailable for this application."],
+    ]);
+    const error = messages.has(value.error) ? value.error : "oauth_exchange_failed";
+    const description = messages.get(error) || "GitHub did not return an access token. Sign in again.";
     throw new ServiceError(error === "authorization_pending" || error === "slow_down" ? 202 : 401,
       error, description);
   }
@@ -414,12 +420,20 @@ export async function providerPublicKey(token, repository, fetchImpl = fetch) {
   return { key: key.key, key_id: key.key_id };
 }
 
-async function putRepositorySecret(token, repository, name, value, fetchImpl) {
-  if (!ALLOWED_SECRETS.has(name)) {
+function requestSecretName(requestId, provider) {
+  return `FLEXFACTOR_${requestId.replaceAll("-", "").toUpperCase()}_${provider}`;
+}
+
+function isRequestScopedSecretName(name, requestId) {
+  return [...ALLOWED_SECRETS].some((provider) => name === requestSecretName(requestId, provider));
+}
+
+async function putRepositorySecret(token, request, name, value, fetchImpl) {
+  if (!isRequestScopedSecretName(name, request.request_id)) {
     throw new ServiceError(400, "invalid_secret_name", "The provider credential name is invalid.");
   }
   const sealed = validateEncryptedSecret(value);
-  await githubJson(token, "PUT", `/repos/${repository}/actions/secrets/${name}`, {
+  await githubJson(token, "PUT", `/repos/${request.repository}/actions/secrets/${name}`, {
     encrypted_value: sealed.encrypted_value,
     key_id: sealed.key_id,
   }, fetchImpl);
@@ -445,28 +459,17 @@ async function prepareProviderSecrets(provided) {
   return writes;
 }
 
-async function ephemeralProviderWrites(token, repository, writes, fetchImpl) {
-  const ephemeral = [];
-  for (const item of writes) {
-    const existing = await githubRaw(token, "GET",
-      `/repos/${repository}/actions/secrets/${item.name}`, undefined, fetchImpl);
-    if (existing.status === 200) {
-      // Never overwrite an owner's durable repository secret with a phone key.
-      // The existing credential already participates in the same model ladder.
-      continue;
-    }
-    if (existing.status !== 404) {
-      throw new ServiceError(existing.status >= 500 ? 502 : existing.status,
-        "github_request_failed", safeGitHubError(existing));
-    }
-    ephemeral.push(item);
-  }
-  return ephemeral;
+function ephemeralProviderWrites(request, writes) {
+  // Never share phone-secret names across requests. An older terminal cleanup
+  // may still be in flight after the phone has admitted its next queued run.
+  // Canonical owner-managed secrets remain untouched as the no-phone fallback.
+  return writes.map((item) => ({ ...item, provider: item.name,
+    name: requestSecretName(request.request_id, item.name) }));
 }
 
-async function applyProviderSecrets(token, repository, writes, fetchImpl) {
+async function applyProviderSecrets(token, request, writes, fetchImpl) {
   for (const item of writes) {
-    await putRepositorySecret(token, repository, item.name, item.value, fetchImpl);
+    await putRepositorySecret(token, request, item.name, item.value, fetchImpl);
   }
 }
 
@@ -587,12 +590,14 @@ async function ensureTargetWorkflow(token, repository, branch, fetchImpl) {
     "github_request_failed", safeGitHubError(written));
 }
 
-function workflowInputs(request) {
+function workflowInputs(request, providerSecretWrites) {
   const cost = Number.isInteger(request.max_cost) ? String(request.max_cost) : String(request.max_cost);
   return {
     request_id: request.request_id,
     mode: request.mode,
     provider: "auto",
+    openai_secret_name: providerSecretWrites.find((item) => item.provider === "OPENAI_API_KEY")?.name || "",
+    anthropic_secret_name: providerSecretWrites.find((item) => item.provider === "ANTHROPIC_API_KEY")?.name || "",
     target_ref: request.ref,
     file: request.file,
     goal: request.goal,
@@ -620,7 +625,8 @@ function normalizeRequestClaim(value, request, label = "GitHub request claim") {
   if (!claim || claim.schema !== 1 || claim.request_id !== request.request_id
       || !["claimed", "dispatched"].includes(claim.state)
       || !Array.isArray(names)
-      || names.some((name) => !ALLOWED_SECRETS.has(name))
+      || names.some((name) => !ALLOWED_SECRETS.has(name)
+        && !isRequestScopedSecretName(name, request.request_id))
       || !Number.isSafeInteger(Number(claim.run_id || 0))
       || Number(claim.run_id || 0) < 0) {
     throw new ServiceError(409, "idempotency_claim_invalid",
@@ -701,13 +707,25 @@ async function deleteEphemeralSecret(token, repository, name, fetchImpl) {
   }
 }
 
-async function cleanupRequestClaim(token, request, fetchImpl, expectedRunId = 0) {
-  const claim = await readRequestClaim(token, request, fetchImpl);
-  if (!claim) return false;
-  if (expectedRunId > 0 && claim.run_id > 0 && claim.run_id !== expectedRunId) {
-    throw new ServiceError(409, "run_identity_mismatch",
-      "The request claim belongs to a different GitHub run; no credential was deleted.");
+function steeringVariableName(requestId) {
+  return `FLEXFACTOR_STEERING_${requestId.replaceAll("-", "").slice(0, 16).toUpperCase()}`;
+}
+
+async function deleteSteering(token, request, fetchImpl) {
+  const removed = await githubRaw(token, "DELETE",
+    `/repos/${request.repository}/actions/variables/${steeringVariableName(request.request_id)}`,
+    undefined, fetchImpl);
+  if (removed.status !== 204 && removed.status !== 404) {
+    throw new ServiceError(removed.status >= 500 ? 502 : removed.status,
+      "steering_cleanup_failed", safeGitHubError(removed));
   }
+}
+
+async function deleteClaimResources(token, request, claim, fetchImpl) {
+  // Keep the cleanup manifest until every dependent resource is gone. Each
+  // delete accepts 404, so a partial failure is safe to retry on the next poll.
+  await deleteSteering(token, request, fetchImpl);
+  if (!claim) return false;
   for (const name of claim.ephemeral_secrets) {
     await deleteEphemeralSecret(token, request.repository, name, fetchImpl);
   }
@@ -719,6 +737,21 @@ async function cleanupRequestClaim(token, request, fetchImpl, expectedRunId = 0)
       "idempotency_cleanup_failed", safeGitHubError(removed));
   }
   return true;
+}
+
+async function cleanupRequestClaim(token, request, run, fetchImpl) {
+  // A successful, matching terminal run lookup is the proof. In particular,
+  // 404 (which may also mean lost permission) cannot authorize any deletion.
+  assertMatchingRun(run, request.request_id, run.id);
+  if (run.status !== "completed") {
+    throw new ServiceError(409, "run_not_terminal", "The run is still active; cleanup must wait.");
+  }
+  const claim = await readRequestClaim(token, request, fetchImpl);
+  if (claim && claim.run_id > 0 && claim.run_id !== Number(run.id)) {
+    throw new ServiceError(409, "run_identity_mismatch",
+      "The request claim belongs to a different GitHub run; no credential was deleted.");
+  }
+  return deleteClaimResources(token, request, claim, fetchImpl);
 }
 
 function parseInstant(value) {
@@ -744,6 +777,14 @@ function runBelongsToRequest(run, requestId) {
   return MODES.has(mode);
 }
 
+function assertMatchingRun(run, requestId, expectedId) {
+  if (!Number.isSafeInteger(Number(run?.id)) || Number(run.id) <= 0
+      || Number(run.id) !== Number(expectedId) || !runBelongsToRequest(run, requestId)) {
+    throw new ServiceError(409, "run_identity_mismatch",
+      "GitHub returned a run that does not belong to this request.");
+  }
+}
+
 async function locateDispatchedRun(token, request, workflowRef, submittedAt, fetchImpl, sleepImpl) {
   const path = `/repos/${request.repository}/actions/workflows/${WORKFLOW_FILE}/runs?event=workflow_dispatch&branch=${encode(workflowRef)}&per_page=30`;
   const earliest = submittedAt - 10_000;
@@ -761,18 +802,26 @@ async function locateDispatchedRun(token, request, workflowRef, submittedAt, fet
     "GitHub accepted the run, but FlexFactor could not correlate its run ID within 30 seconds.");
 }
 
-async function existingDispatchedRun(token, request, fetchImpl) {
+async function existingDispatchedRun(token, request, fetchImpl, claim = null) {
   // GitHub does not expose a display-title search. Follow its authoritative
   // pagination links so a phone that was offline for days still recovers the
   // original request instead of starting a duplicate. The ceiling is a
   // fail-closed abuse/rate bound: if a repository has more history than we can
   // prove absent, the service refuses to dispatch rather than guessing.
-  for (let pageNumber = 1; pageNumber <= MAX_IDEMPOTENCY_SCAN_PAGES; pageNumber += 1) {
+  const createdAt = parseInstant(claim?.created_at);
+  const createdFilter = createdAt > 0
+    ? `created=${encode(`>=${new Date(createdAt - 10_000).toISOString()}`)}&` : "";
+  let scanned = 0;
+  const maximumPages = createdFilter ? 10 : MAX_IDEMPOTENCY_SCAN_PAGES;
+  for (let pageNumber = 1; pageNumber <= maximumPages; pageNumber += 1) {
     // Search repository-wide history rather than the currently installed
     // workflow path or current default branch. Either can be renamed between
     // GitHub accepting the original dispatch and a phone crash/retry; the
     // UUID is the stable correlation key across both changes.
-    const path = `/repos/${request.repository}/actions/runs?event=workflow_dispatch&per_page=100&page=${pageNumber}`;
+    // Unclaimed legacy requests require an unfiltered scan: GitHub silently
+    // caps filtered searches at 1,000. Claimed requests can use their creation
+    // time, but saturation is still uncertainty, never proof of absence.
+    const path = `/repos/${request.repository}/actions/runs?${createdFilter}per_page=100&page=${pageNumber}`;
     const response = await githubRaw(token, "GET", path, undefined, fetchImpl);
     if (response.status < 200 || response.status >= 300) {
       throw new ServiceError(response.status >= 500 ? 502 : response.status,
@@ -784,14 +833,55 @@ async function existingDispatchedRun(token, request, fetchImpl) {
         "GitHub returned an invalid workflow run list.");
     }
     const found = page.workflow_runs.find((item) =>
-      runBelongsToRequest(item, request.request_id)
+      item.event === "workflow_dispatch" && runBelongsToRequest(item, request.request_id)
       && Number.isSafeInteger(Number(item.id)) && Number(item.id) > 0);
     if (found) return runState(found);
+    scanned += page.workflow_runs.length;
     const link = response.headers.get("link") || "";
-    if (!/(?:^|,)\s*<[^>]+>;\s*rel="next"(?:\s*,|$)/i.test(link)) return null;
+    if (!/(?:^|,)\s*<[^>]+>;\s*rel="next"(?:\s*,|$)/i.test(link)) {
+      if ((createdFilter && scanned >= 1000) || Number(page.total_count) > scanned) break;
+      return null;
+    }
   }
   throw new ServiceError(503, "idempotency_scan_incomplete",
     "FlexFactor could not prove this request ID was absent from workflow history; no duplicate was dispatched.");
+}
+
+function dispatchRecoveryRequired(requestId) {
+  return new ServiceError(409, "dispatch_recovery_required",
+    `Request ${requestId}: dispatch acceptance is unresolved. Inspect this UUID in GitHub Actions; retry the same request to recover its run. If none appears, contact the service operator. Do not delete the claim or start a replacement while the original may still run.`);
+}
+
+async function recoverClaimedRequest(token, request, claim, fetchImpl) {
+  if (claim.run_id > 0) {
+    const recovered = await githubRaw(token, "GET",
+      `/repos/${request.repository}/actions/runs/${claim.run_id}`, undefined, fetchImpl);
+    if (recovered.status === 404) throw dispatchRecoveryRequired(request.request_id);
+    if (recovered.status < 200 || recovered.status >= 300) {
+      throw new ServiceError(recovered.status >= 500 ? 502 : recovered.status,
+        "github_request_failed", safeGitHubError(recovered));
+    }
+    const run = parseJson(recovered.body, "GitHub workflow run");
+    assertMatchingRun(run, request.request_id, claim.run_id);
+    return runState(run);
+  }
+  try {
+    const found = await existingDispatchedRun(token, request, fetchImpl, claim);
+    // Recovery never PATCHes or DELETEs a claim read by another invocation.
+    // Repository variables do not provide compare-and-swap ownership transfer.
+    if (found) return found;
+  } catch (error) {
+    if (error instanceof ServiceError && error.code === "idempotency_scan_incomplete") {
+      throw dispatchRecoveryRequired(request.request_id);
+    }
+    throw error;
+  }
+  const createdAt = parseInstant(claim.created_at);
+  if (!createdAt || Date.now() - createdAt >= DISPATCH_PENDING_MS || createdAt > Date.now()) {
+    throw dispatchRecoveryRequired(request.request_id);
+  }
+  throw new ServiceError(409, "dispatch_pending",
+    "This run request is already claimed. Retry the same request to recover its GitHub run; a duplicate will not be dispatched.");
 }
 
 export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl = fetch,
@@ -801,6 +891,8 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   // Recover an already accepted run before revalidating mutable repository
   // state: its saved target ref or caller workflow may have been deleted after
   // GitHub accepted the original dispatch but before the phone stored the ID.
+  const priorClaim = await readRequestClaim(token, run, fetchImpl);
+  if (priorClaim) return recoverClaimedRequest(token, run, priorClaim, fetchImpl);
   const existingRun = await existingDispatchedRun(token, run, fetchImpl);
   if (existingRun) return existingRun;
   const metadata = await githubJson(token, "GET", `/repos/${run.repository}`, undefined, fetchImpl);
@@ -818,29 +910,17 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   // replacing any repository secret. With none configured, the same ladder
   // continues through its subscription and free/local routes.
   const suppliedWrites = await prepareProviderSecrets(encryptedSecrets);
-  const providerSecretWrites = await ephemeralProviderWrites(
-    token, run.repository, suppliedWrites, fetchImpl);
+  const providerSecretWrites = ephemeralProviderWrites(run, suppliedWrites);
   const ephemeralNames = providerSecretWrites.map((item) => item.name);
   const ownership = await claimRequest(token, run, ephemeralNames, fetchImpl);
   if (!ownership.owned) {
-    if (ownership.claim.run_id > 0) {
-      const recovered = await githubJson(token, "GET",
-        `/repos/${run.repository}/actions/runs/${ownership.claim.run_id}`,
-        undefined, fetchImpl);
-      if (!runBelongsToRequest(recovered, run.request_id)) {
-        throw new ServiceError(409, "run_identity_mismatch",
-          "The claimed GitHub run does not belong to this request.");
-      }
-      return runState(recovered);
-    }
-    throw new ServiceError(409, "dispatch_pending",
-      "This run request is already claimed. FlexFactor will recover its GitHub run instead of dispatching a duplicate.");
+    return recoverClaimedRequest(token, run, ownership.claim, fetchImpl);
   }
   let dispatchAttempted = false;
   try {
     const workflowChanged = await ensureTargetWorkflow(
       token, run.repository, workflowRef, fetchImpl);
-    await applyProviderSecrets(token, run.repository, providerSecretWrites, fetchImpl);
+    await applyProviderSecrets(token, run, providerSecretWrites, fetchImpl);
     const submittedAt = Date.now();
     const path = `/repos/${run.repository}/actions/workflows/${WORKFLOW_FILE}/dispatches`;
     let result;
@@ -848,11 +928,13 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
       dispatchAttempted = true;
       result = await githubRaw(token, "POST", path, {
         ref: workflowRef,
-        inputs: workflowInputs(run),
+        inputs: workflowInputs(run, providerSecretWrites),
         return_run_details: true,
       }, fetchImpl);
       if (result.status >= 200 && result.status < 300) break;
-      dispatchAttempted = false;
+      // A server/proxy error can arrive after GitHub accepted the POST. Only
+      // an explicit client rejection permits the owner to roll back its claim.
+      dispatchAttempted = ![400, 401, 403, 404, 422].includes(result.status);
       if (!workflowChanged || ![404, 422].includes(result.status)) {
         throw new ServiceError(result.status >= 500 ? 502 : result.status,
           "github_request_failed", safeGitHubError(result));
@@ -899,7 +981,9 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
     // written phone secrets are safe to remove. Once the request crosses the
     // network boundary, acceptance is ambiguous: retain the claim so a retry
     // can recover but can never dispatch the UUID twice.
-    if (!dispatchAttempted) await cleanupRequestClaim(token, run, fetchImpl);
+    // This invocation exclusively owns a pre-dispatch claim. No recovery path
+    // releases it, so rollback cannot race a newer claim created by a retry.
+    if (!dispatchAttempted) await deleteClaimResources(token, run, ownership.claim, fetchImpl);
     throw error;
   }
 }
@@ -922,22 +1006,9 @@ export async function runStatus(token, repository, runId, requestId, fetchImpl =
     throw new ServiceError(400, "invalid_request_id", "Run request ID is invalid.");
   }
   const request = { request_id: cleanRequestId, repository };
-  let run;
-  try {
-    run = await githubJson(token, "GET", `/repos/${repository}/actions/runs/${id}`,
-      undefined, fetchImpl);
-  } catch (error) {
-    if (error instanceof ServiceError && error.status === 404) {
-      // A deleted/expired run is terminal too. Remove only secrets named by
-      // this exact request's durable claim before the phone advances its queue.
-      await cleanupRequestClaim(token, request, fetchImpl, id);
-    }
-    throw error;
-  }
-  if (!runBelongsToRequest(run, request.request_id)) {
-    throw new ServiceError(409, "run_identity_mismatch",
-      "GitHub returned a run that does not belong to this request.");
-  }
+  const run = await githubJson(token, "GET", `/repos/${repository}/actions/runs/${id}`,
+    undefined, fetchImpl);
+  assertMatchingRun(run, request.request_id, id);
   let step = typeof run.status === "string" ? run.status : "unknown";
   if (run.status !== "completed") {
     const jobs = await githubJson(token, "GET",
@@ -952,18 +1023,25 @@ export async function runStatus(token, repository, runId, requestId, fetchImpl =
     }
   }
   if (run.status === "completed") {
-    await cleanupRequestClaim(token, request, fetchImpl, id);
+    await cleanupRequestClaim(token, request, run, fetchImpl);
   }
   return runState(run, step);
 }
 
-export async function runArtifact(token, repository, runId, fetchImpl = fetch) {
+export async function runArtifact(token, repository, runId, requestId, fetchImpl = fetch) {
   const id = validateRunIdentity(repository, runId);
+  const cleanRequestId = typeof requestId === "string" ? requestId.trim() : "";
+  if (!UUID.test(cleanRequestId)) {
+    throw new ServiceError(400, "invalid_request_id", "Run request ID is invalid.");
+  }
+  const run = await githubJson(token, "GET", `/repos/${repository}/actions/runs/${id}`,
+    undefined, fetchImpl);
+  assertMatchingRun(run, cleanRequestId, id);
   const page = await githubJson(token, "GET",
     `/repos/${repository}/actions/runs/${id}/artifacts?per_page=100`, undefined, fetchImpl);
   const artifact = (Array.isArray(page.artifacts) ? page.artifacts : []).find((item) =>
-    !item.expired && typeof item.name === "string" && item.name.startsWith("mobile-phone-")
-    && Number(item.id) > 0);
+    !item.expired && item.name === `mobile-phone-${cleanRequestId}`
+    && Number.isSafeInteger(Number(item.id)) && Number(item.id) > 0);
   if (!artifact) {
     throw new ServiceError(404, "run_details_pending",
       "Phone-readable details are not available for this run yet.");
@@ -996,12 +1074,36 @@ export async function runArtifact(token, repository, runId, fetchImpl = fetch) {
   return downloaded.body;
 }
 
+async function inspectSteeringRun(token, request, fetchImpl) {
+  const claim = await readRequestClaim(token, request, fetchImpl);
+  if (!claim) return { claim, run: null };
+  // A reconnect may have found the dispatched run before its original caller
+  // recorded the ID. Recover from history without mutating this shared claim.
+  const runId = claim.run_id > 0 ? claim.run_id
+    : (await existingDispatchedRun(token, request, fetchImpl, claim))?.id;
+  if (!runId) return { claim, run: null };
+  const run = await githubJson(token, "GET",
+    `/repos/${request.repository}/actions/runs/${runId}`, undefined, fetchImpl);
+  assertMatchingRun(run, request.request_id, runId);
+  return { claim, run };
+}
+
+function acceptsSteering(inspection) {
+  return ["queued", "in_progress", "waiting", "pending", "requested"]
+    .includes(inspection.run?.status);
+}
+
+function inactiveSteeringError() {
+  return new ServiceError(409, "steering_run_inactive",
+    "Steering requires a correlated active run. Refresh this run's status before trying again.");
+}
+
 export async function submitSteering(token, repository, requestId, comment, fetchImpl = fetch) {
   if (!REPOSITORY.test(repository || "")) {
     throw new ServiceError(400, "invalid_repository", "Run repository is invalid.");
   }
-  const compactId = typeof requestId === "string" ? requestId.replaceAll("-", "") : "";
-  if (!/^[A-Fa-f0-9]{32}$/.test(compactId)) {
+  const cleanRequestId = typeof requestId === "string" ? requestId.trim() : "";
+  if (!UUID.test(cleanRequestId)) {
     throw new ServiceError(400, "invalid_request_id", "Run request ID is invalid.");
   }
   const value = typeof comment === "string" ? comment.trim() : "";
@@ -1009,7 +1111,10 @@ export async function submitSteering(token, repository, requestId, comment, fetc
     throw new ServiceError(400, "invalid_steering",
       "Steering comments must contain 1 to 4,000 printable characters.");
   }
-  const name = `FLEXFACTOR_STEERING_${compactId.slice(0, 16).toUpperCase()}`;
+  const request = { repository, request_id: cleanRequestId };
+  const before = await inspectSteeringRun(token, request, fetchImpl);
+  if (!acceptsSteering(before)) throw inactiveSteeringError();
+  const name = steeringVariableName(cleanRequestId);
   const path = `/repos/${repository}/actions/variables/${name}`;
   const existing = await githubRaw(token, "GET", path, undefined, fetchImpl);
   let comments = [];
@@ -1032,6 +1137,20 @@ export async function submitSteering(token, repository, requestId, comment, fetc
     await githubJson(token, "PATCH", path, payload, fetchImpl);
   } else {
     await githubJson(token, "POST", `/repos/${repository}/actions/variables`, payload, fetchImpl);
+  }
+  // A terminal status poll may delete the claim while this write is in flight.
+  // Remove a late write only on proven completion or an absent claim. Ambiguous
+  // claims and failed inspection remain intact for a later authenticated retry.
+  const after = await inspectSteeringRun(token, request, fetchImpl);
+  if (after.run && Number(after.run.id) !== Number(before.run.id)) {
+    throw new ServiceError(409, "run_identity_mismatch",
+      "The request claim changed GitHub runs while steering was submitted. Refresh the run status.");
+  }
+  if (!acceptsSteering(after)) {
+    if (!after.claim || after.run?.status === "completed") {
+      await deleteSteering(token, request, fetchImpl);
+    }
+    throw inactiveSteeringError();
   }
   return { accepted: true };
 }

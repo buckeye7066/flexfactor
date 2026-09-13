@@ -345,6 +345,33 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("errors.md", api)
         self.assertIn("View results and error ledger", activity)
 
+    def test_run_details_carries_the_selected_request_identity(self):
+        api = (ANDROID / "java" / "com" / "firer" / "console" /
+               "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
+        details = api.split("RunDetails runDetails", 1)[1].split(
+            "void submitSteering", 1)[0]
+        self.assertIn("String requestId", details)
+        self.assertIn('requireCanonicalUuid(requestId, "Run request ID")', details)
+        self.assertIn('"&request_id=" + encode(requestId)', details)
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        view = activity.split("private void viewLastRunResults", 1)[1].split(
+            "private void steerLastRun", 1)[0]
+        self.assertIn('preferences.getString(LAST_RUN_REQUEST_ID, "")', view)
+        self.assertIn("githubToken(), repository, requestId, id", view)
+
+    def test_invalid_legacy_history_is_terminal_and_queue_identity_is_preserved(self):
+        activity = (ANDROID / "java" / "com" / "firer" / "console" /
+                    "flexfactor" / "MainActivity.java").read_text(encoding="utf-8")
+        record = activity.split("private static final class RunRecord", 1)[1].split(
+            "private void viewLastRunResults", 1)[0]
+        self.assertIn("requireCanonicalUuid(requestId", record)
+        self.assertIn("BLOCKED", record)
+        polling = activity.split("private void pollLastRun", 1)[1].split(
+            "private void refreshRunLabel", 1)[0]
+        self.assertIn("record.matches(activeRequest)", polling)
+        self.assertIn("record.matches(queue.activeRequest())", polling)
+
     def test_active_audits_accept_authenticated_phone_steering(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")

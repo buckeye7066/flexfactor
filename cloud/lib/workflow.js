@@ -44,6 +44,12 @@ export function mobileWorkflow() {
     "      max_iterations:",
     "        required: true",
     "        type: string",
+    "      openai_secret_name:",
+    "        required: false",
+    "        type: string",
+    "      anthropic_secret_name:",
+    "        required: false",
+    "        type: string",
     "",
     "permissions:",
     "  actions: read",
@@ -69,8 +75,8 @@ export function mobileWorkflow() {
     "      threshold: ${{ inputs.threshold }}",
     "      max_iterations: ${{ inputs.max_iterations }}",
     "    secrets:",
-    "      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}",
-    "      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}",
+    "      OPENAI_API_KEY: ${{ secrets[inputs.openai_secret_name] || secrets.OPENAI_API_KEY }}",
+    "      ANTHROPIC_API_KEY: ${{ secrets[inputs.anthropic_secret_name] || secrets.ANTHROPIC_API_KEY }}",
     "",
   ].join("\n");
 }

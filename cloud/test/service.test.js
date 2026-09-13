@@ -19,6 +19,9 @@ import {
 } from "../lib/service.js";
 import { mobileWorkflow } from "../lib/workflow.js";
 
+const scopedOpenAI = "FLEXFACTOR_4D32C8E56F2B4A98A7F599594C49B2F8_OPENAI_API_KEY";
+const scopedAnthropic = "FLEXFACTOR_4D32C8E56F2B4A98A7F599594C49B2F8_ANTHROPIC_API_KEY";
+
 function queuedFetch(responses) {
   const calls = [];
   const implementation = async (url, options = {}) => {
@@ -230,6 +233,7 @@ test("provider public keys are fetched through the managed service", async () =>
 
 test("dispatch uses the default-branch caller and GitHub's authoritative run ID", async () => {
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } },
     { status: 200, body: { default_branch: "main" } },
     resolvedRef(),
@@ -242,28 +246,30 @@ test("dispatch uses the default-branch caller and GitHub's authoritative run ID"
   const state = await dispatch("gho_dispatch_token", validRun({ ref: "feature/release" }),
     {}, fetcher, async () => {});
   assert.equal(state.id, 987654);
-  assert.equal(fetcher.calls.length, 8);
-  assert.match(fetcher.calls[0].url, /actions\/runs\?event=workflow_dispatch/);
-  assert.doesNotMatch(fetcher.calls[0].url, /branch=|flexfactor-mobile\.yml/);
-  assert.match(fetcher.calls[2].url, /commits\/feature%2Frelease$/);
-  assert.match(fetcher.calls[3].url, /actions\/variables\/FLEXFACTOR_RUN_/);
-  assert.equal(fetcher.calls[4].options.method, "POST");
-  assert.match(fetcher.calls[5].url, /flexfactor-mobile\.yml\?ref=main$/);
-  assert.match(fetcher.calls[6].url, /flexfactor-mobile\.yml\/dispatches$/);
-  const dispatchBody = JSON.parse(fetcher.calls[6].options.body);
+  assert.equal(fetcher.calls.length, 9);
+  assert.match(fetcher.calls[1].url, /actions\/runs\?per_page=100/);
+  assert.doesNotMatch(fetcher.calls[1].url, /branch=|flexfactor-mobile\.yml/);
+  assert.match(fetcher.calls[3].url, /commits\/feature%2Frelease$/);
+  assert.match(fetcher.calls[4].url, /actions\/variables\/FLEXFACTOR_RUN_/);
+  assert.equal(fetcher.calls[5].options.method, "POST");
+  assert.match(fetcher.calls[6].url, /flexfactor-mobile\.yml\?ref=main$/);
+  assert.match(fetcher.calls[7].url, /flexfactor-mobile\.yml\/dispatches$/);
+  const dispatchBody = JSON.parse(fetcher.calls[7].options.body);
   assert.equal(dispatchBody.ref, "main");
   assert.equal(dispatchBody.inputs.target_ref, "feature/release");
   assert.equal(dispatchBody.return_run_details, true);
-  assert.doesNotMatch(fetcher.calls[6].options.body, /OPENAI|ANTHROPIC|gho_dispatch_token/);
-  const marked = JSON.parse(fetcher.calls[7].options.body);
+  assert.doesNotMatch(fetcher.calls[7].options.body, /OPENAI|ANTHROPIC|gho_dispatch_token/);
+  const marked = JSON.parse(fetcher.calls[8].options.body);
   assert.equal(JSON.parse(marked.value).run_id, 987654);
 });
 
 test("dispatch request IDs are idempotent across phone crash recovery", async () => {
   const request = validRun({ ref: "deleted-after-dispatch" });
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [{
       id: 444,
+      event: "workflow_dispatch",
       status: "in_progress",
       conclusion: null,
       display_title: `FlexFactor audit · ${request.request_id}`,
@@ -275,7 +281,7 @@ test("dispatch request IDs are idempotent across phone crash recovery", async ()
 
   assert.equal(state.id, 444);
   assert.equal(state.status, "in_progress");
-  assert.equal(fetcher.calls.length, 1);
+  assert.equal(fetcher.calls.length, 2);
   assert.equal(fetcher.calls.some((call) => /commits\/deleted-after-dispatch/.test(call.url)), false);
   assert.equal(fetcher.calls.some((call) => call.options.method === "POST"), false);
   assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
@@ -284,10 +290,12 @@ test("dispatch request IDs are idempotent across phone crash recovery", async ()
 test("idempotency recovery follows GitHub pagination without dispatching twice", async () => {
   const request = validRun();
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { headers: { link: '<https://api.github.com/next>; rel="next"' },
       body: { workflow_runs: [] } },
     { body: { workflow_runs: [{
       id: 445,
+      event: "workflow_dispatch",
       status: "completed",
       conclusion: "success",
       display_title: `FlexFactor audit · ${request.request_id}`,
@@ -298,16 +306,17 @@ test("idempotency recovery follows GitHub pagination without dispatching twice",
   const state = await dispatch("gho_idempotent_token", request, {}, fetcher, async () => {});
 
   assert.equal(state.id, 445);
-  assert.equal(fetcher.calls.length, 2);
-  assert.match(fetcher.calls[0].url, /per_page=100&page=1$/);
-  assert.match(fetcher.calls[1].url, /per_page=100&page=2$/);
-  assert.doesNotMatch(fetcher.calls[0].url, /branch=|flexfactor-mobile\.yml/);
+  assert.equal(fetcher.calls.length, 3);
+  assert.match(fetcher.calls[1].url, /per_page=100&page=1$/);
+  assert.match(fetcher.calls[2].url, /per_page=100&page=2$/);
+  assert.doesNotMatch(fetcher.calls[1].url, /branch=|flexfactor-mobile\.yml/);
   assert.equal(fetcher.calls.some((call) => call.options.method === "POST"), false);
   assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
 });
 
 test("idempotency history failure blocks every dispatch mutation", async () => {
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { status: 404, body: { message: "Not Found" } },
   ]);
 
@@ -315,46 +324,44 @@ test("idempotency history failure blocks every dispatch mutation", async () => {
     () => dispatch("gho_history_failure", validRun(), {}, fetcher, async () => {}),
     (error) => error instanceof ServiceError && error.code === "github_request_failed",
   );
-  assert.equal(fetcher.calls.length, 1);
+  assert.equal(fetcher.calls.length, 2);
   assert.equal(fetcher.calls.some((call) => call.options.method === "POST"), false);
   assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
 });
 
-test("idempotency scan stops at GitHub's ten-page filtered-run ceiling", async () => {
-  const pages = Array.from({ length: 10 }, () => ({
+test("idempotency scan stops at the bounded unfiltered history ceiling", async () => {
+  const pages = Array.from({ length: 100 }, () => ({
     headers: { link: '<https://api.github.com/next>; rel="next"' },
     body: { workflow_runs: [] },
   }));
-  const fetcher = queuedFetch(pages);
+  const fetcher = queuedFetch([missingRequestClaim(), ...pages]);
   await assert.rejects(
     () => dispatch("gho_scan_ceiling", validRun(), {}, fetcher, async () => {}),
     (error) => error instanceof ServiceError && error.code === "idempotency_scan_incomplete",
   );
-  assert.equal(fetcher.calls.length, 10);
-  assert.match(fetcher.calls.at(-1).url, /per_page=100&page=10$/);
+  assert.equal(fetcher.calls.length, 101);
+  assert.match(fetcher.calls.at(-1).url, /per_page=100&page=100$/);
   assert.equal(fetcher.calls.some((call) => call.options.method !== "GET"), false);
 });
 
 test("an atomic request claim blocks a duplicate during GitHub history lag", async () => {
   const request = validRun();
   const fetcher = queuedFetch([
+    storedClaim(request, { created_at: new Date().toISOString() }),
     { body: { workflow_runs: [] } },
-    { body: { default_branch: "main" } },
-    resolvedRef(),
-    storedClaim(request),
   ]);
   await assert.rejects(
     () => dispatch("gho_claimed_request", request, {}, fetcher, async () => {}),
     (error) => error instanceof ServiceError && error.code === "dispatch_pending",
   );
-  assert.equal(fetcher.calls.length, 4);
-  assert.equal(fetcher.calls.some((call) => call.options.method === "POST"), false);
-  assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
+  assert.equal(fetcher.calls.length, 2);
+  assert.equal(fetcher.calls.some((call) => call.options.method !== "GET"), false);
 });
 
 test("a stale target ref fails before workflow or credential mutation", async () => {
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     { status: 404, body: { message: "Not Found" } },
@@ -363,8 +370,8 @@ test("a stale target ref fails before workflow or credential mutation", async ()
     validRun({ ref: "deleted/paid-branch" }),
     { OPENAI_API_KEY: sealed }, fetcher, async () => {}),
   (error) => error instanceof ServiceError && error.code === "target_ref_unresolved");
-  assert.equal(fetcher.calls.length, 3);
-  assert.match(fetcher.calls[2].url, /commits\/deleted%2Fpaid-branch$/);
+  assert.equal(fetcher.calls.length, 4);
+  assert.match(fetcher.calls[3].url, /commits\/deleted%2Fpaid-branch$/);
   assert.equal(fetcher.calls.some((call) => call.options.method === "PUT"), false);
   assert.equal(fetcher.calls.some((call) => /actions\/secrets/.test(call.url)), false);
   assert.equal(fetcher.calls.some((call) => /workflows\/flexfactor-mobile/.test(call.url)), false);
@@ -372,10 +379,10 @@ test("a stale target ref fails before workflow or credential mutation", async ()
 
 test("sealed provider values are forwarded without accepting plaintext key fields", async () => {
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
-    { status: 404, body: { message: "Not Found" } },
     missingRequestClaim(),
     createdRequestClaim(),
     installedWorkflow(),
@@ -387,7 +394,7 @@ test("sealed provider values are forwarded without accepting plaintext key field
   await dispatch("gho_sealed_token", validRun(),
     { OPENAI_API_KEY: sealed }, fetcher, async () => {});
   const secretWrite = fetcher.calls[7];
-  assert.match(secretWrite.url, /actions\/secrets\/OPENAI_API_KEY$/);
+  assert.ok(secretWrite.url.endsWith(`/actions/secrets/${scopedOpenAI}`));
   assert.equal(JSON.parse(secretWrite.options.body).encrypted_value, sealed.encrypted_value);
   assert.doesNotMatch(secretWrite.options.body, /sk-|api[_-]?key/i);
 });
@@ -395,13 +402,14 @@ test("sealed provider values are forwarded without accepting plaintext key field
 test("phone credentials never overwrite an owner's existing repository secret", async () => {
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
-    { body: { name: "OPENAI_API_KEY", created_at: "2026-01-01T00:00:00Z" } },
     missingRequestClaim(),
     createdRequestClaim(),
     installedWorkflow(),
+    { status: 204 },
     acceptedDispatch(13),
     markedRequestClaim(),
   ]);
@@ -409,29 +417,28 @@ test("phone credentials never overwrite an owner's existing repository secret", 
     { OPENAI_API_KEY: sealed }, fetcher, async () => {});
   assert.equal(result.id, 13);
   const secretCalls = fetcher.calls.filter((call) => /actions\/secrets\/OPENAI_API_KEY$/.test(call.url));
-  assert.equal(secretCalls.length, 1);
-  assert.equal(secretCalls[0].options.method, "GET");
+  assert.equal(secretCalls.length, 0);
+  const isolatedWrite = fetcher.calls.find((call) => call.url.endsWith(`/actions/secrets/${scopedOpenAI}`));
+  assert.equal(isolatedWrite.options.method, "PUT");
+  assert.equal(JSON.parse(isolatedWrite.options.body).encrypted_value, sealed.encrypted_value);
   const claimCreate = JSON.parse(fetcher.calls[5].options.body);
-  assert.deepEqual(JSON.parse(claimCreate.value).ephemeral_secrets, []);
+  assert.deepEqual(JSON.parse(claimCreate.value).ephemeral_secrets, [scopedOpenAI]);
 });
 
 test("a partial credential-write failure removes every phone credential and its request claim", async () => {
   const request = validRun();
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
-    { status: 404, body: { message: "Not Found" } },
-    { status: 404, body: { message: "Not Found" } },
     missingRequestClaim(),
     createdRequestClaim(),
     installedWorkflow(),
     { status: 204 },
     { status: 500, body: { message: "secret unavailable" } },
-    storedClaim(request, {
-      ephemeral_secrets: ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"],
-    }),
+    { status: 204 }, // steering cleanup
     { status: 204 },
     { status: 204 },
     { status: 204 },
@@ -441,22 +448,21 @@ test("a partial credential-write failure removes every phone credential and its 
       { OPENAI_API_KEY: sealed, ANTHROPIC_API_KEY: sealed }, fetcher, async () => {}),
     (error) => error instanceof ServiceError && error.code === "github_request_failed",
   );
+  assert.equal(fetcher.calls[10].options.method, "DELETE");
+  assert.ok(fetcher.calls[10].url.endsWith(`/actions/secrets/${scopedOpenAI}`));
   assert.equal(fetcher.calls[11].options.method, "DELETE");
-  assert.match(fetcher.calls[11].url, /actions\/secrets\/OPENAI_API_KEY$/);
+  assert.ok(fetcher.calls[11].url.endsWith(`/actions/secrets/${scopedAnthropic}`));
   assert.equal(fetcher.calls[12].options.method, "DELETE");
-  assert.match(fetcher.calls[12].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
-  assert.equal(fetcher.calls[13].options.method, "DELETE");
-  assert.match(fetcher.calls[13].url, /actions\/variables\/FLEXFACTOR_RUN_/);
+  assert.match(fetcher.calls[12].url, /actions\/variables\/FLEXFACTOR_RUN_/);
 });
 
 test("every configured paid credential is accepted for the one ladder", async () => {
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
-    { status: 404, body: { message: "Not Found" } },
-    { status: 404, body: { message: "Not Found" } },
     missingRequestClaim(),
     createdRequestClaim(),
     installedWorkflow(),
@@ -470,9 +476,9 @@ test("every configured paid credential is accepted for the one ladder", async ()
     { OPENAI_API_KEY: sealed, ANTHROPIC_API_KEY: sealed }, fetcher, async () => {});
   assert.equal(result.id, 45);
   const secretNames = new Set(fetcher.calls
-    .filter((call) => /actions\/secrets\/[A-Z_]+$/.test(call.url))
+    .filter((call) => /actions\/secrets\/[A-Z0-9_]+$/.test(call.url))
     .map((call) => call.url.split("/").at(-1)));
-  assert.deepEqual(secretNames, new Set(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]));
+  assert.deepEqual(secretNames, new Set([scopedOpenAI, scopedAnthropic]));
   const dispatchCall = fetcher.calls.find((call) =>
     /flexfactor-mobile\.yml\/dispatches$/.test(call.url));
   assert.ok(dispatchCall);
@@ -484,6 +490,7 @@ test("every configured paid credential is accepted for the one ladder", async ()
 
 test("the free fallback makes provider credentials optional", async () => {
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
@@ -502,6 +509,7 @@ test("the free fallback makes provider credentials optional", async () => {
 test("unknown secret names fail before workflow mutation", async () => {
   const sealed = { key_id: "key-123", encrypted_value: Buffer.alloc(64, 7).toString("base64") };
   const fetcher = queuedFetch([
+    missingRequestClaim(),
     { body: { workflow_runs: [] } },
     { body: { default_branch: "main" } },
     resolvedRef(),
@@ -509,7 +517,7 @@ test("unknown secret names fail before workflow mutation", async () => {
   await assert.rejects(() => dispatch("gho_unknown_secret",
     validRun(), { OTHER_KEY: sealed }, fetcher, async () => {}),
   (error) => error instanceof ServiceError && error.code === "invalid_secret_name");
-  assert.equal(fetcher.calls.length, 3);
+  assert.equal(fetcher.calls.length, 4);
 });
 test("run status reports the active engine step", async () => {
   const request = validRun();
@@ -536,16 +544,17 @@ test("completed status deletes only this request's ephemeral secrets and claim",
       run_id: 99,
       ephemeral_secrets: ["OPENAI_API_KEY"],
     }),
+    { status: 204 }, // steering cleanup
     { status: 204 },
     { status: 204 },
   ]);
   const result = await runStatus("gho_cleanup_token", "owner/project", 99,
     request.request_id, fetcher);
   assert.equal(result.conclusion, "success");
-  assert.match(fetcher.calls[2].url, /actions\/secrets\/OPENAI_API_KEY$/);
-  assert.equal(fetcher.calls[2].options.method, "DELETE");
-  assert.match(fetcher.calls[3].url, /actions\/variables\/FLEXFACTOR_RUN_/);
+  assert.match(fetcher.calls[3].url, /actions\/secrets\/OPENAI_API_KEY$/);
   assert.equal(fetcher.calls[3].options.method, "DELETE");
+  assert.match(fetcher.calls[4].url, /actions\/variables\/FLEXFACTOR_RUN_/);
+  assert.equal(fetcher.calls[4].options.method, "DELETE");
 });
 
 test("status refuses a mismatched run title without touching the request claim", async () => {
@@ -582,55 +591,58 @@ test("status never deletes credentials when the durable claim names another run"
   assert.equal(fetcher.calls.some((call) => call.options.method === "DELETE"), false);
 });
 
-test("an authoritatively missing run is terminal cleanup for phone credentials", async () => {
-  const request = validRun();
-  const fetcher = queuedFetch([
-    { status: 404, body: { message: "Not Found" } },
-    storedClaim(request, {
-      state: "dispatched",
-      run_id: 99,
-      ephemeral_secrets: ["ANTHROPIC_API_KEY"],
-    }),
-    { status: 204 },
-    { status: 204 },
-  ]);
+test("a missing run never proves terminal credential cleanup", async () => {
+  const fetcher = queuedFetch([{ status: 404, body: { message: "Not Found" } }]);
   await assert.rejects(
-    () => runStatus("gho_missing_run", "owner/project", 99, request.request_id, fetcher),
+    () => runStatus("gho_missing_run", "owner/project", 99, validRun().request_id, fetcher),
     (error) => error instanceof ServiceError && error.status === 404,
   );
-  assert.match(fetcher.calls[2].url, /actions\/secrets\/ANTHROPIC_API_KEY$/);
-  assert.equal(fetcher.calls[2].options.method, "DELETE");
-  assert.equal(fetcher.calls[3].options.method, "DELETE");
+  assert.equal(fetcher.calls.length, 1);
+  assert.equal(fetcher.calls[0].options.method, "GET");
 });
 
 test("artifact downloads reject a redirect outside GitHub's signed storage", async () => {
+  const request = validRun();
   const fetcher = queuedFetch([
-    { body: { artifacts: [{ id: 123, name: "mobile-phone-request", expired: false }] } },
+    { body: { id: 42, status: "completed",
+      display_title: `FlexFactor audit \u00b7 ${request.request_id}` } },
+    { body: { artifacts: [{ id: 123, name: `mobile-phone-${request.request_id}`, expired: false }] } },
     { status: 302, headers: { location: "https://attacker.invalid/result.zip" } },
   ]);
-  await assert.rejects(() => runArtifact("gho_artifact_token", "owner/project", 42, fetcher),
+  await assert.rejects(() => runArtifact("gho_artifact_token", "owner/project", 42, request.request_id, fetcher),
     (error) => error instanceof ServiceError && error.code === "untrusted_artifact_location");
 });
 
 test("artifact downloads return only a bounded GitHub-signed archive", async () => {
   const archive = Buffer.from("PK\u0003\u0004bounded-test-archive");
+  const request = validRun();
   const fetcher = queuedFetch([
-    { body: { artifacts: [{ id: 123, name: "mobile-phone-request", expired: false }] } },
+    { body: { id: 42, status: "completed",
+      display_title: `FlexFactor audit \u00b7 ${request.request_id}` } },
+    { body: { artifacts: [{ id: 123, name: `mobile-phone-${request.request_id}`, expired: false }] } },
     { status: 302, headers: { location: "https://results.blob.core.windows.net/run/result.zip" } },
     { status: 200, body: archive },
   ]);
-  assert.deepEqual(await runArtifact("gho_artifact_token", "owner/project", 42, fetcher), archive);
-  assert.equal(fetcher.calls[2].options.headers.Authorization, undefined);
+  assert.deepEqual(await runArtifact("gho_artifact_token", "owner/project", 42, request.request_id, fetcher), archive);
+  assert.equal(fetcher.calls[3].options.headers.Authorization, undefined);
 });
 
 test("steering uses a bounded repository variable and never reflects the bearer token", async () => {
-  const fetcher = queuedFetch([{ status: 404, body: { message: "Not Found" } }, { status: 201, body: {} }]);
+  const request = validRun();
+  const claim = storedClaim(request, { state: "dispatched", run_id: 99 });
+  const activeRun = { body: { id: 99, status: "in_progress",
+    display_title: `FlexFactor audit \u00b7 ${request.request_id}` } };
+  const fetcher = queuedFetch([
+    claim, activeRun,
+    { status: 404, body: { message: "Not Found" } }, { status: 201, body: {} },
+    claim, activeRun,
+  ]);
   assert.deepEqual(await submitSteering("gho_steering_token", "owner/project",
     "4d32c8e5-6f2b-4a98-a7f5-99594c49b2f8", "Re-run the accessibility checks", fetcher),
   { accepted: true });
-  const payload = JSON.parse(fetcher.calls[1].options.body);
+  const payload = JSON.parse(fetcher.calls[3].options.body);
   assert.match(payload.name, /^FLEXFACTOR_STEERING_[A-F0-9]{16}$/);
-  assert.doesNotMatch(fetcher.calls[1].options.body, /gho_steering_token/);
+  assert.doesNotMatch(fetcher.calls[3].options.body, /gho_steering_token/);
 });
 
 test("upstream errors never include the access token", async () => {
