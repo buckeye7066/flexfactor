@@ -314,6 +314,24 @@ def pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    # In containers PID 1 is not always a real init process and may leave
+    # orphaned grandchildren as zombies indefinitely.  kill(0) succeeds for
+    # zombies, but they cannot execute and are therefore not "alive" for the
+    # process-containment checks (or for callers waiting on shutdown).
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as fh:
+            stat = fh.read()
+        if stat[stat.rfind(")") + 2:stat.rfind(")") + 3] == "Z":
+            # Reap it when it is our child.  Orphans cannot be reaped here,
+            # but are still stopped even on a container host whose PID 1
+            # leaves zombie entries behind.
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            return False
+    except (OSError, ValueError):
+        pass
     # zombie children of THIS process still answer kill(0); reap them
     try:
         wpid, _ = os.waitpid(pid, os.WNOHANG)
@@ -694,6 +712,14 @@ def run_contained(cmd: list[str], cwd: str, *, limits: Limits, env: dict | None 
         return cp
 
     try:
+        missing = _missing_executable(cmd, cwd, env)
+    except BaseException as ex:
+        missing = f"invalid executable: {type(ex).__name__}: {ex}"
+    if missing:
+        return _tag(subprocess.CompletedProcess(cmd, 127, "", missing), "none", {},
+                    launch_error=True)
+
+    try:
         c = prepare(cmd, cwd, env, limits, source_root=source_root)
     except Exception as ex:  # a broken probe must not take the audit down
         return _tag(subprocess.CompletedProcess(cmd, 1, "", f"containment prepare failed: "
@@ -776,6 +802,12 @@ def spawn_contained(cmd: list[str], cwd: str, *, limits: Limits, env: dict | Non
     Returns (proc, error, kill_tree). Output is discarded (a server must never
     fill a pipe and wedge the audit)."""
     try:
+        missing = _missing_executable(cmd, cwd, env)
+    except BaseException as ex:
+        missing = f"invalid executable: {type(ex).__name__}: {ex}"
+    if missing:
+        return None, missing, lambda: None
+    try:
         c = prepare(cmd, cwd, env, limits)
     except Exception as ex:
         return None, f"containment prepare failed: {type(ex).__name__}: {ex}", lambda: None
@@ -809,6 +841,43 @@ def spawn_contained(cmd: list[str], cwd: str, *, limits: Limits, env: dict | Non
     return proc, "", kill_tree
 
 
+def _missing_executable(cmd: list[str], cwd: str, env: dict | None) -> str:
+    """Return a launch error before a sandbox wrapper can hide exec failure.
+
+    Namespace launchers such as ``unshare`` successfully start even when the
+    requested program does not exist.  Without this preflight, synchronous
+    calls lose ``flexfactor_launch_error`` and asynchronous calls incorrectly
+    report a healthy server process until the wrapper exits with 127.
+    """
+    if not cmd or not str(cmd[0]).strip():
+        return "executable not found: ? (empty command)"
+    executable = os.fsdecode(os.fspath(cmd[0]))
+    has_separator = os.sep in executable or bool(os.altsep and os.altsep in executable)
+    if has_separator:
+        candidate = executable if os.path.isabs(executable) else os.path.join(cwd, executable)
+        found = os.path.isfile(candidate) and (IS_WINDOWS or os.access(candidate, os.X_OK))
+    else:
+        search_env = env if env is not None else os.environ
+        path = search_env.get("PATH", os.defpath)
+        # execvpe interprets relative PATH components from the child's cwd,
+        # whereas shutil.which would otherwise interpret them from our cwd.
+        path = os.pathsep.join(
+            part if not part or os.path.isabs(part) else os.path.join(cwd, part)
+            for part in path.split(os.pathsep))
+        candidate = shutil.which(executable, path=path)
+        found = candidate is not None
+    if found and not IS_WINDOWS:
+        try:
+            with open(candidate, "rb") as fh:
+                shebang = fh.readline(4096) if fh.read(2) == b"#!" else b""
+            if shebang:
+                interpreter = shebang.decode("utf-8", "replace").strip().split()[0]
+                found = os.path.isfile(interpreter) and os.access(interpreter, os.X_OK)
+        except OSError:
+            found = False
+    return "" if found else f"executable not found: {executable}"
+
+
 # ---------------------------------------------------------------------------
 # Gate: OS sandbox OR owner trust
 # ---------------------------------------------------------------------------
@@ -839,7 +908,9 @@ def require_containment_or_trust(project_dir: str, *, trust_decision) -> dict:
     raise ContainmentUnavailable(
         f"refusing to run third-party install/build/test for {project_dir}: no OS sandbox "
         f"on this host (missing OS enforcement of: {', '.join(missing)}; strongest mechanism: "
-        f"{rep['strongest'] or 'none'}) and the repository is not trusted"
+        f"{rep['strongest'] or 'none'}; capabilities: process_tree={rep['process_tree']}, "
+        f"memory={rep['memory']}, network_isolation={rep['network_isolation']}) and the "
+        f"repository is not trusted"
         f" ({getattr(trust_decision, 'reason', 'no trust decision')}). Authorize it by adding "
         f"the path to FLEXFACTOR_TRUSTED_REPOS or to ~/.flexfactor/policy.json "
         f"\"trusted_repos\".")
