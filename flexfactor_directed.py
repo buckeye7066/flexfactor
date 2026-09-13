@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 
 _UNFIT_CODE_PATTERNS = (
     r"prompt-?guard", r"llama-guard", r"nemoguard", r"moderation", r"rerank",
@@ -38,6 +39,11 @@ _DEFAULT_SKIP_DIRS = {
 
 _CAPACITY_LOCK = threading.Lock()
 _CAPACITY_INSTALLED = False
+
+# Fuzzy discovery is optional recovery, never permission to choose from a
+# partial inventory. Explicit paths remain available even on very large homes.
+_PROJECT_LOOKUP_SECONDS = 1.0
+_PROJECT_LOOKUP_MAX_ENTRIES = 10000
 
 
 _POWERSHELL_EXTS = frozenset({".ps1", ".psm1", ".psd1"})
@@ -105,41 +111,44 @@ def typo_resolve_local_project(name_hints, roots, slugify, generic_tokens=None) 
     if not hints:
         return None
 
-    directories: list[str] = []
+    deadline = time.monotonic() + _PROJECT_LOOKUP_SECONDS
+    examined = 0
+    scored_tiers: tuple[list[tuple[int, str]], list[tuple[int, str]]] = ([], [])
     seen: set[str] = set()
     for root in roots or ():
-        if not os.path.isdir(root):
-            continue
+        if time.monotonic() >= deadline:
+            return None
         try:
-            entries = os.listdir(root)
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    examined += 1
+                    if (examined > _PROJECT_LOOKUP_MAX_ENTRIES
+                            or time.monotonic() >= deadline):
+                        return None
+                    # Score the name before asking the filesystem about it.
+                    # Unrelated mounts/junctions need no metadata access.
+                    candidate = slugify(entry.name).replace("-", "")
+                    if len(candidate) < 5:
+                        continue
+                    best: int | None = None
+                    for hint in hints:
+                        limit = 2 if max(len(hint), len(candidate)) >= 10 else 1
+                        distance = _bounded_damerau_levenshtein(hint, candidate, limit)
+                        if distance is not None and distance > 0:
+                            best = distance if best is None else min(best, distance)
+                    if best is None:
+                        continue
+                    full = os.path.join(root, entry.name)
+                    key = os.path.normcase(os.path.abspath(full))
+                    if key in seen or not os.path.isdir(full):
+                        continue
+                    seen.add(key)
+                    scored_tiers[int(entry.name.startswith("."))].append((best, full))
         except OSError:
             continue
-        for entry in entries:
-            full = os.path.join(root, entry)
-            if not os.path.isdir(full):
-                continue
-            key = os.path.normcase(os.path.abspath(full))
-            if key in seen:
-                continue
-            seen.add(key)
-            directories.append(full)
-
-    visible = [p for p in directories if not os.path.basename(p).startswith(".")]
-    hidden = [p for p in directories if os.path.basename(p).startswith(".")]
-    for tier in (visible, hidden):
-        scored: list[tuple[int, str]] = []
-        for path in tier:
-            candidate = slugify(os.path.basename(path)).replace("-", "")
-            if len(candidate) < 5:
-                continue
-            best: int | None = None
-            for hint in hints:
-                limit = 2 if max(len(hint), len(candidate)) >= 10 else 1
-                distance = _bounded_damerau_levenshtein(hint, candidate, limit)
-                if distance is not None and distance > 0:
-                    best = distance if best is None else min(best, distance)
-            if best is not None:
-                scored.append((best, path))
+    if time.monotonic() >= deadline:
+        return None
+    for scored in scored_tiers:
         if not scored:
             continue
         minimum = min(score for score, _path in scored)
@@ -352,9 +361,17 @@ def install(module_globals: dict) -> None:
     # one/two-edit typo. Ambiguous names still fail closed.
     prior_find_project = module_globals.get("_find_local_project")
     if callable(prior_find_project) and not getattr(prior_find_project, "_typo_hardened", False):
+        lookup_result = module_globals.get("_find_local_project_result")
         @functools.wraps(prior_find_project)
         def _find_local_project(*name_hints):
-            exact_or_prefix = prior_find_project(*name_hints)
+            if callable(lookup_result):
+                exact_or_prefix, complete = lookup_result(*name_hints)
+                if not complete:
+                    # An exhausted exact scan is not proof that no exact match
+                    # exists. Never substitute a different fuzzy project for it.
+                    return None
+            else:
+                exact_or_prefix = prior_find_project(*name_hints)
             if exact_or_prefix:
                 return exact_or_prefix
             return typo_resolve_local_project(
