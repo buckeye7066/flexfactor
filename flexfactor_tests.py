@@ -10434,7 +10434,8 @@ class RepositorySourceClassificationTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as handle:
             # This test-only sink intentionally writes synthetic credential-shaped
             # fixtures so repository classification can prove they never egress.
-            handle.write(text)  # lgtm[py/clear-text-storage-sensitive-data]
+            # lgtm[py/clear-text-storage-sensitive-data]
+            handle.write(text)
 
     def test_secret_outside_selected_source_makes_the_whole_repository_local(self):
         self.write("main.py", "print('hello')\n")
