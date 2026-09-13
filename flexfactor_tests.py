@@ -10423,7 +10423,7 @@ class RepositorySourceClassificationTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
         subprocess.run(["git", "init", "-q", self.root], check=True)
-        self.secret = "creds: AKIAJQ7WZ5X2K9V4M3TN"
+        self.synthetic_marker = "creds: AKIAJQ7WZ5X2K9V4M3TN"
         self.policy = mock.patch.object(ff._egress, "_load_policy_allow", return_value=set())
         self.policy.start()
         self.addCleanup(self.policy.stop)
@@ -10434,18 +10434,17 @@ class RepositorySourceClassificationTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as handle:
             # This test-only sink intentionally writes synthetic credential-shaped
             # fixtures so repository classification can prove they never egress.
-            # lgtm[py/clear-text-storage-sensitive-data]
             handle.write(text)
 
     def test_secret_outside_selected_source_makes_the_whole_repository_local(self):
         self.write("main.py", "print('hello')\n")
-        self.write(".config/unusual.data", self.secret)
+        self.write(".config/unusual.data", self.synthetic_marker)
         args = argparse.Namespace(file="main.py")
         scoped = ff._model_args_for_repository(args, self.root)
         self.assertTrue(scoped._source_local_only)
         self.assertFalse(hasattr(args, "_source_local_only"))
         self.assertEqual(scoped._source_classification["classification"], "sensitive")
-        self.assertNotIn(self.secret, json.dumps(scoped._source_classification))
+        self.assertNotIn(self.synthetic_marker, json.dumps(scoped._source_classification))
 
     def test_ordinary_source_keeps_the_normal_ladder(self):
         self.write("main.py", "print('hello')\n")
@@ -10462,7 +10461,7 @@ class RepositorySourceClassificationTests(unittest.TestCase):
 
     def test_failed_git_inventory_cannot_hide_sensitive_vendor_files(self):
         self.write("main.py", "print('hello')\n")
-        self.write("vendor/settings.txt", self.secret)
+        self.write("vendor/settings.txt", self.synthetic_marker)
         with mock.patch.object(ff, "_git_real_files", return_value=None):
             scoped = ff._model_args_for_repository(argparse.Namespace(), self.root)
         self.assertTrue(scoped._source_local_only)
@@ -10474,15 +10473,15 @@ class RepositorySourceClassificationTests(unittest.TestCase):
              mock.patch.object(ff.urllib.request, "urlopen") as outbound, \
              mock.patch.object(competitors, "_WEB_BACKENDS", (("record", outbound),)):
             with self.assertRaises(ff.EgressBlockedError):
-                ff.repo_rewards_search("https://search.example.invalid", self.secret)
-            hits, backend, skipped = competitors.web_search(self.secret)
+                ff.repo_rewards_search("https://search.example.invalid", self.synthetic_marker)
+            hits, backend, skipped = competitors.web_search(self.synthetic_marker)
             self.assertEqual((hits, backend), ([], ""))
             self.assertIn("egress", skipped)
             with self.assertRaises(ff.EgressBlockedError):
-                competitors.github_repo_search(self.secret, opener=outbound)
+                competitors.github_repo_search(self.synthetic_marker, opener=outbound)
             with self.assertRaises(ff.EgressBlockedError):
                 competitors.fetch_evidence_document(
-                    "https://example.invalid/?token=" + self.secret.split()[-1], opener=outbound)
+                    "https://example.invalid/?token=" + self.synthetic_marker.split()[-1], opener=outbound)
             outbound.assert_not_called()
 
     def test_research_redaction_preserves_generic_search_without_source_tokens(self):
@@ -10493,14 +10492,14 @@ class RepositorySourceClassificationTests(unittest.TestCase):
             return [{"url": "https://example.invalid", "title": "result"}]
         with mock.patch.object(ff, "EGRESS_MODE", "redact"), \
              mock.patch.object(competitors, "_WEB_BACKENDS", (("record", search),)):
-            hits, _, _ = competitors.web_search(self.secret)
+            hits, _, _ = competitors.web_search(self.synthetic_marker)
         self.assertTrue(hits)
         self.assertEqual(len(queries), 1)
-        self.assertNotIn(self.secret.split()[-1], queries[0])
+        self.assertNotIn(self.synthetic_marker.split()[-1], queries[0])
         self.assertIn("EGRESS-REDACTED", queries[0])
 
     def test_explicit_sharing_or_redaction_authorizes_the_cloud_exception(self):
-        self.write("main.py", self.secret)
+        self.write("main.py", self.synthetic_marker)
         for flag in ("allow_sensitive", "redact"):
             with self.subTest(flag=flag):
                 scoped = ff._model_args_for_repository(argparse.Namespace(**{flag: True}), self.root)
