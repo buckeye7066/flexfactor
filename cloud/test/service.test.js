@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { ENGINE_REF } from "../lib/config.js";
+import { ENGINE_REF, SERVICE_VERSION } from "../lib/config.js";
 import {
   ServiceError,
   bearerToken,
@@ -695,4 +695,8 @@ test("protected-branch retry preserves an engine upgraded during the initial wri
   );
   assert.equal(fetcher.calls.some(({ url }) => /\/git\/refs$|\/pulls$|\/dispatches$/.test(url)), false);
   assert.match(fetcher.calls[9].url, new RegExp(`ref=${"b".repeat(40)}$`));
+});
+
+test("downgrade protection has a distinct cloud release identity", () => {
+  assert.equal(SERVICE_VERSION, "1.1.5");
 });
