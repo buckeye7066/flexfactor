@@ -111,7 +111,7 @@
   "workflows": [
     {
       "id": "w-1",
-      "text": "Audit inventories purpose and the repository, evaluates competitors, iterates verified deltas, then verifies, reviews, and publishes explicit-apply changes.",
+      "text": "Audit inventories purpose and the repository, evaluates competitors, iterates verified deltas, then verifies, independently reviews, and publishes retained changes.",
       "confidence": "verified",
       "evidence_refs": [
         0,
@@ -146,7 +146,7 @@
   "invariants": [
     {
       "id": "i-1",
-      "text": "Report-only is the default; mutation requires explicit apply authorization.",
+      "text": "Audit and Production Ready perform real repair and publication without a report-only path; Scout mutation requires explicit apply authorization.",
       "confidence": "supported",
       "evidence_refs": [
         5,
@@ -328,9 +328,9 @@
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
-      "content_hash": "a9f6d2bbf2611c21a664f3c4de85127c6eae80a99d7b77a5d2fb7c0eb114087f",
-      "observed_at": "2026-09-05T07:02:50Z",
-      "excerpt": "Cloud dispatch and secret cleanup."
+      "content_hash": "2c41ffae2f3edcf97372c2aed48eadb209a207fbabc56b767c17883e5e690eb5",
+      "observed_at": "2026-09-13T12:57:12.113753+00:00",
+      "excerpt": "Cloud dispatch, downgrade prevention, and request-scoped secret cleanup; 36 cloud contract tests passed."
     },
     {
       "kind": "documentation",
