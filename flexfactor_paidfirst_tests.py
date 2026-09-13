@@ -1,4 +1,4 @@
-"""Best-available ladder: strongest paid capacity down to free.
+"""Best-available ladder: subscription capacity, then metered API capacity, then free.
 
 Runs offline. No credentials, network, or token spend.
 """
@@ -58,7 +58,7 @@ class LadderOrdering(_Base):
             selected = rotator.next_route(
                 tier=R.FRONTIER, allow_paid=True, paid_first=True, now=now
             )
-            self.assertEqual(selected.route.id, PAID_FRONTIER.id)
+            self.assertEqual(selected.route.id, PAID_STRONG.id)
             rotator.report(selected.route, "ok", now=now)
 
     def test_exhaustion_walks_every_paid_level_before_free(self):
@@ -77,9 +77,9 @@ class LadderOrdering(_Base):
         )
         observed.append(final.route.id)
         self.assertEqual(observed, [
+            PAID_STRONG.id,
             PAID_FRONTIER.id,
             PAID_FRONTIER_2.id,
-            PAID_STRONG.id,
             FREE_STRONG.id,
         ])
 
@@ -97,7 +97,7 @@ class LadderOrdering(_Base):
             tier=R.FRONTIER, allow_paid=True, paid_first=True,
             pin=FREE_STRONG.id, now=100,
         )
-        self.assertEqual(selected.route.id, PAID_FRONTIER.id)
+        self.assertEqual(selected.route.id, PAID_STRONG.id)
         self.assertFalse(selected.pinned)
 
 
@@ -130,9 +130,9 @@ class RetryFallthrough(_Base):
         )
         result = provider.structured("system", "prompt", {})
         self.assertEqual([selection.route.id for selection in observed], [
+            PAID_STRONG.id,
             PAID_FRONTIER.id,
             PAID_FRONTIER_2.id,
-            PAID_STRONG.id,
             FREE_STRONG.id,
         ])
         self.assertEqual(result["served_by"], FREE_STRONG.id)
