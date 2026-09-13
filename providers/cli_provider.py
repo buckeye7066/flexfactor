@@ -117,12 +117,13 @@ def _recursion_guard_env(api: str = "") -> Dict[str, str]:
     if api in ("claude-code", "codex-cli"):
         # A subscription child must not silently select a parent's metered key.
         # Copy-only: SDK fallbacks retain the original environment credentials.
-        for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL",
+        blocked = {"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL",
                     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
                     "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID",
                     "ANTHROPIC_ORGANIZATION_ID", "CLAUDE_CODE_USE_BEDROCK",
-                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
-            env.pop(key, None)
+                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"}
+        # Windows preserves spelling in copied mappings, but lookup ignores case.
+        env = {key: value for key, value in env.items() if key.upper() not in blocked}
     env[_RECURSION_MARKER] = "1"
     # Keep the child non-interactive no matter how it is configured.
     env.setdefault("CI", "1")
