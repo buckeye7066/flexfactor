@@ -40,6 +40,53 @@ calls only fixed GitHub HTTPS origins; user input cannot select an upstream host
 redirect is accepted only from GitHub's signed storage host families, and
 the bearer token is never forwarded to that signed URL.
 
+Status and details both require `repository`, `run_id`, and the canonical
+`request_id` UUID. Details first verifies the run's numeric ID and FlexFactor
+request title, then selects only `mobile-phone-<request_id>` from that run.
+Missing or mismatched identity fails before artifact listing or download.
+
+## Interrupted requests and cleanup
+
+Dispatch retries read the durable request claim first. A recorded run ID is
+recovered directly, even if the target ref was deleted or repository history is
+large. Claims without a run ID are searched from their creation time. A missing
+claim requires repository-wide unfiltered history, bounded to 100 pages; this
+avoids GitHub's 1,000-result cap on filtered searches. Incomplete or saturated
+history never authorizes another dispatch.
+
+An unresolved claim returns `dispatch_pending` for up to 15 minutes, then
+`dispatch_recovery_required`. An invalid creation time, missing recorded run, or
+saturated recovery search also requires recovery. Inspect the request UUID in
+the repository's GitHub Actions history and retry the same request to recover a
+visible run. If it remains unresolved, the service operator must investigate
+acceptance and execution before any replacement is authorized. Do not delete a
+claim or regenerate its UUID solely because it is old: GitHub repository
+variables offer no documented compare-and-swap operation, and the original
+invocation could still be dispatching. Transport failures and dispatch HTTP 5xx
+retain the claim and credentials.
+
+Phone-supplied provider keys use secret names containing the full request UUID.
+The generated caller passes those secrets under the two names expected by the
+unchanged pinned engine. An explicitly supplied phone key takes precedence for
+that request; canonical owner-managed repository secrets are never overwritten
+and remain the fallback when no phone key is supplied. A delayed cleanup from
+an earlier run therefore cannot delete a later request's uploaded credential.
+Legacy claims naming canonical secrets remain readable for cleanup.
+
+Cleanup requires a successfully fetched, matching, completed run. A 404 can
+mean lost access or visibility and never proves completion. Cleanup removes
+steering, then phone-supplied secrets, then the claim, accepting already-missing
+resources on retry. Any failure is returned to the phone so it retains the
+queue entry. Terminal status also removes legacy steering whose claim was
+already deleted. Steering checks the active claimed run before and after its
+write; a concurrent completion removes the late instruction before rejecting it.
+
+OAuth endpoints share an in-memory budget of 120 admitted requests per minute
+and at most eight concurrent upstream exchanges per process. Excess requests
+receive HTTP 429 with `Retry-After`. This is a per-instance resource bound, not
+distributed rate limiting: separate serverless instances have separate budgets.
+No credentials or client IP address records are retained by this limiter.
+
 ## Verification and release
 
 ```bash

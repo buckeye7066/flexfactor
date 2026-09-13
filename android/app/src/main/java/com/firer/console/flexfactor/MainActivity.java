@@ -983,23 +983,16 @@ public final class MainActivity extends Activity {
         MobileRunQueue savedQueue = loadRunQueue();
         if (savedQueue != null && savedQueue.hasActiveRun()) {
             long activeId = savedQueue.activeRunId();
-            boolean recorded = records.stream().anyMatch(record -> record.id == activeId);
             MobileRunRequest activeRequest = savedQueue.activeRequest();
+            // The durable queue is authoritative if older history lost its UUID.
+            // A locally blocked legacy record must never complete that active target.
+            records.removeIf(record -> record.id == activeId && !record.matches(activeRequest));
+            boolean recorded = records.stream().anyMatch(record -> record.id == activeId
+                    && record.matches(activeRequest));
             if (!recorded && activeRequest != null) {
                 records.add(0, new RunRecord(activeId, activeRequest.repository,
                         activeRequest.requestId, activeRequest.mode.wire, "",
                         "Queued · " + activeRequest.repository, false));
-            }
-        }
-        if (records.isEmpty()) {
-            long id = preferences.getLong(LAST_RUN_ID, 0L);
-            String repository = lastRunRepository();
-            if (id > 0 && !repository.isEmpty()) {
-                records.add(new RunRecord(id, repository,
-                        preferences.getString(LAST_RUN_REQUEST_ID, ""),
-                        preferences.getString(LAST_RUN_MODE, ""),
-                        preferences.getString(LAST_RUN_URL, ""),
-                        preferences.getString(LAST_RUN_STATUS, "Queued"), false));
             }
         }
         if (records.isEmpty()) return;
@@ -1056,7 +1049,8 @@ public final class MainActivity extends Activity {
                 if (queue != null && queue.hasActiveRun()) {
                     long queuedRun = queue.activeRunId();
                     for (RunRecord record : updated) {
-                        if (record.id == queuedRun && record.complete) {
+                        if (record.id == queuedRun && record.complete
+                                && record.matches(queue.activeRequest())) {
                             queue.markActiveComplete(queuedRun);
                             saveRunQueue(queue);
                             advanced = true;
@@ -1172,6 +1166,7 @@ public final class MainActivity extends Activity {
     private synchronized List<RunRecord> runHistory() {
         List<RunRecord> records = new ArrayList<>();
         String raw = preferences.getString(RUN_HISTORY, "[]");
+        boolean migrated = false;
         try {
             JSONArray rows = new JSONArray(raw);
             for (int i = 0; i < rows.length() && records.size() < 30; i++) {
@@ -1180,13 +1175,38 @@ public final class MainActivity extends Activity {
                 long id = row.optLong("id", 0L);
                 String repository = row.optString("repository", "");
                 if (id <= 0 || repository.isEmpty()) continue;
-                records.add(new RunRecord(id, repository,
+                RunRecord record = new RunRecord(id, repository,
                         row.optString("request_id", ""), row.optString("mode", ""),
                         row.optString("url", ""), row.optString("status", "Queued"),
-                        row.optBoolean("complete", false)));
+                        row.optBoolean("complete", false));
+                records.add(record);
+                migrated |= record.complete != row.optBoolean("complete", false);
             }
         } catch (Exception ignored) {
             // A damaged local history never prevents a new authoritative run.
+        }
+        // Apply the same migration before admission checks as before polling.
+        if (records.isEmpty()) {
+            long id = preferences.getLong(LAST_RUN_ID, 0L);
+            String repository = lastRunRepository();
+            if (id > 0 && !repository.isEmpty()) {
+                records.add(new RunRecord(id, repository,
+                        preferences.getString(LAST_RUN_REQUEST_ID, ""),
+                        preferences.getString(LAST_RUN_MODE, ""),
+                        preferences.getString(LAST_RUN_URL, ""),
+                        preferences.getString(LAST_RUN_STATUS, "Queued"), false));
+                migrated = true;
+            }
+        }
+        if (migrated) {
+            saveRunHistory(records);
+            for (RunRecord record : records) {
+                if (record.id == preferences.getLong(LAST_RUN_ID, 0L)
+                        && record.repository.equalsIgnoreCase(lastRunRepository())) {
+                    preferences.edit().putString(LAST_RUN_STATUS, record.status).apply();
+                    break;
+                }
+            }
         }
         return records;
     }
@@ -1228,23 +1248,48 @@ public final class MainActivity extends Activity {
             this.requestId = requestId;
             this.mode = mode;
             this.url = url;
+            if (!complete) {
+                try {
+                    GitHubApi.requireCanonicalUuid(requestId, "Run request ID");
+                } catch (IllegalArgumentException legacy) {
+                    // This is terminal local tracking, not proof of remote completion.
+                    // Keep the original ID, URL and status so the owner can recover it.
+                    status = "BLOCKED: This saved run has no valid request ID. "
+                            + "Open it on GitHub and confirm it has stopped before starting "
+                            + "a new queue. Previous status: " + status;
+                    complete = true;
+                }
+            }
             this.status = status;
             this.complete = complete;
+        }
+
+        boolean matches(MobileRunRequest request) {
+            return request != null && request.repository.equalsIgnoreCase(repository)
+                    && request.requestId.equalsIgnoreCase(requestId);
         }
     }
 
     private void viewLastRunResults() {
         long id = preferences.getLong(LAST_RUN_ID, 0L);
         String repository = lastRunRepository();
+        String requestId = preferences.getString(LAST_RUN_REQUEST_ID, "");
         if (id <= 0 || repository.isEmpty()) {
             Toast.makeText(this, "No FlexFactor run is available yet", Toast.LENGTH_LONG).show();
+            return;
+        }
+        try {
+            GitHubApi.requireCanonicalUuid(requestId, "Run request ID");
+        } catch (IllegalArgumentException legacy) {
+            showError("This saved run needs recovery",
+                    "Its request ID is unavailable. Open the run on GitHub to view its result.");
             return;
         }
         runState.setText("Loading the run result and error ledger…");
         worker.execute(() -> {
             try {
                 GitHubApi.RunDetails details = api.runDetails(
-                        githubToken(), repository, id);
+                        githubToken(), repository, requestId, id);
                 post(() -> {
                     refreshRunLabel();
                     TextView body = text(details.displayText(), 14, Color.WHITE);
