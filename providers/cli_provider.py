@@ -112,8 +112,18 @@ def cli_binary_for(api: str) -> Optional[str]:
     return shutil.which(name) if name else None
 
 
-def _recursion_guard_env() -> Dict[str, str]:
+def _recursion_guard_env(api: str = "") -> Dict[str, str]:
     env = dict(os.environ)
+    if api in ("claude-code", "codex-cli"):
+        # A subscription child must not silently select a parent's metered key.
+        # Copy-only: SDK fallbacks retain the original environment credentials.
+        blocked = {"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL",
+                    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID",
+                    "ANTHROPIC_ORGANIZATION_ID", "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"}
+        # Windows preserves spelling in copied mappings, but lookup ignores case.
+        env = {key: value for key, value in env.items() if key.upper() not in blocked}
     env[_RECURSION_MARKER] = "1"
     # Keep the child non-interactive no matter how it is configured.
     env.setdefault("CI", "1")
@@ -295,7 +305,7 @@ def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            env=_recursion_guard_env(),
+            env=_recursion_guard_env(api),
             shell=False,
         )
     except FileNotFoundError:
