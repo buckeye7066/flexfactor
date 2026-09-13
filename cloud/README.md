@@ -63,3 +63,12 @@ Before promoting a deployment:
 
 Rollback by restoring the previous production deployment alias. The Android release stays pinned to
 its exact engine tag, so rolling back the control plane cannot silently change the engine source.
+
+### Engine rollback safety
+
+Cloud 1.1.4 refuses to replace an installed newer Android engine with an older
+pin, including a protected-branch update race. The request claim is cleaned up,
+and no downgrade branch or pull request is created. Upgrade the control plane
+before retrying. Do not roll back to cloud 1.1.3: it predates this protection.
+The main-branch release gate verifies the exact service version and engine pin,
+not just HTTP 200 or the OAuth configuration flag.
