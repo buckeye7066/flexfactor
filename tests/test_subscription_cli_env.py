@@ -22,5 +22,24 @@ class SubscriptionEnvironmentTests(unittest.TestCase):
                 self.assertEqual(env["PATH"], original["PATH"])
                 self.assertEqual(dict(os.environ), original)
 
+    def test_mixed_case_environment_is_filtered_without_changing_parent(self):
+        fixture = {"OpenAI_Api_Key": "fixture", "anthropic_api_key": "fixture",
+                   "CodeX_Api_Key": "fixture", "Anthropic_Auth_Token": "fixture",
+                   "openai_base_url": "https://example.invalid",
+                   "Claude_Code_Use_Bedrock": "1", "anthropic_profile": "fixture",
+                   "PATH": "fixture-path", "CLAUDE_CODE_OAUTH_TOKEN": "fixture-plan"}
+        with patch.object(os, "environ", fixture.copy()):
+            for api in ("codex-cli", "claude-code"):
+                child = _recursion_guard_env(api)
+                for name in fixture:
+                    if name not in ("PATH", "CLAUDE_CODE_OAUTH_TOKEN"):
+                        self.assertNotIn(name, child)
+                self.assertEqual(child["PATH"], fixture["PATH"])
+                self.assertEqual(child["CLAUDE_CODE_OAUTH_TOKEN"], "fixture-plan")
+                self.assertEqual(os.environ, fixture)
+            untouched = _recursion_guard_env("copilot-cli")
+            for key, value in fixture.items():
+                self.assertEqual(untouched[key], value)
+
 if __name__ == "__main__":
     unittest.main()
