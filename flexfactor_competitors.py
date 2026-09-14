@@ -1065,6 +1065,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         "sources_skipped": {}, "rr_endpoint": rr_endpoint or "(not used)",
         "verified": 0, "unverified": 0, "accepted": 0, "rejected": 0,
         "coverage_note": "", "queries": [],
+        "research_complete": False, "incomplete_reasons": [],
         "scout_attempted": bool(scout_attempted),
         "scout_url_queries": [], "scout_url_hits": [],
         "repo_rewards_attempted": rr_search is not None,
@@ -1106,6 +1107,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     if scout_opportunities:
         research["sources_used"].append("scout-program-analysis")
     elif scout_attempted:
+        research["incomplete_reasons"].append("Scout program analysis did not complete")
         research["sources_skipped"]["scout-program-analysis"] = (
             str(scout_error or "Scout returned no complete URL/repository query pairs")[:1000]
         )
@@ -1190,6 +1192,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         why = (f"{type(last_err).__name__}: {_ascii(last_err)}" if last_err
                else "model named no competitors")
         research["sources_skipped"]["model-discovery"] = why
+        research["incomplete_reasons"].append("model discovery did not complete: " + why)
         log(f"  competitor discovery failed (non-fatal): {why}")
 
     probe_only = False
@@ -1503,6 +1506,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
 
     if not competitors:
         research["coverage_note"] = coverage_note(0, target, 0)
+        research["incomplete_reasons"].append("no competitor evidence was available for evaluation")
         return research
 
     # -- 4d. One adoptable idea per competitor, judged against the purpose ---
@@ -1613,6 +1617,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                 + str(idea.get("purpose_reason") or ""))
         c["idea"] = idea
         if incomplete:
+            research["incomplete_reasons"].append(f"idea:{c['name']}: {incomplete}")
             research["sources_skipped"].setdefault(f"idea:{c['name']}", incomplete)
         # An unverified competitor can never be "accepted" for action: we have
         # no evidence the product exists, so its idea is a hypothesis about a
@@ -1623,6 +1628,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                 "NOT ACTED ON: no reachable source corroborated this competitor. "
                 + str(idea.get("purpose_reason") or ""))
         if idea.get("error"):
+            research["incomplete_reasons"].append(f"idea:{c['name']}: {idea['error']}")
             research["sources_skipped"].setdefault(
                 f"idea:{c['name']}", idea["error"])
 
@@ -1633,6 +1639,11 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     research["rejected"] = len(competitors) - research["accepted"]
     research["coverage_note"] = coverage_note(
         research["verified"], target, research["unverified"])
+    # Source shortfalls remain visible and retain the owner's count policy.
+    # Provider/analysis failures, however, cannot masquerade as a finished gate.
+    if not research["sources_used"]:
+        research["incomplete_reasons"].append("no research source completed")
+    research["research_complete"] = not research["incomplete_reasons"]
     return research
 
 

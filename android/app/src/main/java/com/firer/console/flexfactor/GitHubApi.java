@@ -273,10 +273,13 @@ final class GitHubApi {
                 + "&run_id=" + runId, null, true));
     }
 
-    RunDetails runDetails(String token, String repository, long runId) throws Exception {
+    RunDetails runDetails(String token, String repository, String requestId, long runId)
+            throws Exception {
         validateRunIdentity(repository, runId);
+        requireCanonicalUuid(requestId, "Run request ID");
         byte[] archive = cloudBytes(token, "/api/runs/details?repository="
-                + encode(repository) + "&run_id=" + runId);
+                + encode(repository) + "&request_id=" + encode(requestId)
+                + "&run_id=" + runId);
         String result = "";
         String errors = "";
         String status = "";

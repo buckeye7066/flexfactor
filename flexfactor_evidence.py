@@ -160,6 +160,11 @@ class EventLedger:
             "attributes": _redact(attributes),
         }
         line = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        # Owner-WIP restoration can legitimately remove an untracked state
+        # directory after this ledger was constructed. Recreate the parent at
+        # each durable append instead of turning the intended terminal event
+        # into the run's error.
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
             fh.write(line)
             fh.flush()
@@ -170,6 +175,7 @@ class EventLedger:
                 failure = dict(event)
                 failure["name"] = "hook.failed"
                 failure["attributes"] = {"hook": repr(hook), "error": str(ex)[:300]}
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
                 with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
                     fh.write(json.dumps(_redact(failure), sort_keys=True) + "\n")
         return event

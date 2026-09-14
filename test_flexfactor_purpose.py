@@ -1183,8 +1183,10 @@ class PurposeContractV2Tests(_TempRepo):
         )
         self.assertIsNotNone(contract)
         prompt = contract.prompt_block()
+        self.assertNotIn("Report-only is the default", prompt)
         for requirement in (
-            "Report-only is the default",
+            "Audit/Production Ready attempt repair and publication, never report-only",
+            "Scout apply requires authorization",
             "Source is classified before cloud calls",
             "resource, network, path, process, and time containment",
             "batch/project budgets",

@@ -21539,8 +21539,16 @@ class OrphanWipWiringTests(unittest.TestCase):
             allowed, why = ff._wip_publish_guard(d)
             self.assertTrue(allowed, why)
             sha = g("rev-parse", ref).stdout.strip()
-            mr = g("merge", "-q", "--allow-unrelated-histories", "-m", "oops", sha)
-            self.assertEqual(mr.returncode, 0, mr.stderr)
+            # Construct the forbidden ancestry directly. A porcelain merge of
+            # two root commits is sensitive to checkout newline conversion on
+            # Windows and can report an add/add conflict even when the owner
+            # file introduced by the snapshot is distinct.
+            tree = g("rev-parse", "HEAD^{tree}").stdout.strip()
+            head = g("rev-parse", "HEAD").stdout.strip()
+            merged = g("commit-tree", tree, "-p", head, "-p", sha, "-m", "oops")
+            self.assertEqual(merged.returncode, 0, merged.stderr)
+            moved = g("update-ref", "HEAD", merged.stdout.strip(), head)
+            self.assertEqual(moved.returncode, 0, moved.stderr)
             allowed, why = ff._wip_publish_guard(d)
             self.assertFalse(allowed)
             self.assertIn("ancestor", why.lower())

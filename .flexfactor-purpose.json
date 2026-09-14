@@ -111,7 +111,7 @@
   "workflows": [
     {
       "id": "w-1",
-      "text": "Audit inventories purpose and the repository, evaluates competitors, iterates verified deltas, then verifies, reviews, and publishes explicit-apply changes.",
+      "text": "Audit checks purpose, repository, competitors, and verified deltas, then verifies, independently reviews, and publishes.",
       "confidence": "verified",
       "evidence_refs": [
         0,
@@ -146,7 +146,7 @@
   "invariants": [
     {
       "id": "i-1",
-      "text": "Report-only is the default; mutation requires explicit apply authorization.",
+      "text": "Audit/Production Ready attempt repair and publication, never report-only. Scout apply requires authorization.",
       "confidence": "supported",
       "evidence_refs": [
         5,
@@ -314,8 +314,8 @@
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "3063b40b50e0b2c0b9b2196d5b6966a6c45a3de11ac1bc4ebdfac5f148e94fbc",
-      "observed_at": "2026-09-12T05:49:55.124271+00:00",
+      "content_hash": "f609283c89f108dc46e16eebe8231d2389d93398c274a85fb5448f009368a8fa",
+      "observed_at": "2026-09-13T13:15:00.220129+00:00",
       "excerpt": "Modes, verification, review, publication."
     },
     {
@@ -328,9 +328,9 @@
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
-      "content_hash": "a9f6d2bbf2611c21a664f3c4de85127c6eae80a99d7b77a5d2fb7c0eb114087f",
-      "observed_at": "2026-09-05T07:02:50Z",
-      "excerpt": "Cloud dispatch and secret cleanup."
+      "content_hash": "f511d557bed2772c83187baeb50d0b64ac1c7875e7b358dc92af956c38f38668",
+      "observed_at": "2026-09-13T13:44:00.227462+00:00",
+      "excerpt": "Dispatch, downgrade guard, and scoped cleanup."
     },
     {
       "kind": "documentation",
@@ -342,14 +342,14 @@
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MainActivity.java",
-      "content_hash": "723ebabf97b63fb8f335188b04ca3a57366cc26a34df774c78443385f7f91973",
-      "observed_at": "2026-09-09T03:25:58.981361+00:00",
+      "content_hash": "d5044ff2aa52d5d60a749ab9f71f29b09d5f11f817ea78a55a24203dc1e77b63",
+      "observed_at": "2026-09-13T13:44:00.228496+00:00",
       "excerpt": "Android dispatch recovery."
     },
     {
       "kind": "source",
       "locator": "flexfactor_evidence.py",
-      "content_hash": "bf1da36f493b58dba1d740f5f60a9b90481939aa547615321b670621db6e8982",
+      "content_hash": "df40d38d4d927b3ab0f643c8e98e1f836aa50138e0ae4cbc8e93b0e2a8540469",
       "observed_at": "2026-09-06T16:45:00Z",
       "excerpt": "Fail-closed gate ledger."
     },

@@ -4272,6 +4272,106 @@ def _report_route_quality(provider, role: str, signal: str, pfx: str = "  ") -> 
         print(f"{pfx}[rotation] {note}", file=sys.stderr)
 
 
+def _bind_candidate_authorship(provider, project_dir: str, checkpoint=None) -> None:
+    """Attach exact-commit author receipts to the shared, run-scoped coordinator."""
+    from flexfactor_rotation import RotatingProvider
+    if not isinstance(provider, RotatingProvider):
+        return
+    coordinator = provider.role_coordinator
+    project = os.path.normcase(os.path.realpath(project_dir))
+    previous = getattr(coordinator, "candidate_authorship", None)
+    if previous is not None:
+        if previous["project"] != project:
+            raise RuntimeError("candidate author history belongs to a different target")
+        return
+    data = getattr(checkpoint, "data", {})
+    if (checkpoint is not None and isinstance(data, dict)
+            and os.path.normcase(os.path.realpath(str(data.get("project_dir") or ""))) != project):
+        raise RuntimeError("candidate author checkpoint belongs to a different target")
+    recorded = data.get("candidate_author_families", {}) if isinstance(data, dict) else {}
+    coordinator.candidate_authorship = {
+        "project": project,
+        "commits": dict(recorded) if isinstance(recorded, dict) else {},
+        "checkpoint": checkpoint,
+    }
+
+
+def _record_candidate_authorship(provider, project_dir: str, candidate_sha: str) -> None:
+    """Record only successful authors, after Git binds their candidate to a SHA.
+
+    A crash before this receipt is durable leaves an unaccounted commit; final
+    review then blocks instead of assuming the new process knows its authors.
+    """
+    from flexfactor_rotation import RotatingProvider
+    if not isinstance(provider, RotatingProvider):
+        return
+    _bind_candidate_authorship(provider, project_dir)
+    coordinator = provider.role_coordinator
+    with coordinator.lock:
+        families = sorted(coordinator.author_families)
+    if not families:
+        return  # No author evidence is not a receipt for externally supplied bytes.
+    state = coordinator.candidate_authorship
+    state["commits"][candidate_sha] = families
+    checkpoint = state["checkpoint"]
+    if checkpoint is not None:
+        try:
+            checkpoint.set(candidate_author_families=dict(state["commits"]))
+            if checkpoint.save(force=True) is not True:
+                raise RuntimeError("candidate author history could not be saved")
+        except Exception:
+            state["commits"].pop(candidate_sha, None)
+            checkpoint.set(candidate_author_families=dict(state["commits"]))
+            raise
+
+
+def _candidate_review_authors(reviewer, project_dir: str, baseline_sha: str | None,
+                             final_sha: str) -> tuple[bool, str]:
+    """Prove author history for every unpublished candidate commit, including resume."""
+    from flexfactor_rotation import RotatingProvider
+    if not isinstance(reviewer, RotatingProvider):
+        # Legacy fixed adapters cannot own production runs: the canonical
+        # builders refuse to start without a rotating ladder.
+        return True, ""
+    if baseline_sha == final_sha:
+        return True, ""
+    if not baseline_sha:
+        return False, "candidate author history has no baseline commit"
+    ancestry = _git(["merge-base", "--is-ancestor", baseline_sha, final_sha], project_dir)
+    if ancestry.returncode != 0:
+        return False, "candidate author history baseline is not an ancestor of the candidate"
+    default_branch, _basis = _remote_default_branch(project_dir)
+    published = (_git(["merge-base", "--is-ancestor", baseline_sha,
+                       f"refs/remotes/origin/{default_branch}"], project_dir)
+                 if default_branch else None)
+    if published is None or published.returncode != 0:
+        return False, "candidate author history excludes an unpublished or unknown baseline"
+    listed = _git(["rev-list", final_sha, "--not", baseline_sha], project_dir)
+    if listed.returncode != 0:
+        return False, "candidate author history could not enumerate the exact commit interval"
+    commits = (listed.stdout or "").split()
+    if not commits:
+        return False, "candidate author history commit interval was empty"
+    coordinator = reviewer.role_coordinator
+    state = getattr(coordinator, "candidate_authorship", {})
+    if state.get("project") != os.path.normcase(os.path.realpath(project_dir)):
+        return False, "candidate author history is unavailable for this target"
+    receipts = state.get("commits", {})
+    families = set()
+    for commit in commits:
+        recorded = receipts.get(commit)
+        if (not isinstance(recorded, list) or not recorded
+                or any(not isinstance(family, str) or not family.strip()
+                       for family in recorded)):
+            return False, f"candidate author history is missing for commit {commit}"
+        families.update(recorded)
+    # This is the same coordinator read by RotatingProvider._complete_intent.
+    # Restore all earlier authors before FINAL_REVIEW_SCHEMA selects any route.
+    with coordinator.lock:
+        coordinator.author_families.update(families)
+    return True, ""
+
+
 def _intent_kw(provider, role: str, *needs: str, avoid_family: str | None = None) -> dict:
     """`intent=` kwarg for a ROTATING provider; nothing for a fixed one.
 
@@ -5598,7 +5698,7 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
     may influence the clean-room rewrite of the selected target file.
     """
     outcome = {
-        "attempted": True, "verified": 0, "implemented_files": [],
+        "attempted": False, "verified": 0, "implemented_files": [],
         "note": "", "research": None, "current": current,
     }
     module = _competitors_module()
@@ -5648,6 +5748,10 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
             scout_error=scout_error,
         )
         outcome["research"] = research
+        if research.get("research_complete") is False:
+            outcome["note"] = "competitor research incomplete: " + "; ".join(
+                research.get("incomplete_reasons") or ["research did not complete"])
+            return outcome
         outcome["verified"] = int(research.get("verified") or 0)
         outcome["note"] = str(research.get("coverage_note") or "")
         print(f"[competitor gate] {outcome['note']}")
@@ -5671,6 +5775,7 @@ def _refactor_top_three_gate(args, provider, project_dir: str, rel: str,
         )[:1000]
         return outcome
 
+    outcome["attempted"] = True
     relevant = [finding for path, finding in pairs
                 if str(path).replace("\\", "/") == rel]
     if not relevant:
@@ -5857,6 +5962,8 @@ def run(args) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    _bind_candidate_authorship(provider, root)
+    args._candidate_author_provider = provider
     print(f"FlexFactor | model_policy=best-available "
           f"threshold={args.threshold} "
           f"max_iterations={args.max_iterations}\n")
@@ -6247,6 +6354,10 @@ def run(args) -> int:
                 verified=competitor["verified"],
                 note=competitor["note"],
             )
+        if not competitor["attempted"]:
+            print("error: required competitor research is incomplete: "
+                  + competitor["note"], file=sys.stderr)
+            return 1
         print(
             f"\nSwole. {args.file} already satisfies the goal; project "
             f"verification passed and {baseline_sha[:12]} is contained in "
@@ -6311,6 +6422,10 @@ def run(args) -> int:
         delta = _ff_execution.changed_file_scope(
             [changed_rel] + list(competitor["implemented_files"])
         )
+        if not competitor["attempted"]:
+            print("error: required competitor research is incomplete: "
+                  + competitor["note"], file=sys.stderr)
+            return 1
         if execution_orchestrator is not None:
             execution_orchestrator.begin_pass(2, delta)
         current = str(competitor.get("current") or current)
@@ -6943,6 +7058,11 @@ def _name_variants(name_hint: str) -> list[str]:
 
 
 def _find_local_project(*name_hints: str) -> str | None:
+    """Resolve an exact/prefix name only from a complete bounded inventory."""
+    return _find_local_project_result(*name_hints)[0]
+
+
+def _find_local_project_result(*name_hints: str) -> tuple[str | None, bool]:
     """Given one or more display names like 'Mind Over Math' or 'GrantFlow Repo'
     (and/or a repo name mined from a URL), look for a matching source folder under
     the known project roots (e.g. C:\\Users\\firer\\mind-over-math). This upgrades
@@ -6959,7 +7079,7 @@ def _find_local_project(*name_hints: str) -> str | None:
                 if v not in candidates:
                     candidates.append(v)
     if not candidates:
-        return None
+        return None, True
 
     exact = set(candidates)
     # Prefix match is guarded by length so short slugs can't match everything.
@@ -6967,27 +7087,37 @@ def _find_local_project(*name_hints: str) -> str | None:
 
     # Snapshot the directories under each root once, then run two GLOBAL passes so
     # an exact match in any root always beats a mere prefix match in another.
+    # Share the optional typo discovery limits: the initial exact/prefix scan
+    # runs first and must not do an unlimited home inventory before that guard.
+    deadline = time.monotonic() + _ff_directed._PROJECT_LOOKUP_SECONDS
+    examined = 0
     root_dirs: list[str] = []
     for root in _PROJECT_ROOTS:
-        if not os.path.isdir(root):
-            continue
+        if time.monotonic() >= deadline:
+            return None, False
         try:
-            entries = os.listdir(root)
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    examined += 1
+                    if (examined > _ff_directed._PROJECT_LOOKUP_MAX_ENTRIES
+                            or time.monotonic() >= deadline):
+                        return None, False
+                    # Only plausible names need metadata: unrelated mounts and
+                    # junctions must not turn recovery into a slow filesystem walk.
+                    slug = _slugify(entry.name)
+                    squashed = slug.replace("-", "")
+                    if (slug not in exact and not any(
+                            slug.startswith(c) or squashed.startswith(c)
+                            for c in prefix_cands)):
+                        continue
+                    full = os.path.join(root, entry.name)
+                    if os.path.isdir(full):
+                        root_dirs.append(full)
         except OSError:
             continue
-        # Metadata probes on unrelated entries can take minutes on a mounted
-        # drive. Only names that could win either matching tier need a stat.
-        # Keep the global passes below so exact/visible precedence is unchanged.
-        for entry in entries:
-            slug = _slugify(entry)
-            squashed = slug.replace("-", "")
-            if (slug not in exact and not any(
-                    slug.startswith(c) or squashed.startswith(c)
-                    for c in prefix_cands)):
-                continue
-            full = os.path.join(root, entry)
-            if os.path.isdir(full):
-                root_dirs.append(full)
+    # A partial inventory cannot prove the global exact/visible precedence.
+    if time.monotonic() >= deadline:
+        return None, False
 
     # A HIDDEN sibling is a config/data directory, not a source checkout, and
     # `_slugify` cannot tell them apart: the leading dot is not alnum, so it
@@ -7011,15 +7141,15 @@ def _find_local_project(*name_hints: str) -> str | None:
     for tier in (visible, hidden):
         for full in tier:
             if _slugify(os.path.basename(full)) in exact:
-                return full
+                return full, True
     # Pass 2 (global): prefix match - tolerant of name/folder drift.
     for tier in (visible, hidden):
         for full in tier:
             entry_slug = _slugify(os.path.basename(full))
             entry_squash = entry_slug.replace("-", "")
             if any(entry_slug.startswith(c) or entry_squash.startswith(c) for c in prefix_cands):
-                return full
-    return None
+                return full, True
+    return None, True
 
 
 def _read_text_safe(path: str, limit: int = 4000) -> str:
@@ -8050,6 +8180,26 @@ _WIRED_TRUST_GATE = True
 _WIRED_EXECUTION_BROKER = True
 
 
+def _git_without_hooks(cmd: list[str]) -> list[str]:
+    """Disable target Git hooks without changing repository or transport config.
+
+    Git is allowed outside the build broker for authenticated publication, but
+    its client hooks and fsmonitor hook are target-controlled executable code.
+    Per-command settings leave owner config and remote branch rules untouched.
+    Insert them after global options so an earlier -c/--config-env cannot
+    re-enable hooks; command-line config also outranks inherited config.
+    /dev/null is Git's documented cross-platform hook-disabling path.
+    """
+    index = 1
+    while index < len(cmd) and str(cmd[index]).startswith("-"):
+        option = str(cmd[index])
+        if option == "--":
+            break
+        index += 2 if option in (_cmd_policy._GIT_VALUE_OPTS | {"--config-env"}) else 1
+    return [*cmd[:index], "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false", *cmd[index:]]
+
+
 def _run(cmd: list[str], cwd: str, timeout: int = 900,
          env: dict | None = None) -> subprocess.CompletedProcess:
     """Run a subprocess robustly - NEVER raises. A missing executable, OS error, bad
@@ -8085,6 +8235,11 @@ def _run(cmd: list[str], cwd: str, timeout: int = 900,
     if _classes & _TARGET_CODE_CLASSES and not _tool_authored_syntax_check(cmd):
         return _run_target_code(cmd, cwd, timeout, env, _classes, _fail)
     try:
+        # All Git adapters, including autoclean's tuple runner, reach here.
+        # Keep authentication/transport configuration intact; only local hook
+        # execution is disabled. Command policy still sees the original argv.
+        if _cmd_policy._exe_name(cmd) == "git":
+            cmd = _git_without_hooks(cmd)
         # encoding/errors are LOAD-BEARING on Windows (live GrantFlow crash,
         # 2026-08-16). `text=True` with no encoding decodes child output with the
         # locale codec - cp1252 here - so ONE smart quote or em dash from npm /
@@ -8974,6 +9129,11 @@ def _git_tree_clean(path: str) -> bool:
     They are NOT deleted from the working tree: FlexFactor did create them, but
     a predicate named "is this tree clean" has no business removing files, and a
     pattern list is not a good enough reason to unlink somebody's data."""
+    # Status can invoke clean filters. Refuse those repositories before the
+    # first cleanliness probe, while the owner's bytes and index are untouched.
+    safe, _reason = _ff_wip.snapshot_preflight(_git, path)
+    if not safe:
+        return False
     r = _git(["status", "--porcelain"], path)
     if r.returncode != 0:
         return False
@@ -9766,6 +9926,7 @@ def _apply_integration_impl(project_dir: str, repo_name: str, patch: dict, opts)
         candidate_sha = ((head.stdout or "").strip() if head.returncode == 0 else "")
         if not candidate_sha or candidate_sha == baseline_sha:
             raise ApplyError("candidate commit could not be resolved")
+        _record_candidate_authorship(reviewer, project_dir, candidate_sha)
 
         review_summary = {
             "mode": "scout",
@@ -14021,7 +14182,7 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
     """Research the configured competitor target after pass one.
 
     This is the orchestrator's mandatory pass-1/pass-2 gate. Research failure
-    is recorded, not fatal; unsafe or unverified mutations remain fail-closed.
+    is incomplete and cannot authorize a follow-up pass or successful run.
     The return value is deliberately explicit so the caller can merge every
     changed path into pass two's exact delta scope.
     """
@@ -14034,7 +14195,7 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
         "notes": [],
         "dirty_abort": False,
         "committed": False,
-        "attempted": True,
+        "attempted": False,
     }
     report(phase="configured competitor gate (between passes 1 and 2)")
     if checkpoint is not None:
@@ -14110,7 +14271,15 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
         print(f"{pfx}competitor gate INCOMPLETE: {module._ascii(exc)}", file=sys.stderr)
         return outcome
 
+    if not isinstance(research, dict):
+        outcome["notes"].append("configured competitor research returned no result")
+        return outcome
     outcome["research"] = research
+    if research.get("research_complete") is False:
+        outcome["notes"].append("configured competitor research incomplete: " + "; ".join(
+            research.get("incomplete_reasons") or ["research did not complete"]))
+        print(f"{pfx}{outcome['notes'][-1]}", file=sys.stderr)
+        return outcome
     safe = module._ascii
     print(f"{pfx}{safe(research.get('coverage_note', ''))}")
     for source, reason in sorted((research.get("sources_skipped") or {}).items()):
@@ -14135,6 +14304,9 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
         outcome["findings"].append(dict(finding, file=rel))
         outcome["purpose_files"].append(rel)
     ledger = research.get("bridge_ledger") or {}
+    # The receipt's attempted bit admits pass two. Set it only after research
+    # returned and its findings were processed, never merely on function entry.
+    outcome["attempted"] = True
     print(f"{pfx}competitor gate: {ledger.get('bridged', 0)}/"
           f"{ledger.get('candidates', 0)} candidate idea(s) entered the fix stream")
     if not pairs or not _model_work_available(meter, [author, cross]):
@@ -18015,6 +18187,12 @@ def _independent_final_review(reviewer, project_dir: str, baseline_sha: str | No
         return {"verdict": "reject", "commit": "", "findings": [],
                 "evidence_consistent": False,
                 "reason": "target is not a Git commit; exact-commit review unavailable"}
+    authors_known, author_reason = _candidate_review_authors(
+        reviewer, project_dir, baseline_sha, final_sha,
+    )
+    if not authors_known:
+        return {"verdict": "reject", "commit": final_sha, "findings": [],
+                "evidence_consistent": False, "reason": author_reason}
     if not isinstance(evidence_summary, dict):
         return {
             "verdict": "reject", "commit": final_sha, "findings": [],
@@ -19975,6 +20153,16 @@ def _commit_and_sync(project_dir: str, branch: str, prev_branch: str, args,
     else:
         verification_word = "build + project tests ok" if has_suite else "build ok"
     status = f"{label}: committed on {branch} ({verification_word})"
+    author_provider = getattr(args, "_candidate_author_provider", None)
+    if author_provider is not None:
+        head = _git(["rev-parse", "HEAD"], project_dir)
+        candidate_sha = (head.stdout or "").strip()
+        if head.returncode != 0 or not candidate_sha:
+            raise BranchStateError(f"{label}: candidate author history lost the committed SHA")
+        try:
+            _record_candidate_authorship(author_provider, project_dir, candidate_sha)
+        except Exception as exc:
+            raise BranchStateError(f"{label}: candidate author history unavailable: {exc}") from exc
     # CRUCIAL: the next cycle must continue on the audit branch reading saved code.
     # If we cannot CONFIRM HEAD is back on the audit branch, STOP the audit - silently
     # returning success here would write/commit the next cycle onto whatever branch is
@@ -20527,6 +20715,52 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             )
             print(f"{pfx}error: {result['error']}", file=sys.stderr)
             return result
+        # Preserve owner work before preparation can stage, commit, or sync it.
+        # The orphan and index refs stay outside all candidate branch history.
+        tree_dirty = git and not _git_tree_clean(project_dir)
+        if tree_dirty and not getattr(args, "allow_dirty", False):
+            # Preparation must never commit pre-existing owner work.
+            print(f"{pfx}working tree is dirty; preserving it before cleanup in "
+                  "an orphan WIP snapshot and continuing the repair.", file=sys.stderr)
+            result["wip_snapshot_auto"] = True
+        prev_branch = _git_current_branch(project_dir) if git else None
+        # NO SANDBOX BRANCH (owner order 2026-08-11). Work lands on the branch the
+        # repo is already on, so a verified fix IS in the repo the moment it commits -
+        # never stranded on a flexfactor/* branch waiting on a merge gate that may
+        # never open. `created_branch` stays False forever: nothing to create, nothing
+        # to restore, nothing to force-push.
+        branch = prev_branch
+        result["branch"] = branch
+        created_branch = False
+        if git:
+            print(f"{pfx}Working directly on your branch: {branch} (no sandbox branch)")
+
+        if tree_dirty:
+            # OWNER WIP MUST NEVER ENTER AUTOMATED BRANCH HISTORY. The dirty tree
+            # is captured as an ORPHAN commit under refs/flexfactor-wip/<sha>
+            # (no parent -> never an ancestor of anything FlexFactor pushes),
+            # secret-scanned, and the worktree is reset to HEAD so every commit
+            # this run makes is tool-only. It is restored in the `finally` below
+            # on EVERY exit path; if restoration cannot be proven the ref is kept.
+            fp_before = _ff_wip.porcelain_fingerprint(_git, project_dir)
+            ok_wip, wip_ref, wip_secrets = _ff_wip.capture_orphan_wip_snapshot(_git, project_dir)
+            if wip_ref:
+                _WIP_ACTIVE[os.path.normcase(os.path.abspath(project_dir))] = {
+                    "ref": wip_ref, "secrets": wip_secrets, "fingerprint": fp_before,
+                    "prev_branch": prev_branch}
+            if not ok_wip:
+                print(f"{pfx}error: could not snapshot the dirty working tree "
+                      f"(ref={wip_ref or 'none'}); refusing to run on top of your WIP",
+                      file=sys.stderr)
+                result["error"] = "could not snapshot dirty working tree"
+                result["wip_snapshot_ref"] = wip_ref
+                return result
+            result["wip_snapshot_ref"] = wip_ref
+            result["wip_secret_findings"] = len(wip_secrets)
+            print(f"{pfx}pre-run uncommitted work snapshotted to ORPHAN {wip_ref} "
+                  f"({len(wip_secrets)} secret-shaped item(s) found); worktree at HEAD "
+                  "for the run; restored at the end")
+
         # Repair an interrupted merge/rebase/cherry-pick before branch/head
         # checks.  The old path tried ordinary cleanup against an unmerged
         # index, then died on a dirty tree.  Autoclean uses Git's own safe abort
@@ -20670,6 +20904,9 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
             _ledger("setup", result["error"])
             return result
         author = providers[0][1]
+        for _provider_name, candidate_provider in providers:
+            _bind_candidate_authorship(candidate_provider, project_dir, checkpoint)
+        args._candidate_author_provider = author
         # Collecting evidence is not itself understanding.  When no authored
         # contract exists, execute the inference now that a provider exists and
         # refuse to begin the sweep unless it identifies users, end-to-end
@@ -20750,8 +20987,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
               f"web={stack['is_web']}")
 
         # Open the exhaustive pass before any repository preparation can
-        # mutate the target.  Auto-clean may commit owner work, merge green
-        # dependency PRs, and fast-forward the branch; bootstrap can update
+        # mutate the candidate. Owner WIP is already held outside its history.
+        # Auto-clean may merge green PRs or fast-forward; bootstrap can update
         # lockfiles.  Treating those as invisible setup made the queue receipt
         # describe only a suffix of the repository transaction.
         execution_orchestrator = getattr(args, "execution_orchestrator", None)
@@ -20772,27 +21009,8 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 exhaustive=True,
             )
 
-        # 2. Sandbox: clean-tree gated, dedicated reversible branch (created ONCE;
-        #    every cycle commits onto it). The branch is slug-named from this program,
-        #    giving per-program uniqueness with no cross-contamination.
-        #    A dirty tree is handled three ways: --allow-dirty sweeps the dirt into
-        #    the cycle commits (legacy, explicit opt-in); --snapshot-dirty (prodready's
-        #    default - "walk away" must not faceplant on the most common real-world
-        #    state) preserves it verbatim as the branch's first commit; otherwise
-        #    hard-stop, because `git add -A` below would silently commit owner WIP
-        #    as FlexFactor's work.
-        # ============== PRE-WORK REPO CLEANUP (owner order 2026-08-20) ========
-        # The launcher no longer ASKS whether to deal with what is already left
-        # in the repo - it always does, before any new work starts. Commit
-        # pre-existing changes, land every green open PR, account for every
-        # Dependabot alert and open issue, then fast-forward so the new work is
-        # built on the union that just landed.
-        #
-        # This runs BEFORE the dirty-tree gate below on purpose: cleaning is
-        # what makes the tree clean, so gating the cleanup on a clean tree would
-        # be circular. It is also LOUD - the accounting identity in
-        # flexfactor_autoclean (candidates == acted + skipped + failed) means a
-        # cleanup that did nothing says so, with a reason per item.
+        # Pre-work cleanup operates only on the clean committed baseline.
+        # Its accounting and verification gates remain mandatory.
         if git and getattr(args, "auto_clean", True):
             try:
                 import flexfactor_autoclean as _autoclean
@@ -20843,54 +21061,27 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 result["autoclean"] = {"error": str(exc)}
                 _ledger("autoclean", exc)
 
-        tree_dirty = git and not _git_tree_clean(project_dir)
-        if tree_dirty and not getattr(args, "allow_dirty", False):
-            # A normal dirty tree has already been offered to autoclean.  If it
-            # remains (for example a test/bootstrap side effect or a commit
-            # failure), stopping here strands the repair behind precisely the
-            # recoverable "unclean head" state the runner was asked to resolve.
-            # The orphan snapshot below keeps every byte out of FlexFactor's
-            # commits and restores it at the end, so continuing is safer than a
-            # manual stash/abort loop and does not claim owner work as ours.
-            print(f"{pfx}working tree remains dirty after cleanup; preserving it in "
-                  "an orphan WIP snapshot and continuing the repair.", file=sys.stderr)
-            result["wip_snapshot_auto"] = True
-        prev_branch = _git_current_branch(project_dir) if git else None
-        # NO SANDBOX BRANCH (owner order 2026-08-11). Work lands on the branch the
-        # repo is already on, so a verified fix IS in the repo the moment it commits -
-        # never stranded on a flexfactor/* branch waiting on a merge gate that may
-        # never open. `created_branch` stays False forever: nothing to create, nothing
-        # to restore, nothing to force-push.
-        branch = prev_branch
-        result["branch"] = branch
-        created_branch = False
-        if git:
-            print(f"{pfx}Working directly on your branch: {branch} (no sandbox branch)")
-
-        if tree_dirty:
-            # OWNER WIP MUST NEVER ENTER AUTOMATED BRANCH HISTORY. The dirty tree
-            # is captured as an ORPHAN commit under refs/flexfactor-wip/<sha>
-            # (no parent -> never an ancestor of anything FlexFactor pushes),
-            # secret-scanned, and the worktree is reset to HEAD so every commit
-            # this run makes is tool-only. It is restored in the `finally` below
-            # on EVERY exit path; if restoration cannot be proven the ref is kept.
-            fp_before = _ff_wip.porcelain_fingerprint(_git, project_dir)
-            ok_wip, wip_ref, wip_secrets = _ff_wip.capture_orphan_wip_snapshot(_git, project_dir)
-            if not ok_wip:
-                print(f"{pfx}error: could not snapshot the dirty working tree "
-                      f"(ref={wip_ref or 'none'}); refusing to run on top of your WIP",
-                      file=sys.stderr)
-                result["error"] = "could not snapshot dirty working tree"
-                result["wip_snapshot_ref"] = wip_ref
+            # Autoclean may merge an already-reviewed PR and fast-forward the
+            # working branch. Those published commits predate this run's model
+            # work and therefore have no candidate-author receipts. Bind the
+            # review interval to the freshly synchronized remote/HEAD pair so
+            # only commits authored by this run require those receipts.
+            _default_branch, _default_basis = _remote_default_branch(project_dir)
+            _remote_boundary = (_git(
+                ["rev-parse", f"refs/remotes/origin/{_default_branch}"], project_dir
+            ) if _default_branch else None)
+            _head = _git(["rev-parse", "HEAD"], project_dir)
+            if (_remote_boundary is None or _remote_boundary.returncode != 0
+                    or _head.returncode != 0):
+                result["error"] = "could not refresh the post-autoclean publication boundary"
+                print(f"{pfx}error: {result['error']}", file=sys.stderr)
                 return result
-            _WIP_ACTIVE[os.path.normcase(os.path.abspath(project_dir))] = {
-                "ref": wip_ref, "secrets": wip_secrets, "fingerprint": fp_before,
-                "prev_branch": prev_branch}
-            result["wip_snapshot_ref"] = wip_ref
-            result["wip_secret_findings"] = len(wip_secrets)
-            print(f"{pfx}pre-run uncommitted work snapshotted to ORPHAN {wip_ref} "
-                  f"({len(wip_secrets)} secret-shaped item(s) found); worktree at HEAD "
-                  "for the run; restored at the end")
+            publication_review_baseline = (_remote_boundary.stdout or "").strip() or None
+            initial_commit = (_head.stdout or "").strip() or None
+            if not publication_review_baseline or not initial_commit:
+                result["error"] = "post-autoclean publication boundary was empty"
+                print(f"{pfx}error: {result['error']}", file=sys.stderr)
+                return result
 
         # Baseline build status decides whether the per-file gate is the real build
         # or a syntax-only fallback (a project already broken can't gate on its build).
@@ -22009,6 +22200,12 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                     stop_reason = (
                         "aborted in competitor gate: refused rollback left an "
                         "unverified candidate"
+                    )
+                    break
+                if not competitor_gate["attempted"]:
+                    converged = False
+                    stop_reason = "competitor gate incomplete: " + (
+                        "; ".join(competitor_gate["notes"]) or "research did not complete"
                     )
                     break
 

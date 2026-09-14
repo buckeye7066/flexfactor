@@ -19,12 +19,16 @@
 3. **Provider credentials.** Provider keys remain encrypted on the phone until a run needs one. The
    APK validates each newly entered value independently against the provider's fixed HTTPS origin
    before saving it and again before transmission. It seals only credentials required by the effective run policy with the
-   repository public key. The cloud preflights every supplied repository secret before any write,
-   never replaces an owner-managed secret, forwards only sealed ciphertext and key IDs to GitHub,
+   repository public key. The cloud validates every supplied sealed credential before any write,
+   writes phone keys under full-request-UUID secret names, never replaces an owner-managed
+   canonical secret, and forwards only sealed ciphertext and key IDs to GitHub,
    and never receives a plaintext provider key. Phone-supplied secrets are recorded in the
-   request's durable claim and deleted when the run completes or a pre-dispatch failure occurs;
-   cleanup failure is fail-closed and prevents queue advancement.
-4. **Artifacts.** Only the run-correlated `mobile-phone-*` artifact is selected. Redirects must be
+   request's durable claim and deleted only after proven matching terminal completion or rollback
+   by the invocation owning a definitively rejected/pre-dispatch request. A 404 or ambiguous
+   dispatch failure retains credentials and the claim. Cleanup removes steering before secrets
+   and the claim last; partial failure is retriable and prevents queue advancement.
+4. **Artifacts.** The request UUID and numeric run ID must match the fetched FlexFactor run before
+   listing artifacts. Only that request's exact `mobile-phone-<request_id>` artifact is selected. Redirects must be
    HTTPS and use GitHub's signed storage host families. The download is capped at 2 MiB and the OAuth
    bearer is not sent to the signed storage URL. The APK separately caps each extracted entry.
 5. **Execution.** Target code runs inside the selected repository's ephemeral GitHub-hosted runner
@@ -36,6 +40,13 @@
    credential mutation begins. A repository variable atomically claims the request UUID before the
    non-idempotent GitHub dispatch call; retries recover that claim/run instead of starting a second
    workflow. No generic GitHub proxy endpoint exists.
+7. **Recovery.** Recorded claims bypass history scans. Ambiguous claims are never age-deleted:
+   GitHub variable updates/deletes expose no documented conditional ownership transfer. Missing
+   or saturated evidence yields an explicit recovery-required state rather than redispatch.
+8. **OAuth resource use.** Each process limits all device/poll/refresh handlers together to 120
+   admitted requests per minute and eight concurrent exchanges, returning 429 and `Retry-After`.
+   This bounds one instance only; it provides neither fleet-wide rate limiting nor an identity
+   quota. Logs omit request bodies, credentials, query strings, and upstream exception details.
 
 ## Deliberate non-features
 

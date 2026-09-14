@@ -175,16 +175,15 @@ class RenamedFileTests(_RepoCase):
         before = tree_hashes(self.d)
         self.assertIn("renamed.txt", before)
         self.assertNotIn("a.txt", before)
+        staged_before = status(self.d)
         ok, ref, _ = wip.capture_orphan_wip_snapshot(git, self.d)
         self.assertTrue(ok)
         self.assertTrue(os.path.exists(os.path.join(self.d, "a.txt")))
         self.assertFalse(os.path.exists(os.path.join(self.d, "renamed.txt")))
         self._restore_and_assert_identical(before, ref)
         st = status(self.d)
-        # Restore yields an UNSTAGED dirty state (documented): old name deleted,
-        # new name untracked. Bytes are identical; only staging differs.
-        self.assertIn(" D a.txt", st)
-        self.assertIn("?? renamed.txt", st)
+        # A rename staged by the owner must stay staged after restoration.
+        self.assertEqual(st, staged_before)
 
 
 class SymlinkTests(_RepoCase):
@@ -351,7 +350,7 @@ class CrashDuringRestoreTests(_RepoCase):
         self.assertTrue(ok)
 
         def failing(args, cwd):
-            if args and args[0] in ("checkout", "read-tree"):
+            if "checkout" in args or "read-tree" in args:
                 return subprocess.CompletedProcess(args, 128, "", "simulated crash")
             return git(args, cwd)
 

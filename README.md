@@ -59,6 +59,9 @@ compatibility, but they cannot create another execution policy.
 
 ## Install and verify
 
+Git 2.40 or newer is required so owner-WIP snapshots can inspect attributes
+from every source tree without running repository-controlled transformations.
+
 ```bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
