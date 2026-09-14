@@ -314,7 +314,7 @@
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "c7cf0715ce833ac693d18148a4bc1e249842517afa0abe86691c43cdc0b3c1f1",
+      "content_hash": "f609283c89f108dc46e16eebe8231d2389d93398c274a85fb5448f009368a8fa",
       "observed_at": "2026-09-13T13:15:00.220129+00:00",
       "excerpt": "Modes, verification, review, publication."
     },
@@ -328,7 +328,7 @@
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
-      "content_hash": "22a35acd7b134fecc4976438462130149039c18d75dfb73d53dc014b9c275519",
+      "content_hash": "f511d557bed2772c83187baeb50d0b64ac1c7875e7b358dc92af956c38f38668",
       "observed_at": "2026-09-13T13:44:00.227462+00:00",
       "excerpt": "Dispatch, downgrade guard, and scoped cleanup."
     },
@@ -342,7 +342,7 @@
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MainActivity.java",
-      "content_hash": "e8141429044cc49d2eede1fc7ea78da99ebd0e2313ec1797cbbffc93816a5422",
+      "content_hash": "d5044ff2aa52d5d60a749ab9f71f29b09d5f11f817ea78a55a24203dc1e77b63",
       "observed_at": "2026-09-13T13:44:00.228496+00:00",
       "excerpt": "Android dispatch recovery."
     },

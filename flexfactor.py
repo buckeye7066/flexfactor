@@ -21061,6 +21061,28 @@ def audit_one_program(program_arg, args, index: int, total: int, e2e_port: int) 
                 result["autoclean"] = {"error": str(exc)}
                 _ledger("autoclean", exc)
 
+            # Autoclean may merge an already-reviewed PR and fast-forward the
+            # working branch. Those published commits predate this run's model
+            # work and therefore have no candidate-author receipts. Bind the
+            # review interval to the freshly synchronized remote/HEAD pair so
+            # only commits authored by this run require those receipts.
+            _default_branch, _default_basis = _remote_default_branch(project_dir)
+            _remote_boundary = (_git(
+                ["rev-parse", f"refs/remotes/origin/{_default_branch}"], project_dir
+            ) if _default_branch else None)
+            _head = _git(["rev-parse", "HEAD"], project_dir)
+            if (_remote_boundary is None or _remote_boundary.returncode != 0
+                    or _head.returncode != 0):
+                result["error"] = "could not refresh the post-autoclean publication boundary"
+                print(f"{pfx}error: {result['error']}", file=sys.stderr)
+                return result
+            publication_review_baseline = (_remote_boundary.stdout or "").strip() or None
+            initial_commit = (_head.stdout or "").strip() or None
+            if not publication_review_baseline or not initial_commit:
+                result["error"] = "post-autoclean publication boundary was empty"
+                print(f"{pfx}error: {result['error']}", file=sys.stderr)
+                return result
+
         # Baseline build status decides whether the per-file gate is the real build
         # or a syntax-only fallback (a project already broken can't gate on its build).
         # 2b. BOOTSTRAP: install the project's own dependencies so the baseline

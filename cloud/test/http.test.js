@@ -331,12 +331,15 @@ test("recognized OAuth errors preserve Android polling states using fixed safe m
   }
 });
 
-test("details handler requires request identity before listing or downloading artifacts", async (t) => {
-  const calls = mockUpstream(t, () => json({ artifacts: [] }));
+test("details handler derives request identity for released clients", async (t) => {
+  const calls = mockUpstream(t, (url) => url.endsWith("/actions/runs/77")
+    ? json({ id: 77, path: ".github/workflows/flexfactor-mobile.yml",
+      display_title: `FlexFactor audit · ${requestId}` })
+    : json({ artifacts: [] }));
   const result = await invoke(details, { method: "GET", url: "/api/runs/details",
     query: { repository: "owner/project", run_id: "77" }, headers: { authorization: bearer } });
-  assert.equal(result.statusCode, 400);
-  assert.equal(calls.length, 0);
+  assert.equal(result.statusCode, 404);
+  assert.equal(calls.length, 2);
   secure(result);
 });
 
@@ -344,7 +347,7 @@ test("details handler returns only an artifact from the supplied matching reques
   const archive = Buffer.from("PK\u0003\u0004artifact-test");
   const calls = mockUpstream(t, (url) => {
     if (url.endsWith("/actions/runs/77")) return json({ id: 77, name: "FlexFactor Mobile",
-      path: ".github/workflows/flexfactor-mobile.yml", event: "workflow_dispatch",
+      path: ".github/workflows/flexfactor-mobile.yml", event: "workflow_dispatch", path: ".github/workflows/flexfactor-mobile.yml",
       display_title: `FlexFactor audit · ${requestId}`, status: "completed", conclusion: "success" });
     if (url.includes("/artifacts?")) return json({ artifacts: [{ id: 12, name: `mobile-phone-${requestId}`, expired: false, size_in_bytes: archive.length }] });
     if (url.endsWith("/artifacts/12/zip")) return new Response(null, { status: 302,

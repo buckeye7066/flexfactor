@@ -806,9 +806,15 @@ function runBelongsToRequest(run, requestId) {
   return MODES.has(mode);
 }
 
+function runUsesTrustedWorkflow(run) {
+  const path = typeof run?.path === "string" ? run.path.split("@", 1)[0] : "";
+  return path === WORKFLOW_PATH || run?.workflow_id === WORKFLOW_FILE;
+}
+
 function assertMatchingRun(run, requestId, expectedId) {
   if (!Number.isSafeInteger(Number(run?.id)) || Number(run.id) <= 0
-      || Number(run.id) !== Number(expectedId) || !runBelongsToRequest(run, requestId)) {
+      || Number(run.id) !== Number(expectedId) || !runBelongsToRequest(run, requestId)
+      || !runUsesTrustedWorkflow(run)) {
     throw new ServiceError(409, "run_identity_mismatch",
       "GitHub returned a run that does not belong to this request.");
   }
@@ -863,6 +869,7 @@ async function existingDispatchedRun(token, request, fetchImpl, claim = null) {
     }
     const found = page.workflow_runs.find((item) =>
       item.event === "workflow_dispatch" && runBelongsToRequest(item, request.request_id)
+      && runUsesTrustedWorkflow(item)
       && Number.isSafeInteger(Number(item.id)) && Number(item.id) > 0);
     if (found) return runState(found);
     scanned += page.workflow_runs.length;
@@ -1059,12 +1066,19 @@ export async function runStatus(token, repository, runId, requestId, fetchImpl =
 
 export async function runArtifact(token, repository, runId, requestId, fetchImpl = fetch) {
   const id = validateRunIdentity(repository, runId);
-  const cleanRequestId = typeof requestId === "string" ? requestId.trim() : "";
-  if (!UUID.test(cleanRequestId)) {
+  let cleanRequestId = typeof requestId === "string" ? requestId.trim() : "";
+  if (cleanRequestId && !UUID.test(cleanRequestId)) {
     throw new ServiceError(400, "invalid_request_id", "Run request ID is invalid.");
   }
   const run = await githubJson(token, "GET", `/repos/${repository}/actions/runs/${id}`,
     undefined, fetchImpl);
+  if (!cleanRequestId) {
+    const title = typeof run?.display_title === "string" ? run.display_title : "";
+    cleanRequestId = title.slice(title.lastIndexOf(" · ") + 3).trim();
+  }
+  if (!UUID.test(cleanRequestId)) {
+    throw new ServiceError(400, "invalid_request_id", "Run request ID is invalid.");
+  }
   assertMatchingRun(run, cleanRequestId, id);
   const page = await githubJson(token, "GET",
     `/repos/${repository}/actions/runs/${id}/artifacts?per_page=100`, undefined, fetchImpl);

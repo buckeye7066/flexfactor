@@ -269,7 +269,7 @@ test("dispatch request IDs are idempotent across phone crash recovery", async ()
     missingRequestClaim(),
     { body: { workflow_runs: [{
       id: 444,
-      event: "workflow_dispatch",
+      event: "workflow_dispatch", path: ".github/workflows/flexfactor-mobile.yml",
       status: "in_progress",
       conclusion: null,
       display_title: `FlexFactor audit · ${request.request_id}`,
@@ -295,7 +295,7 @@ test("idempotency recovery follows GitHub pagination without dispatching twice",
       body: { workflow_runs: [] } },
     { body: { workflow_runs: [{
       id: 445,
-      event: "workflow_dispatch",
+      event: "workflow_dispatch", path: ".github/workflows/flexfactor-mobile.yml",
       status: "completed",
       conclusion: "success",
       display_title: `FlexFactor audit · ${request.request_id}`,
@@ -523,6 +523,7 @@ test("run status reports the active engine step", async () => {
   const request = validRun();
   const fetcher = queuedFetch([
     { body: { id: 99, status: "in_progress", conclusion: null,
+      path: ".github/workflows/flexfactor-mobile.yml",
       display_title: `FlexFactor audit · ${request.request_id}`,
       html_url: "https://example.invalid/run" } },
     { body: { jobs: [{ steps: [{ name: "Build", status: "completed" },
@@ -537,6 +538,7 @@ test("completed status deletes only this request's ephemeral secrets and claim",
   const request = validRun();
   const fetcher = queuedFetch([
     { body: { id: 99, status: "completed", conclusion: "success",
+      path: ".github/workflows/flexfactor-mobile.yml",
       display_title: `FlexFactor audit · ${request.request_id}`,
       html_url: "https://github.com/owner/project/actions/runs/99" } },
     storedClaim(request, {
@@ -561,6 +563,7 @@ test("status refuses a mismatched run title without touching the request claim",
   const request = validRun();
   const fetcher = queuedFetch([
     { body: { id: 99, status: "completed", conclusion: "success",
+      path: ".github/workflows/flexfactor-mobile.yml",
       display_title: `Unrelated build · ${request.request_id}`,
       html_url: "https://github.com/owner/project/actions/runs/99" } },
   ]);
@@ -575,6 +578,7 @@ test("status never deletes credentials when the durable claim names another run"
   const request = validRun();
   const fetcher = queuedFetch([
     { body: { id: 99, status: "completed", conclusion: "success",
+      path: ".github/workflows/flexfactor-mobile.yml",
       display_title: `FlexFactor audit · ${request.request_id}`,
       html_url: "https://github.com/owner/project/actions/runs/99" } },
     storedClaim(request, {
@@ -605,6 +609,7 @@ test("artifact downloads reject a redirect outside GitHub's signed storage", asy
   const request = validRun();
   const fetcher = queuedFetch([
     { body: { id: 42, status: "completed",
+      path: ".github/workflows/flexfactor-mobile.yml",
       display_title: `FlexFactor audit \u00b7 ${request.request_id}` } },
     { body: { artifacts: [{ id: 123, name: `mobile-phone-${request.request_id}`, expired: false }] } },
     { status: 302, headers: { location: "https://attacker.invalid/result.zip" } },
@@ -618,6 +623,7 @@ test("artifact downloads return only a bounded GitHub-signed archive", async () 
   const request = validRun();
   const fetcher = queuedFetch([
     { body: { id: 42, status: "completed",
+      path: ".github/workflows/flexfactor-mobile.yml",
       display_title: `FlexFactor audit \u00b7 ${request.request_id}` } },
     { body: { artifacts: [{ id: 123, name: `mobile-phone-${request.request_id}`, expired: false }] } },
     { status: 302, headers: { location: "https://results.blob.core.windows.net/run/result.zip" } },
@@ -631,6 +637,7 @@ test("steering uses a bounded repository variable and never reflects the bearer 
   const request = validRun();
   const claim = storedClaim(request, { state: "dispatched", run_id: 99 });
   const activeRun = { body: { id: 99, status: "in_progress",
+    path: ".github/workflows/flexfactor-mobile.yml",
     display_title: `FlexFactor audit \u00b7 ${request.request_id}` } };
   const fetcher = queuedFetch([
     claim, activeRun,

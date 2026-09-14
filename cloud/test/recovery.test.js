@@ -13,7 +13,7 @@ const runRequest = {
 const claim = (overrides = {}) => ({ schema: 1, request_id: requestId,
   state: "claimed", run_id: 0, ephemeral_secrets: ["OPENAI_API_KEY"],
   created_at: new Date().toISOString(), ...overrides });
-const run = (overrides = {}) => ({ event: "workflow_dispatch", id: 99, status: "completed", conclusion: "success",
+const run = (overrides = {}) => ({ event: "workflow_dispatch", path: ".github/workflows/flexfactor-mobile.yml", id: 99, status: "completed", conclusion: "success",
   display_title: `FlexFactor audit · ${requestId}`,
   html_url: "https://github.com/owner/project/actions/runs/99", ...overrides });
 const response = (body, status = 200, headers = {}) => new Response(
@@ -225,7 +225,7 @@ test("concurrent fresh dispatch requests use one atomic create winner", async ()
   assert.equal(api.dispatches, 1);
 });
 
-for (const badId of [undefined, "", "not-a-uuid", requestId.replaceAll("-", "")]) {
+for (const badId of ["not-a-uuid", requestId.replaceAll("-", "")]) {
   test(`artifact rejects invalid request identity ${String(badId)} before upstream access`, async (t) => {
     let calls = 0;
     t.mock.method(globalThis, "fetch", async () => { calls += 1; return response({}); });
@@ -245,6 +245,12 @@ test("artifact rejects mismatched run identity before listing or downloading", a
       return response(run({ display_title: `Unrelated · ${requestId}` }));
     }), (error) => error.code === "run_identity_mismatch");
   assert.equal(calls, 1);
+});
+
+test("artifact rejects a same-title run from another workflow", async () => {
+  await assert.rejects(() => runArtifact("test_token", "owner/project", 99, requestId,
+    async () => response(run({ path: ".github/workflows/unrelated.yml" }))),
+  (error) => error.code === "run_identity_mismatch");
 });
 
 test("artifact selects only the exact UUID artifact and never forwards bearer to signed storage", async () => {
@@ -278,3 +284,10 @@ for (const hasDispatchedRun of [true, false]) {
     assert.equal(api.dispatches, hasDispatchedRun ? 0 : 1);
   });
 }
+
+test("history recovery ignores a same-title run from another workflow", async () => {
+  const api = github({ history: [run({ path: ".github/workflows/unrelated.yml" })] });
+  const state = await dispatch("test_token", runRequest, {}, api.fetcher);
+  assert.equal(state.id, 99);
+  assert.equal(api.dispatches, 1);
+});

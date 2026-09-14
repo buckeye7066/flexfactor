@@ -62,7 +62,7 @@ public final class RunRecordMigrationTest {
     }
 
     private static void assertRecoverable(Object record) throws Exception {
-        assertTrue("Invalid legacy history must stop blocking queue admission",
+        assertFalse("Invalid legacy history must block queue admission until the owner clears it",
                 (boolean) field(record, "complete"));
         String status = (String) field(record, "status");
         assertTrue(status, status.startsWith("BLOCKED"));

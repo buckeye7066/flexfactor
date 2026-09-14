@@ -1005,6 +1005,11 @@ public final class MainActivity extends Activity {
             for (RunRecord record : records) {
                 RunRecord next = record;
                 if (!record.complete) {
+                    if (record.blockedRecovery()) {
+                        active = true;
+                        updated.add(record);
+                        continue;
+                    }
                     try {
                         GitHubApi.RunState state = api.run(
                                 githubToken(), record.repository, record.requestId,
@@ -1257,7 +1262,7 @@ public final class MainActivity extends Activity {
                     status = "BLOCKED: This saved run has no valid request ID. "
                             + "Open it on GitHub and confirm it has stopped before starting "
                             + "a new queue. Previous status: " + status;
-                    complete = true;
+                    complete = false;
                 }
             }
             this.status = status;
@@ -1267,6 +1272,10 @@ public final class MainActivity extends Activity {
         boolean matches(MobileRunRequest request) {
             return request != null && request.repository.equalsIgnoreCase(repository)
                     && request.requestId.equalsIgnoreCase(requestId);
+        }
+
+        boolean blockedRecovery() {
+            return !complete && status.startsWith("BLOCKED:");
         }
     }
 
@@ -1568,4 +1577,3 @@ public final class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 }
-

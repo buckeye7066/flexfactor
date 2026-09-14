@@ -13,7 +13,7 @@ const scopedName = (id, provider = "OPENAI_API_KEY") =>
   `FLEXFACTOR_${id.replaceAll("-", "").toUpperCase()}_${provider}`;
 const request = (id) => ({ request_id: id, repository, ref: "main", mode: "audit",
   provider: "auto", max_cost: 50, threshold: 90, max_iterations: 6 });
-const run = (id, requestId) => ({ id, event: "workflow_dispatch", status: "completed", conclusion: "success",
+const run = (id, requestId) => ({ id, event: "workflow_dispatch", path: ".github/workflows/flexfactor-mobile.yml", status: "completed", conclusion: "success",
   display_title: `FlexFactor audit · ${requestId}`,
   html_url: `https://github.com/${repository}/actions/runs/${id}` });
 const claim = (id, names) => ({ schema: 1, request_id: id, state: "dispatched", run_id: 99,

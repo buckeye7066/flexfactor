@@ -25,7 +25,7 @@ function githubStore() {
     calls: [],
     history: [],
     run: {
-      event: "workflow_dispatch",
+      event: "workflow_dispatch", path: ".github/workflows/flexfactor-mobile.yml",
       id: 99,
       status: "in_progress",
       conclusion: null,

@@ -102,6 +102,10 @@ def _active_attribute(attributes: dict[str, str], names: tuple[str, ...]) -> str
 def snapshot_preflight(git: GitRunner, project_dir: str, *, sources: tuple[str, ...] = ()
                        ) -> tuple[bool, str]:
     """Reject executable/content-transforming attributes before even Git status."""
+    version = git(["version"], project_dir)
+    match = re.search(r"\bgit version (\d+)\.(\d+)", _out(version)) if _ok(version) else None
+    if not match or tuple(map(int, match.groups())) < (2, 40):
+        return False, "Git 2.40 or newer is required for source-tree attribute inspection"
     try:
         attributes = _snapshot_attributes(git, project_dir, sources=sources)
     except Exception as exc:

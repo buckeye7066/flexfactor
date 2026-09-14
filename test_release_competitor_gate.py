@@ -96,7 +96,8 @@ class CompetitorGateFailureTests(unittest.TestCase):
 
     def test_real_research_swallowed_budget_fault_stays_incomplete(self):
         with mock.patch.object(ff, "_judge", side_effect=ff.BudgetExceededError("offline cost cap")), \
-             mock.patch.object(competitors, "web_search", return_value=([], "", {})):
+             mock.patch.object(competitors, "web_search", return_value=([], "", {})), \
+             mock.patch.object(competitors, "github_repo_search", return_value=[]):
             outcome, _ = self._gate(real_module=True)
         self.assertIn("model-discovery", outcome["research"]["sources_skipped"])
         self.assertFalse(outcome["attempted"])
