@@ -103,16 +103,39 @@ def _ext_on():
     os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = "1"
 
 
-class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
+class _RotationExtensionsScope(unittest.TestCase):
+    """Turn the extensions flag on for one class and put it back afterwards.
+
+    The flag is process-wide, so a class that sets it and never restores it
+    changes the outcome of every test that runs later in the same process.
+    `flexfactor_tests.py` pins FLEXFACTOR_ROTATION_EXTENSIONS=0 at import for
+    a specific reason: `_merge_auto_routes` reads the real `catalog.auto.json`
+    from the SOURCE DIRECTORY, a path AI_ROTATE_CATALOG cannot redirect. A
+    leaked "1" therefore merged this developer's real discovered routes into
+    every fixture catalog, and
+    RotationDefaultProviderTests::test_the_warning_is_not_claimed_when_no_route_is_usable
+    plus ::test_ai_time_catalog_is_authoritative_over_builtin_guesses failed
+    because a route WAS usable - a failure that appeared ONLY in a full run and
+    never in isolation, which is the hardest kind to trust.
+
+    Inherit this rather than hand-rolling the save/restore, so the next class
+    that needs extensions cannot forget the second half.
+    """
+
     def setUp(self):
-        self._prev = os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS")
+        super().setUp()
+        self._prev_rotation_extensions = os.environ.get("FLEXFACTOR_ROTATION_EXTENSIONS")
         _ext_on()
 
     def tearDown(self):
-        if self._prev is None:
+        if self._prev_rotation_extensions is None:
             os.environ.pop("FLEXFACTOR_ROTATION_EXTENSIONS", None)
         else:
-            os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = self._prev
+            os.environ["FLEXFACTOR_ROTATION_EXTENSIONS"] = self._prev_rotation_extensions
+        super().tearDown()
+
+
+class FilterAdmitsOnlyBuildableRoutesTests(_RotationExtensionsScope):
 
     def test_a_missing_adapter_is_a_REASON_not_an_exception(self):
         """The whole point. A PATH hit must not admit an unimportable route."""
@@ -184,9 +207,7 @@ class FilterAdmitsOnlyBuildableRoutesTests(unittest.TestCase):
                       ff._route_unusable_reason(Route("claude-code"), "free"))
 
 
-class CliProviderBehaviourTests(unittest.TestCase):
-    def setUp(self):
-        _ext_on()
+class CliProviderBehaviourTests(_RotationExtensionsScope):
 
     def test_the_prompt_travels_on_STDIN_never_argv(self):
         """WinPS 5.1 mangles quotes in native args; a review prompt is full of
