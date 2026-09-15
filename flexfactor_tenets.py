@@ -202,6 +202,23 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             pass
 
 
+_STATE_DIR_REMEDY = (
+    "Set FLEXFACTOR_STATE_DIR to a directory outside every Git checkout "
+    "(for example a folder under the system temp directory) and run again."
+)
+_EXPLICIT_OUTPUT_REMEDY = (
+    "Choose an output path outside every Git checkout and selected repository."
+)
+"""The refusals above are deliberate - evidence written inside a checkout can be
+committed by the very refactor that produced it, or erased by a `git clean` -
+and `test_default_state_is_rejected_when_home_is_a_git_worktree` pins it. But
+the message must name the remedy that ACTUALLY WORKS for that situation.
+
+When output comes from the default state root, setting FLEXFACTOR_STATE_DIR is
+the remedy. When output is explicitly provided, the user must choose a different
+output path. Mixing these up sends users into repeated failures."""
+
+
 def _state_root() -> Path:
     override = os.environ.get("FLEXFACTOR_STATE_DIR", "").strip()
     return Path(override).expanduser() if override else Path.home() / ".flexfactor"
@@ -247,7 +264,9 @@ def _validate_external_evidence_path(
     candidate: Path,
     *,
     protected_roots: Sequence[str | os.PathLike[str]] = (),
+    explicit_output: bool = False,
 ) -> Path:
+    remedy = _EXPLICIT_OUTPUT_REMEDY if explicit_output else _STATE_DIR_REMEDY
     for protected in _normalized_protected_roots(project_root, protected_roots):
         try:
             candidate.relative_to(protected)
@@ -259,13 +278,13 @@ def _validate_external_evidence_path(
             )
         raise ValueError(
             "FlexFactor state/evidence must be outside every selected repository "
-            f"(destination is inside {protected})"
+            f"(destination is inside {protected}). {remedy}"
         )
     enclosing = _containing_git_worktree(candidate)
     if enclosing is not None:
         raise ValueError(
             "FlexFactor state/evidence must be outside every Git repository "
-            f"(destination is inside {enclosing})"
+            f"(destination is inside {enclosing}). {remedy}"
         )
     return candidate
 
@@ -300,7 +319,7 @@ def _resolve_output_path(
         candidate = Path.cwd() / candidate
     resolved = candidate.resolve(strict=False)
     return _validate_external_evidence_path(
-        project_root, resolved, protected_roots=protected_roots
+        project_root, resolved, protected_roots=protected_roots, explicit_output=True
     )
 
 

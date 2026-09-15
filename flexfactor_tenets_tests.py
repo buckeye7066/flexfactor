@@ -203,6 +203,37 @@ class TenetsContextTests(unittest.TestCase):
         finder.assert_not_called()
         self.assertFalse((home / ".flexfactor").exists())
 
+    def test_every_refusal_names_the_way_out(self) -> None:
+        """The two guards are deliberate, but the refusal message must name the
+        remedy that ACTUALLY WORKS for that situation. When output comes from
+        the default state root, setting FLEXFACTOR_STATE_DIR is the remedy.
+        When output is explicitly provided, the user must choose a different
+        output path. Mixing these up sends users into repeated failures."""
+        # Case 1: Default state path (output=None) inside a Git repository
+        # Remedy: Set FLEXFACTOR_STATE_DIR
+        home = Path(self.temp.name) / "git-managed-home-2"
+        home.mkdir()
+        (home / ".git").mkdir()
+        with mock.patch.dict(
+            os.environ, {"FLEXFACTOR_STATE_DIR": ""}, clear=False
+        ), mock.patch.object(
+            ft.Path, "home", return_value=home
+        ), mock.patch.object(ft, "_find_tenets_executable"):
+            with self.assertRaisesRegex(ValueError, "FLEXFACTOR_STATE_DIR"):
+                ft.generate_tenets_context(self.root, "audit")
+
+        # Case 2: Explicit output path inside a protected root
+        # Remedy: Choose a different output path (NOT FLEXFACTOR_STATE_DIR)
+        other = Path(self.temp.name) / "selected-elsewhere"
+        other.mkdir()
+        with self.assertRaisesRegex(ValueError, "Choose an output path"):
+            ft.generate_tenets_context(
+                self.root,
+                "audit",
+                output=other / "tenets-context.json",
+                protected_roots=(other,),
+            )
+
     def test_unreadable_distribution_metadata_is_treated_as_unavailable(self) -> None:
         failures = (
             PermissionError("metadata is unreadable"),
