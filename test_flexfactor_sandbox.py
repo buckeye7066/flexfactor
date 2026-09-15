@@ -184,8 +184,18 @@ class ResourceAbuseTests(unittest.TestCase):
             self.skipTest(_blocked("no OS-enforced process-count limit"))
         if not IS_WIN and hasattr(os, "geteuid") and os.geteuid() == 0:
             self.skipTest(_blocked("RLIMIT_NPROC is ignored for root"))
+        # A returned Popen is NOT proof of a running child on Windows. At
+        # ActiveProcessLimit a Job Object lets CreateProcess succeed and then
+        # TERMINATES the new process because the job association failed (it
+        # exits 101), so counting calls that did not raise OSError measures
+        # nothing but timing: this assertion read 7, 16, 27, 41 and 44 live
+        # "escapes" on one host while containment was working perfectly, and
+        # only passed on CI because a faster runner failed CreateProcess
+        # outright more often. Count the children actually ALIVE under the cap
+        # - the one quantity both mechanisms bound (POSIX RLIMIT_NPROC makes
+        # fork itself fail, which is why `failed` stays meaningful there).
         child = textwrap.dedent("""
-            import subprocess, sys
+            import subprocess, sys, time
             kids, failed = [], 0
             for i in range(50):
                 try:
@@ -194,7 +204,9 @@ class ResourceAbuseTests(unittest.TestCase):
                                                  stderr=subprocess.DEVNULL))
                 except OSError:
                     failed += 1
-            print("SPAWNED", len(kids), "FAILED", failed, flush=True)
+            time.sleep(3)
+            alive = sum(1 for k in kids if k.poll() is None)
+            print("SPAWNED", len(kids), "FAILED", failed, "ALIVE", alive, flush=True)
             for k in kids:
                 k.kill()
             for k in kids:
@@ -204,11 +216,15 @@ class ResourceAbuseTests(unittest.TestCase):
                               limits=Limits(timeout_s=120, max_processes=5))
         self.assertIn("SPAWNED", cp.stdout, f"rc={cp.returncode} err={cp.stderr}")
         parts = cp.stdout.split()
-        spawned, failed = int(parts[1]), int(parts[3])
-        self.assertGreater(failed, 0, cp.stdout)
-        self.assertLess(spawned, 50, cp.stdout)
-        if IS_WIN:
-            self.assertLessEqual(spawned, 4, cp.stdout)  # 5 active incl. the child itself
+        spawned, failed, alive = int(parts[1]), int(parts[3]), int(parts[5])
+        self.assertLess(alive, 50, cp.stdout)
+        # 5 active processes including the child itself -> at most 4 live kids.
+        # Measured unconfined (max_processes=None) this reads 50, so the bound
+        # still fails if the limit ever stops being applied.
+        self.assertLessEqual(alive, 4, cp.stdout)
+        if not IS_WIN:
+            self.assertGreater(failed, 0, cp.stdout)
+            self.assertLess(spawned, 50, cp.stdout)
 
     def test_output_flood_is_capped_at_8mb_per_stream(self):
         prog = ("import sys\n"
