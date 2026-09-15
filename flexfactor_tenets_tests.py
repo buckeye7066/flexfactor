@@ -204,11 +204,13 @@ class TenetsContextTests(unittest.TestCase):
         self.assertFalse((home / ".flexfactor").exists())
 
     def test_every_refusal_names_the_way_out(self) -> None:
-        """The two guards above are deliberate, but a refusal that names only
-        the problem is a dead end: keeping a home directory under version
-        control is common, and the user is then told the destination is inside
-        a Git repository without being told that FLEXFACTOR_STATE_DIR is the
-        supported answer.  Both messages must carry the remedy."""
+        """The two guards are deliberate, but the refusal message must name the
+        remedy that ACTUALLY WORKS for that situation. When output comes from
+        the default state root, setting FLEXFACTOR_STATE_DIR is the remedy.
+        When output is explicitly provided, the user must choose a different
+        output path. Mixing these up sends users into repeated failures."""
+        # Case 1: Default state path (output=None) inside a Git repository
+        # Remedy: Set FLEXFACTOR_STATE_DIR
         home = Path(self.temp.name) / "git-managed-home-2"
         home.mkdir()
         (home / ".git").mkdir()
@@ -220,9 +222,11 @@ class TenetsContextTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "FLEXFACTOR_STATE_DIR"):
                 ft.generate_tenets_context(self.root, "audit")
 
+        # Case 2: Explicit output path inside a protected root
+        # Remedy: Choose a different output path (NOT FLEXFACTOR_STATE_DIR)
         other = Path(self.temp.name) / "selected-elsewhere"
         other.mkdir()
-        with self.assertRaisesRegex(ValueError, "FLEXFACTOR_STATE_DIR"):
+        with self.assertRaisesRegex(ValueError, "Choose an output path"):
             ft.generate_tenets_context(
                 self.root,
                 "audit",
