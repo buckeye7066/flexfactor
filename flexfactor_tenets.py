@@ -202,6 +202,19 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             pass
 
 
+_STATE_DIR_REMEDY = (
+    "Set FLEXFACTOR_STATE_DIR to a directory outside every Git checkout "
+    "(for example a folder under the system temp directory) and run again."
+)
+"""The refusal above is deliberate - evidence written inside a checkout can be
+committed by the very refactor that produced it, or erased by a `git clean` -
+and `test_default_state_is_rejected_when_home_is_a_git_worktree` pins it. But
+the message named the problem and not the way out, so a user whose home is a
+Git repository (keeping dotfiles under version control is common) hit a wall
+with no escape route named, even though FLEXFACTOR_STATE_DIR has always been
+the supported answer."""
+
+
 def _state_root() -> Path:
     override = os.environ.get("FLEXFACTOR_STATE_DIR", "").strip()
     return Path(override).expanduser() if override else Path.home() / ".flexfactor"
@@ -259,13 +272,13 @@ def _validate_external_evidence_path(
             )
         raise ValueError(
             "FlexFactor state/evidence must be outside every selected repository "
-            f"(destination is inside {protected})"
+            f"(destination is inside {protected}). {_STATE_DIR_REMEDY}"
         )
     enclosing = _containing_git_worktree(candidate)
     if enclosing is not None:
         raise ValueError(
             "FlexFactor state/evidence must be outside every Git repository "
-            f"(destination is inside {enclosing})"
+            f"(destination is inside {enclosing}). {_STATE_DIR_REMEDY}"
         )
     return candidate
 

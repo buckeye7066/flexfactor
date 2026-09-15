@@ -203,6 +203,33 @@ class TenetsContextTests(unittest.TestCase):
         finder.assert_not_called()
         self.assertFalse((home / ".flexfactor").exists())
 
+    def test_every_refusal_names_the_way_out(self) -> None:
+        """The two guards above are deliberate, but a refusal that names only
+        the problem is a dead end: keeping a home directory under version
+        control is common, and the user is then told the destination is inside
+        a Git repository without being told that FLEXFACTOR_STATE_DIR is the
+        supported answer.  Both messages must carry the remedy."""
+        home = Path(self.temp.name) / "git-managed-home-2"
+        home.mkdir()
+        (home / ".git").mkdir()
+        with mock.patch.dict(
+            os.environ, {"FLEXFACTOR_STATE_DIR": ""}, clear=False
+        ), mock.patch.object(
+            ft.Path, "home", return_value=home
+        ), mock.patch.object(ft, "_find_tenets_executable"):
+            with self.assertRaisesRegex(ValueError, "FLEXFACTOR_STATE_DIR"):
+                ft.generate_tenets_context(self.root, "audit")
+
+        other = Path(self.temp.name) / "selected-elsewhere"
+        other.mkdir()
+        with self.assertRaisesRegex(ValueError, "FLEXFACTOR_STATE_DIR"):
+            ft.generate_tenets_context(
+                self.root,
+                "audit",
+                output=other / "tenets-context.json",
+                protected_roots=(other,),
+            )
+
     def test_unreadable_distribution_metadata_is_treated_as_unavailable(self) -> None:
         failures = (
             PermissionError("metadata is unreadable"),
