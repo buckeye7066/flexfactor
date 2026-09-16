@@ -53,9 +53,16 @@ configured = json_request("POST", "/api/configure", {})
 if not configured.get("login"):
     raise SystemExit("Cloud did not identify the live proof account")
 
-repositories = json_request("GET", "/api/repositories?page=1")
-visible = {row.get("full_name") for row in repositories.get("repositories", [])}
-if REPOSITORY not in visible:
+target_visible = False
+for page in range(1, 101):
+    repositories = json_request("GET", f"/api/repositories?page={page}")
+    visible = {row.get("full_name") for row in repositories.get("repositories", [])}
+    if REPOSITORY in visible:
+        target_visible = True
+        break
+    if not repositories.get("has_more", False):
+        break
+if not target_visible:
     raise SystemExit("Live proof target was not returned by repository discovery")
 
 run_request = {
@@ -120,7 +127,15 @@ with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                        if Path(name).name == "mobile-result.json")
     result = json.loads(bundle.read(result_name))
 
+if terminal.get("conclusion") != "success":
+    raise SystemExit("Live mobile run did not conclude successfully")
+if result.get("success") is not True:
+    raise SystemExit("Phone-readable result did not report success")
+if result.get("mode") != "scout":
+    raise SystemExit("Phone-readable result reported the wrong mode")
+
 proof = {
+    "source_sha": os.environ["EXPECTED_SHA"],
     "client_version": "3.5.6",
     "target_repository": REPOSITORY,
     "request_id": REQUEST_ID,
