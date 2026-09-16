@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 from pathlib import Path
 import time
 import urllib.error
@@ -165,6 +166,15 @@ with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
     result_name = next(name for name in bundle.namelist()
                        if Path(name).name == "mobile-result.json")
     result = json.loads(bundle.read(result_name))
+    log_names = [name for name in bundle.namelist()
+                 if Path(name).name == "mobile-run.log"]
+    diagnostic = ""
+    if log_names:
+        diagnostic = bundle.read(log_names[0]).decode("utf-8", "replace")[-4000:]
+        diagnostic = diagnostic.replace(TOKEN, "[REDACTED]")
+        diagnostic = re.sub(
+            r"(?i)(token|secret|password|authorization|api[_-]?key)\s*[:=]\s*\S+",
+            r"\1=[REDACTED]", diagnostic)
 
 save_proof(
     stage="artifact-inspected",
@@ -174,6 +184,7 @@ save_proof(
     phone_result_exit_code=result.get("exit_code"),
     phone_result_publication_required=result.get("publication_required"),
     phone_result_publication_complete=result.get("publication_complete"),
+    failure_diagnostic=diagnostic if result.get("success") is not True else "",
 )
 print(json.dumps(proof))
 
