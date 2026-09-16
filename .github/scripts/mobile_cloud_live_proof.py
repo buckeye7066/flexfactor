@@ -138,13 +138,6 @@ with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                        if Path(name).name == "mobile-result.json")
     result = json.loads(bundle.read(result_name))
 
-if terminal.get("conclusion") != "success":
-    raise SystemExit("Live mobile run did not conclude successfully")
-if result.get("success") is not True:
-    raise SystemExit("Phone-readable result did not report success")
-if result.get("mode") != "scout":
-    raise SystemExit("Phone-readable result reported the wrong mode")
-
 proof = {
     "source_sha": os.environ["EXPECTED_SHA"],
     "client_version": "3.5.6",
@@ -159,6 +152,16 @@ proof = {
     "phone_result_success": bool(result.get("success")),
     "phone_result_mode": result.get("mode"),
 }
+proof["phone_result_exit_code"] = result.get("exit_code")
+proof["phone_result_publication_required"] = result.get("publication_required")
+proof["phone_result_publication_complete"] = result.get("publication_complete")
 Path("mobile-cloud-live-proof.json").write_text(
     json.dumps(proof, indent=2) + "\n", encoding="utf-8")
 print(json.dumps(proof))
+
+if terminal.get("conclusion") != "success":
+    raise SystemExit("Live mobile run did not conclude successfully")
+if result.get("success") is not True:
+    raise SystemExit("Phone-readable result did not report success")
+if result.get("mode") != "scout":
+    raise SystemExit("Phone-readable result reported the wrong mode")
