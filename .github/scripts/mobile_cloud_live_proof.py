@@ -27,6 +27,24 @@ HEADERS = {
     "X-FlexFactor-Client-Version": "3.5.6",
 }
 
+proof = {
+    "source_sha": os.environ["EXPECTED_SHA"],
+    "client_version": "3.5.6",
+    "target_repository": REPOSITORY,
+    "request_id": REQUEST_ID,
+    "stage": "initialized",
+}
+
+
+def save_proof(**updates: object) -> None:
+    """Persist only the allow-listed, non-secret acceptance evidence."""
+    proof.update(updates)
+    Path("mobile-cloud-live-proof.json").write_text(
+        json.dumps(proof, indent=2) + "\n", encoding="utf-8")
+
+
+save_proof()
+
 
 def request(method: str, path: str, body: object | None = None) -> tuple[int, bytes, str]:
     payload = None if body is None else json.dumps(body).encode()
@@ -52,6 +70,7 @@ def json_request(method: str, path: str, body: object | None = None) -> dict:
 configured = json_request("POST", "/api/configure", {})
 if not configured.get("login"):
     raise SystemExit("Cloud did not identify the live proof account")
+save_proof(stage="configured")
 
 target_visible = False
 for page in range(1, 101):
@@ -64,6 +83,7 @@ for page in range(1, 101):
         break
 if not target_visible:
     raise SystemExit("Live proof target was not returned by repository discovery")
+save_proof(stage="repository-discovered")
 
 run_request = {
     "request_id": REQUEST_ID,
@@ -84,6 +104,7 @@ started = json_request("POST", "/api/runs/dispatch", dispatch_body)
 run_id = int(started.get("id", 0))
 if run_id <= 0:
     raise SystemExit("Dispatch returned no authoritative run ID")
+save_proof(stage="dispatched", run_id=run_id)
 
 # Repeating the exact request models process loss after GitHub accepted it.
 # GitHub may briefly return the run before its evaluated run-name/path fields
@@ -100,6 +121,7 @@ for attempt in range(30):
         time.sleep(1)
 if recovered is None or int(recovered.get("id", 0)) != run_id:
     raise SystemExit("Crash recovery dispatched a duplicate run")
+save_proof(stage="dispatch-recovered", dispatch_recovered_same_run=True)
 
 steering = json_request("POST", "/api/runs/steer", {
     "repository": REPOSITORY,
@@ -108,6 +130,7 @@ steering = json_request("POST", "/api/runs/steer", {
 })
 if steering.get("accepted") is not True:
     raise SystemExit("Active steering was not accepted")
+save_proof(stage="steering-accepted", steering_accepted=True)
 
 encoded_repo = urllib.parse.quote(REPOSITORY, safe="")
 encoded_request = urllib.parse.quote(REQUEST_ID, safe="")
@@ -124,6 +147,11 @@ for _ in range(720):
     time.sleep(30)
 if terminal is None:
     raise SystemExit("Live mobile run did not complete within six hours")
+save_proof(
+    stage="run-completed",
+    terminal_status=terminal.get("status"),
+    terminal_conclusion=terminal.get("conclusion", ""),
+)
 
 details_path = (f"/api/runs/details?repository={encoded_repo}"
                 f"&request_id={encoded_request}&run_id={run_id}")
@@ -138,27 +166,20 @@ with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                        if Path(name).name == "mobile-result.json")
     result = json.loads(bundle.read(result_name))
 
+save_proof(
+    stage="artifact-inspected",
+    phone_result_present=True,
+    phone_result_success=bool(result.get("success")),
+    phone_result_mode=result.get("mode"),
+    phone_result_exit_code=result.get("exit_code"),
+    phone_result_publication_required=result.get("publication_required"),
+    phone_result_publication_complete=result.get("publication_complete"),
+)
+print(json.dumps(proof))
+
 if terminal.get("conclusion") != "success":
     raise SystemExit("Live mobile run did not conclude successfully")
 if result.get("success") is not True:
     raise SystemExit("Phone-readable result did not report success")
 if result.get("mode") != "scout":
     raise SystemExit("Phone-readable result reported the wrong mode")
-
-proof = {
-    "source_sha": os.environ["EXPECTED_SHA"],
-    "client_version": "3.5.6",
-    "target_repository": REPOSITORY,
-    "request_id": REQUEST_ID,
-    "run_id": run_id,
-    "dispatch_recovered_same_run": True,
-    "steering_accepted": True,
-    "terminal_status": terminal.get("status"),
-    "terminal_conclusion": terminal.get("conclusion", ""),
-    "phone_result_present": True,
-    "phone_result_success": bool(result.get("success")),
-    "phone_result_mode": result.get("mode"),
-}
-Path("mobile-cloud-live-proof.json").write_text(
-    json.dumps(proof, indent=2) + "\n", encoding="utf-8")
-print(json.dumps(proof))
