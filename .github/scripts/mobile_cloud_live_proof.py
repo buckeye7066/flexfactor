@@ -86,8 +86,19 @@ if run_id <= 0:
     raise SystemExit("Dispatch returned no authoritative run ID")
 
 # Repeating the exact request models process loss after GitHub accepted it.
-recovered = json_request("POST", "/api/runs/dispatch", dispatch_body)
-if int(recovered.get("id", 0)) != run_id:
+# GitHub may briefly return the run before its evaluated run-name/path fields
+# are consistent. That is a recoverable correlation lag, never permission to
+# create a second UUID or dispatch.
+recovered = None
+for attempt in range(30):
+    try:
+        recovered = json_request("POST", "/api/runs/dispatch", dispatch_body)
+        break
+    except RuntimeError as error:
+        if "HTTP 409" not in str(error) or attempt == 29:
+            raise
+        time.sleep(1)
+if recovered is None or int(recovered.get("id", 0)) != run_id:
     raise SystemExit("Crash recovery dispatched a duplicate run")
 
 steering = json_request("POST", "/api/runs/steer", {
