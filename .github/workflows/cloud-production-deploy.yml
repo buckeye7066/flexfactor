@@ -1,0 +1,99 @@
+name: cloud-production-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact current main commit authorized for production
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flexfactor-cloud-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Production
+    timeout-minutes: 20
+    steps:
+      - name: Authorize the exact main revision
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
+          test "$GITHUB_REF" = "refs/heads/main"
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          test "$EXPECTED_SHA" = "$live_main"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+
+      - name: Install the pinned Vercel CLI
+        run: npm install --global vercel@48.11.0 --no-audit --no-fund
+
+      - name: Require the existing production project
+        working-directory: cloud
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$VERCEL_TOKEN"
+          vercel project inspect flexfactor-cloud --token "$VERCEL_TOKEN" >/dev/null
+          vercel link --yes --project flexfactor-cloud --token "$VERCEL_TOKEN"
+
+      - name: Deploy the exact cloud revision to production
+        working-directory: cloud
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          vercel deploy --prod --yes --token "$VERCEL_TOKEN"
+
+      - name: Prove production health and engine identity
+        working-directory: cloud
+        run: |
+          node --input-type=module <<'JS'
+          import assert from "node:assert/strict";
+          import { setTimeout as delay } from "node:timers/promises";
+          import { ENGINE_REF, SERVICE_NAME, SERVICE_VERSION } from "./lib/config.js";
+
+          let lastError;
+          for (let attempt = 0; attempt < 60; attempt += 1) {
+            try {
+              const response = await fetch(
+                "https://flexfactor-cloud.vercel.app/api/health",
+                { signal: AbortSignal.timeout(15000) },
+              );
+              assert.equal(response.status, 200);
+              const health = await response.json();
+              assert.equal(health.ok, true);
+              assert.equal(health.oauth_device_configured, true);
+              assert.equal(health.service, SERVICE_NAME);
+              assert.equal(health.version, SERVICE_VERSION);
+              assert.equal(health.engine_ref, ENGINE_REF);
+              console.log(JSON.stringify(health));
+              process.exit(0);
+            } catch (error) {
+              lastError = error;
+              if (attempt < 59) await delay(5000);
+            }
+          }
+          throw lastError;
+          JS
