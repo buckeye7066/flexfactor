@@ -75,35 +75,33 @@ jobs:
         working-directory: cloud
         env:
           DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
-          node --input-type=module <<'JS'
+          set -euo pipefail
+          for attempt in {1..30}; do
+            if vercel curl /api/health --deployment "$DEPLOYMENT_URL" \
+                --token "$VERCEL_TOKEN" > preview-health.json; then
+              if node --input-type=module <<'JS'
           import assert from "node:assert/strict";
-          import { setTimeout as delay } from "node:timers/promises";
+          import { readFile } from "node:fs/promises";
           import { ENGINE_REF, SERVICE_NAME, SERVICE_VERSION } from "./lib/config.js";
 
-          let lastError;
-          for (let attempt = 0; attempt < 30; attempt += 1) {
-            try {
-              const response = await fetch(
-                `${process.env.DEPLOYMENT_URL}/api/health`,
-                { signal: AbortSignal.timeout(10000) },
-              );
-              assert.equal(response.status, 200);
-              const health = await response.json();
-              assert.equal(health.ok, true);
-              assert.equal(health.oauth_device_configured, true);
-              assert.equal(health.service, SERVICE_NAME);
-              assert.equal(health.version, SERVICE_VERSION);
-              assert.equal(health.engine_ref, ENGINE_REF);
-              console.log(JSON.stringify(health));
-              process.exit(0);
-            } catch (error) {
-              lastError = error;
-              if (attempt < 29) await delay(5000);
-            }
-          }
-          throw lastError;
+          const health = JSON.parse(await readFile("preview-health.json", "utf8"));
+          assert.equal(health.ok, true);
+          assert.equal(health.oauth_device_configured, true);
+          assert.equal(health.service, SERVICE_NAME);
+          assert.equal(health.version, SERVICE_VERSION);
+          assert.equal(health.engine_ref, ENGINE_REF);
+          console.log(JSON.stringify(health));
           JS
+              then
+                exit 0
+              fi
+            fi
+            if [ "$attempt" -lt 30 ]; then sleep 5; fi
+          done
+          echo "Preview did not serve the expected healthy engine" >&2
+          exit 1
 
       - name: Reauthorize and promote the tested deployment
         working-directory: cloud
