@@ -19,7 +19,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: Production
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Authorize the exact main revision
         shell: bash
@@ -30,6 +30,7 @@ jobs:
           set -euo pipefail
           printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'
           test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
+          test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
           test "$GITHUB_REF" = "refs/heads/main"
           live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
           test "$EXPECTED_SHA" = "$live_main"
@@ -58,16 +59,22 @@ jobs:
           vercel project inspect flexfactor-cloud --token "$VERCEL_TOKEN" >/dev/null
           vercel link --yes --project flexfactor-cloud --token "$VERCEL_TOKEN"
 
-      - name: Deploy the exact cloud revision to production
+      - name: Build an immutable preview deployment
+        id: preview
         working-directory: cloud
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
           set -euo pipefail
-          vercel deploy --prod --yes --token "$VERCEL_TOKEN"
+          deployment_url=$(vercel deploy --yes --token "$VERCEL_TOKEN" | tail -n 1)
+          printf '%s' "$deployment_url" \
+            | grep -Eq '^https://[A-Za-z0-9.-]+\.vercel\.app$'
+          printf 'deployment_url=%s\n' "$deployment_url" >> "$GITHUB_OUTPUT"
 
-      - name: Prove production health and engine identity
+      - name: Prove preview health and engine identity
         working-directory: cloud
+        env:
+          DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
         run: |
           node --input-type=module <<'JS'
           import assert from "node:assert/strict";
@@ -75,11 +82,11 @@ jobs:
           import { ENGINE_REF, SERVICE_NAME, SERVICE_VERSION } from "./lib/config.js";
 
           let lastError;
-          for (let attempt = 0; attempt < 60; attempt += 1) {
+          for (let attempt = 0; attempt < 30; attempt += 1) {
             try {
               const response = await fetch(
-                "https://flexfactor-cloud.vercel.app/api/health",
-                { signal: AbortSignal.timeout(15000) },
+                `${process.env.DEPLOYMENT_URL}/api/health`,
+                { signal: AbortSignal.timeout(10000) },
               );
               assert.equal(response.status, 200);
               const health = await response.json();
@@ -92,8 +99,43 @@ jobs:
               process.exit(0);
             } catch (error) {
               lastError = error;
-              if (attempt < 59) await delay(5000);
+              if (attempt < 29) await delay(5000);
             }
           }
           throw lastError;
+          JS
+
+      - name: Reauthorize and promote the tested deployment
+        working-directory: cloud
+        env:
+          DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          GH_TOKEN: ${{ github.token }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          test "$EXPECTED_SHA" = "$live_main"
+          vercel promote "$DEPLOYMENT_URL" --yes --token "$VERCEL_TOKEN"
+
+      - name: Prove the production alias serves the tested engine
+        working-directory: cloud
+        run: |
+          node --input-type=module <<'JS'
+          import assert from "node:assert/strict";
+          import { ENGINE_REF, SERVICE_NAME, SERVICE_VERSION } from "./lib/config.js";
+
+          const response = await fetch(
+            "https://flexfactor-cloud.vercel.app/api/health",
+            { signal: AbortSignal.timeout(15000) },
+          );
+          assert.equal(response.status, 200);
+          const health = await response.json();
+          assert.equal(health.ok, true);
+          assert.equal(health.oauth_device_configured, true);
+          assert.equal(health.service, SERVICE_NAME);
+          assert.equal(health.version, SERVICE_VERSION);
+          assert.equal(health.engine_ref, ENGINE_REF);
+          console.log(JSON.stringify(health));
           JS
