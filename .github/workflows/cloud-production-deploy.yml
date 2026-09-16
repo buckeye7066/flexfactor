@@ -115,7 +115,8 @@ jobs:
           test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
           live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
           test "$EXPECTED_SHA" = "$live_main"
-          vercel promote "$DEPLOYMENT_URL" --yes --token "$VERCEL_TOKEN"
+          vercel promote "$DEPLOYMENT_URL" --yes \
+            --scope buckeye7066-7954s-projects --token "$VERCEL_TOKEN"
 
       - name: Prove the production alias serves the tested engine
         working-directory: cloud
