@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Live, redacted proof of the released Android cloud contract."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+from pathlib import Path
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import zipfile
+
+
+BASE = "https://flexfactor-cloud.vercel.app"
+TOKEN = os.environ["FLEXFACTOR_LIVE_PROOF_TOKEN"].strip()
+REPOSITORY = os.environ["TARGET_REPOSITORY"]
+REQUEST_ID = str(uuid.uuid4())
+HEADERS = {
+    "Accept": "application/json, application/zip",
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json",
+    "User-Agent": "FlexFactor-Mobile-Live-Proof",
+    "X-FlexFactor-Client-Version": "3.5.6",
+}
+
+
+def request(method: str, path: str, body: object | None = None) -> tuple[int, bytes, str]:
+    payload = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(BASE + path, data=payload, method=method, headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=330) as response:
+            return response.status, response.read(), response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:1000]
+        raise RuntimeError(f"{method} {path} returned HTTP {error.code}: {detail}") from None
+
+
+def json_request(method: str, path: str, body: object | None = None) -> dict:
+    status, raw, _ = request(method, path, body)
+    if not 200 <= status < 300:
+        raise RuntimeError(f"{method} {path} returned HTTP {status}")
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{method} {path} returned non-object JSON")
+    return value
+
+
+configured = json_request("POST", "/api/configure", {})
+if not configured.get("login"):
+    raise SystemExit("Cloud did not identify the live proof account")
+
+target_visible = False
+for page in range(1, 101):
+    repositories = json_request("GET", f"/api/repositories?page={page}")
+    visible = {row.get("full_name") for row in repositories.get("repositories", [])}
+    if REPOSITORY in visible:
+        target_visible = True
+        break
+    if not repositories.get("has_more", False):
+        break
+if not target_visible:
+    raise SystemExit("Live proof target was not returned by repository discovery")
+
+run_request = {
+    "request_id": REQUEST_ID,
+    "mode": "scout",
+    "provider": "auto",
+    "repository": REPOSITORY,
+    "ref": "main",
+    "file": "",
+    "goal": "",
+    "guidance": "Live 3.5.6 acceptance proof; do not apply proposed changes.",
+    "scout_apply": False,
+    "max_cost": 1,
+    "threshold": 90,
+    "max_iterations": 1,
+}
+dispatch_body = {"request": run_request, "encrypted_secrets": {}}
+started = json_request("POST", "/api/runs/dispatch", dispatch_body)
+run_id = int(started.get("id", 0))
+if run_id <= 0:
+    raise SystemExit("Dispatch returned no authoritative run ID")
+
+# Repeating the exact request models process loss after GitHub accepted it.
+recovered = json_request("POST", "/api/runs/dispatch", dispatch_body)
+if int(recovered.get("id", 0)) != run_id:
+    raise SystemExit("Crash recovery dispatched a duplicate run")
+
+steering = json_request("POST", "/api/runs/steer", {
+    "repository": REPOSITORY,
+    "request_id": REQUEST_ID,
+    "comment": "Live proof steering: keep this Scout read-only and report only verified findings.",
+})
+if steering.get("accepted") is not True:
+    raise SystemExit("Active steering was not accepted")
+
+encoded_repo = urllib.parse.quote(REPOSITORY, safe="")
+encoded_request = urllib.parse.quote(REQUEST_ID, safe="")
+status_path = (f"/api/runs/status?repository={encoded_repo}"
+               f"&request_id={encoded_request}&run_id={run_id}")
+terminal = None
+for _ in range(720):
+    state = json_request("GET", status_path)
+    if int(state.get("id", 0)) != run_id:
+        raise SystemExit("Status returned a different run ID")
+    if state.get("status") == "completed":
+        terminal = state
+        break
+    time.sleep(30)
+if terminal is None:
+    raise SystemExit("Live mobile run did not complete within six hours")
+
+details_path = (f"/api/runs/details?repository={encoded_repo}"
+                f"&request_id={encoded_request}&run_id={run_id}")
+_, archive, content_type = request("GET", details_path)
+if not content_type.lower().startswith("application/zip"):
+    raise SystemExit("Details endpoint did not return the phone artifact")
+with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+    names = {Path(name).name for name in bundle.namelist()}
+    if "mobile-result.json" not in names:
+        raise SystemExit("Phone-readable result is missing")
+    result_name = next(name for name in bundle.namelist()
+                       if Path(name).name == "mobile-result.json")
+    result = json.loads(bundle.read(result_name))
+
+if terminal.get("conclusion") != "success":
+    raise SystemExit("Live mobile run did not conclude successfully")
+if result.get("success") is not True:
+    raise SystemExit("Phone-readable result did not report success")
+if result.get("mode") != "scout":
+    raise SystemExit("Phone-readable result reported the wrong mode")
+
+proof = {
+    "source_sha": os.environ["EXPECTED_SHA"],
+    "client_version": "3.5.6",
+    "target_repository": REPOSITORY,
+    "request_id": REQUEST_ID,
+    "run_id": run_id,
+    "dispatch_recovered_same_run": True,
+    "steering_accepted": True,
+    "terminal_status": terminal.get("status"),
+    "terminal_conclusion": terminal.get("conclusion", ""),
+    "phone_result_present": True,
+    "phone_result_success": bool(result.get("success")),
+    "phone_result_mode": result.get("mode"),
+}
+Path("mobile-cloud-live-proof.json").write_text(
+    json.dumps(proof, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(proof))

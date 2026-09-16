@@ -1,0 +1,55 @@
+name: mobile-cloud-live-proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact current main commit authorized for the live proof
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-cloud-live-proof
+  cancel-in-progress: false
+
+jobs:
+  live-proof:
+    runs-on: ubuntu-latest
+    environment: Production
+    timeout-minutes: 360
+    env:
+      FLEXFACTOR_LIVE_PROOF_TOKEN: ${{ secrets.FLEXFACTOR_LIVE_PROOF_GITHUB_TOKEN }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      TARGET_REPOSITORY: buckeye7066/flexfactor-demo-tinystats
+    steps:
+      - name: Authorize the exact main revision and triggering owner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
+          test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER"
+          test "$GITHUB_REF" = "refs/heads/main"
+          printf '%s' "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          live_main=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          test "$EXPECTED_SHA" = "$live_main"
+          test -n "$FLEXFACTOR_LIVE_PROOF_TOKEN"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_sha }}
+          persist-credentials: false
+
+      - name: Exercise the released mobile control-plane path live
+        run: python .github/scripts/mobile_cloud_live_proof.py
+
+      - name: Upload redacted live proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-cloud-live-proof-${{ inputs.expected_sha }}
+          path: mobile-cloud-live-proof.json
+          if-no-files-found: error
+          retention-days: 30
