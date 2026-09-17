@@ -314,8 +314,8 @@
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "f609283c89f108dc46e16eebe8231d2389d93398c274a85fb5448f009368a8fa",
-      "observed_at": "2026-09-13T13:15:00.220129+00:00",
+      "content_hash": "ffef0ad25a24c77d237dcd73567895c547f55491eb39b8d36cf3dd852f086bb6",
+      "observed_at": "2026-09-17T04:00:08.125048+00:00",
       "excerpt": "Modes, verification, review, publication."
     },
     {
@@ -349,8 +349,8 @@
     {
       "kind": "source",
       "locator": "flexfactor_evidence.py",
-      "content_hash": "df40d38d4d927b3ab0f643c8e98e1f836aa50138e0ae4cbc8e93b0e2a8540469",
-      "observed_at": "2026-09-06T16:45:00Z",
+      "content_hash": "c91b6f6956d407c28d599bfec1161bbe16034e9186954ec5919f8a53696d89fb",
+      "observed_at": "2026-09-17T04:00:08.125048+00:00",
       "excerpt": "Fail-closed gate ledger."
     },
     {
