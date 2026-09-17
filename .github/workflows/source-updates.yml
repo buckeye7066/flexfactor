@@ -20,4 +20,4 @@ jobs:
         with:
           python-version: '3.11'
       - name: Exercise real Git update and file preservation with local fixtures
-        run: python -m unittest test_source_app_update -v
+        run: python -m unittest test_source_app_update test_release_update_manifest -v

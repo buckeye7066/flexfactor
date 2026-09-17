@@ -207,6 +207,7 @@ jobs:
                    test_stale_runtime_recurrence.py \
                    test_build_target.py \
                    test_source_app_update.py \
+                   test_release_update_manifest.py \
                    tests/test_cursor_provider.py \
                    tests/test_subscription_cli_env.py \
                    tests/test_subscription_priority.py; do

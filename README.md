@@ -217,6 +217,14 @@ Git metadata cannot self-update through this source path. This is not a signed
 Windows/macOS/iOS installer or an app-store release. Existing installations
 need this updater installed once before they can notify about future versions.
 
+Android production releases publish a versioned `flexfactor-update-v1` manifest.
+It binds the exact source revision, compatible cloud engine, and Android artifact
+in one active stable-channel record. Direct Android builds verify the signed APK
+and store builds defer to their store. Source checkouts deliberately retain the
+independent clean-main fast-forward rules above; the Android release manifest is
+not advertised as their update authority. An unavailable update service is never
+reported as "up to date."
+
 ## Build target selection
 
 See [build targets and supported artifacts](docs/BUILD-TARGETS.md).

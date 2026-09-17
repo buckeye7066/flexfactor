@@ -45,6 +45,40 @@ final class UpdatePolicy {
         return candidate > installed;
     }
 
+    static String requireRevision(String value) {
+        String normalized = value == null ? "" : value.toLowerCase(Locale.ROOT);
+        if (!normalized.matches("^[0-9a-f]{40}$")) {
+            throw new IllegalArgumentException("The update manifest has an invalid source revision.");
+        }
+        return normalized;
+    }
+
+    static void requireVersionedApk(URI uri, String versionName) {
+        String expected = "/buckeye7066/flexfactor/releases/download/android-v"
+                + versionName + "/flexfactor-" + versionName + ".apk";
+        if (!expected.equals(uri.getPath())) {
+            throw new IllegalArgumentException("The update APK does not match the declared version.");
+        }
+    }
+
+    static String requireCompatibleEngineRef(String value, String appVersion) {
+        if (value == null || !value.matches("^android-v[0-9]+\\.[0-9]+\\.[0-9]+$")) {
+            throw new IllegalArgumentException("The update manifest has an invalid cloud engine ref.");
+        }
+        if (appVersion == null || !appVersion.matches("^[0-9]+\\.[0-9]+\\.[0-9]+$")) {
+            throw new IllegalArgumentException("The update manifest has an invalid app version.");
+        }
+        String[] engine = value.substring("android-v".length()).split("\\.");
+        String[] app = appVersion.split("\\.");
+        long enginePatch = Long.parseLong(engine[2]);
+        long appPatch = Long.parseLong(app[2]);
+        if (!engine[0].equals(app[0]) || !engine[1].equals(app[1])
+                || (enginePatch != appPatch && enginePatch != appPatch - 1)) {
+            throw new IllegalArgumentException("The cloud engine is not compatible with this app release.");
+        }
+        return value;
+    }
+
     private static URI requireHttps(String value) {
         try {
             URI uri = URI.create(value);
