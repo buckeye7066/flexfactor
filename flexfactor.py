@@ -7112,6 +7112,24 @@ def _find_local_project_result(*name_hints: str) -> tuple[str | None, bool]:
                         continue
                     full = os.path.join(root, entry.name)
                     if os.path.isdir(full):
+                        # A CONFIRMED VISIBLE EXACT MATCH IS THE ANSWER ALREADY.
+                        # Return it here, inside the entry loop, before another
+                        # entry is touched. The shape this replaced appended it
+                        # to root_dirs, finished enumerating the root, and only
+                        # then ran a post-enumeration exact pass - so ONE more
+                        # entry after the winner could still destroy a result the
+                        # scan had already established: it could exhaust the
+                        # entry budget or the deadline (both `return None, False`),
+                        # raise OSError out of the iterator, or block in a
+                        # metadata probe on an unrelated plausible name. None of
+                        # that is information about the directory already found.
+                        # Precedence is unchanged: only a VISIBLE EXACT match may
+                        # take this path, so a prefix neighbour ('GrantFlow-backup')
+                        # and a hidden config sibling ('.ellie') both still fall
+                        # through to the ordered passes below and can never
+                        # pre-empt a later visible exact checkout.
+                        if not entry.name.startswith(".") and slug in exact:
+                            return full, True
                         root_dirs.append(full)
         except OSError:
             continue
@@ -7138,10 +7156,12 @@ def _find_local_project_result(*name_hints: str) -> tuple[str | None, bool]:
     hidden = [d for d in root_dirs if os.path.basename(d).startswith(".")]
 
     # Pass 1 (global): exact slug match (despaced form included) - precise.
-    for tier in (visible, hidden):
-        for full in tier:
-            if _slugify(os.path.basename(full)) in exact:
-                return full, True
+    # HIDDEN ONLY: every visible exact match already returned from inside the
+    # scan loop above, so a visible tier here would be dead code rather than a
+    # second chance. A dot-named project still resolves - last resort, as before.
+    for full in hidden:
+        if _slugify(os.path.basename(full)) in exact:
+            return full, True
     # Pass 2 (global): prefix match - tolerant of name/folder drift.
     for tier in (visible, hidden):
         for full in tier:

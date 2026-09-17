@@ -938,5 +938,148 @@ class ScoutSandboxPostureIsTrueTests(unittest.TestCase):
                          summary)
 
 
+class EmptySourceInventoryIsNotAGreenAudit(unittest.TestCase):
+    """DEFECT: a full audit of nothing passed every gate.
+
+    `complete_source_inventory` is `all(...)` over the index's SOURCE files and
+    `all([])` is True, so an EMPTY inventory satisfied the `inventory` gate.
+    Measured 2026-09-17 against a real empty tree through the real
+    `build_repository_index` + `quality_gates`: all eight gates returned
+    "pass" and `quality_gates()["passed"]` was **True** - a green full-audit
+    claim over zero files.
+
+    That is the live 2026-08-24 shape: project lookup selected the hidden
+    config sibling `~/.ellie` instead of the checkout `~/Ellie`, `_file_tree`
+    refuses to walk dot-directories so nothing could ever be found inside it,
+    and the program "finished" with files_total=0 / analyzed_source_files=0.
+
+    These tests drive the REAL functions over REAL temporary trees. Nothing is
+    stubbed, so they measure what a run would actually claim.
+    """
+
+    @staticmethod
+    def _gates(index, rescan=None):
+        return ev.quality_gates(
+            run_id="r", baseline_ran=True, baseline_passed=True,
+            suite_command=["pytest"], suite_ran=True, suite_passed=True,
+            tests_collected=True, e2e=None,
+            rescan=rescan if rescan is not None else {"complete": True},
+            blast={"ran": True}, secrets=[], index=index, coverage={})
+
+    @staticmethod
+    def _row(gates, gate_id):
+        return next(g for g in gates["gates"] if g["id"] == gate_id)
+
+    def _write(self, root, rel, text):
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def test_an_empty_source_inventory_can_never_be_a_passing_full_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = ev.build_repository_index(tmp, "r")
+            # The shape the defect produced, stated so a regression is obvious.
+            self.assertEqual(0, index["totals"]["tracked_or_relevant_source_files"])
+            self.assertEqual(0, index["totals"]["analyzed_source_files"])
+            self.assertTrue(index["complete_source_inventory"],
+                            "all([]) is still True - the flag's meaning is "
+                            "unchanged; the GATE is what must not be fooled")
+            gates = self._gates(index)
+            row = self._row(gates, "inventory")
+            self.assertEqual("blocked", row["status"])
+            self.assertIsNone(row["passed"])
+            self.assertFalse(gates["passed"],
+                             "a full audit of nothing must never report passed")
+
+    def test_the_empty_outcome_is_explicit_rather_than_merely_not_green(self):
+        """'Not passed' is not enough - the run has to SAY why."""
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._row(self._gates(ev.build_repository_index(tmp, "r")),
+                            "inventory")
+            self.assertIn("EMPTY", row["name"])
+            self.assertTrue(row["evidence"]["empty_source_inventory"])
+            self.assertIn("name match", row["evidence"]["reason"])
+            # Blocked, never fail: an absence of evidence is not proof of a
+            # defect in the audited program.
+            self.assertNotEqual("fail", row["status"])
+
+    def test_an_entirely_excluded_inventory_is_the_same_outcome(self):
+        """A tree whose only contents are non-source is inventoried, and still
+        proves nothing about a SOURCE audit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, "assets/logo.svg", "<svg/>\n")
+            self._write(tmp, "notes.txt", "nothing to compile\n")
+            index = ev.build_repository_index(tmp, "r")
+            self.assertEqual(0, index["totals"]["tracked_or_relevant_source_files"])
+            self.assertEqual("blocked",
+                             self._row(self._gates(index), "inventory")["status"])
+
+    def test_a_real_source_checkout_still_passes_the_inventory_gate(self):
+        """The guard must not cost a legitimate audit its green gate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, "src/app.py", "def main():\n    return 1\n")
+            index = ev.build_repository_index(tmp, "r")
+            self.assertEqual(1, index["totals"]["analyzed_source_files"])
+            gates = self._gates(index)
+            self.assertEqual("pass", self._row(gates, "inventory")["status"])
+            self.assertTrue(gates["passed"])
+
+    def test_an_incremental_run_with_no_changed_files_still_passes(self):
+        """A run that changed nothing is NOT an audit of nothing.
+
+        The distinction is structural: the repository index is always FULL, so
+        `inventory` keeps passing, and the changed-file scope lives in the
+        separate `rescan` gate. Conflating the two is what would make a
+        legitimate no-op incremental run indistinguishable from the defect.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, "src/app.py", "def main():\n    return 1\n")
+            index = ev.build_repository_index(tmp, "r")
+            rescan = ev.changed_file_rescan(index, [])
+            gates = self._gates(index, rescan=rescan)
+            self.assertEqual("pass", self._row(gates, "inventory")["status"])
+            self.assertTrue(gates["passed"])
+            # And the two gates are genuinely different questions.
+            self.assertEqual(
+                0, len(rescan.get("rescanned") or rescan.get("changed") or []),
+                "this run really did change nothing")
+
+    def test_a_hidden_config_sibling_cannot_displace_the_source_checkout(self):
+        """The upstream half, at the real resolver.
+
+        The empty-inventory gate is the second line of defence; the first is
+        that `~/Ellie` wins over `~/.ellie` in the first place. Asserted here
+        too so the two halves cannot drift apart: if lookup ever regresses,
+        THIS test names the consequence (an inventory with no source files).
+        """
+        import flexfactor as ff
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".ellie"))
+            checkout = os.path.join(tmp, "Ellie")
+            os.makedirs(checkout)
+            self._write(checkout, "src/app.py", "def main():\n    return 1\n")
+            saved = ff._PROJECT_ROOTS
+            try:
+                ff._PROJECT_ROOTS = [tmp]
+                resolved = ff._find_local_project("Ellie")
+            finally:
+                ff._PROJECT_ROOTS = saved
+            self.assertEqual(checkout, resolved)
+            index = ev.build_repository_index(resolved, "r")
+            self.assertGreaterEqual(
+                index["totals"]["analyzed_source_files"], 1,
+                "the selected directory must be the SOURCE checkout")
+            self.assertEqual("pass",
+                             self._row(self._gates(index), "inventory")["status"])
+            # And the sibling it must not have chosen would have been blocked.
+            hidden_index = ev.build_repository_index(
+                os.path.join(tmp, ".ellie"), "r")
+            self.assertEqual(
+                "blocked",
+                self._row(self._gates(hidden_index), "inventory")["status"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
