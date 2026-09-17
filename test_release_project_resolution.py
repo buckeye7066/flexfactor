@@ -205,10 +205,16 @@ class KnownProjectResolutionTests(unittest.TestCase):
             (second / "GrantFlow").mkdir()
             (first / "grantfloo").mkdir()  # a near-name the typo stage could grab
             real_scandir = os.scandir
+            # 6x the budget below. The assertion compares against the BUDGET,
+            # never against this duration: Windows timer granularity lets
+            # `wait(t)` return a few ms EARLY (measured 0.1952s for a 0.20s
+            # wait), so asserting `elapsed >= block` is a flake, not a check.
+            block_seconds = 0.30
+            budget_seconds = 0.05
 
             def scandir(root):
                 if os.path.normcase(str(root)) == os.path.normcase(str(first)):
-                    threading.Event().wait(0.20)
+                    threading.Event().wait(block_seconds)
                 return real_scandir(root)
 
             runtime = {"_find_local_project": ff._find_local_project,
@@ -218,7 +224,8 @@ class KnownProjectResolutionTests(unittest.TestCase):
             directed.install(runtime)
             with mock.patch.object(ff, "_PROJECT_ROOTS", [str(first), str(second)]), \
                  mock.patch.object(ff.os, "scandir", scandir), \
-                 mock.patch.object(directed, "_PROJECT_LOOKUP_SECONDS", 0.05):
+                 mock.patch.object(directed, "_PROJECT_LOOKUP_SECONDS",
+                                   budget_seconds):
                 started = time.perf_counter()
                 result = ff._find_local_project_result("GrantFlow")
                 elapsed = time.perf_counter() - started
@@ -228,10 +235,13 @@ class KnownProjectResolutionTests(unittest.TestCase):
                 self.assertIsNone(runtime["_find_local_project"]("GrantFlow"),
                                   "an incomplete inventory must not be fuzzy-"
                                   "resolved to a near-name")
-            self.assertGreaterEqual(
-                elapsed, 0.20,
-                "this pins the honest limit: the cooperative budget does NOT "
-                "abort a blocked filesystem call")
+            # THE honest limit: a 0.05s budget did not abort a 0.30s blocked
+            # call. Compared against the BUDGET (with room to spare) rather
+            # than the block duration, so timer granularity cannot flake it.
+            self.assertGreater(
+                elapsed, budget_seconds * 2,
+                "this pins the honest limit: the cooperative budget is checked "
+                "BETWEEN filesystem operations and does NOT abort a blocked one")
 
     def test_typo_lookup_does_not_stat_unrelated_directories(self):
         with tempfile.TemporaryDirectory() as tmp:
