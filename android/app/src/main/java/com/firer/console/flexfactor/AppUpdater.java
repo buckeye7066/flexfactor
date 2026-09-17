@@ -113,18 +113,51 @@ final class AppUpdater {
                 UpdatePolicy.requireTrustedTransport(UpdatePolicy.MANIFEST_URL),
                 MAX_MANIFEST_BYTES);
         JSONObject json = new JSONObject(new String(body, StandardCharsets.UTF_8));
-        String packageName = json.getString("packageName");
+        if (!"flexfactor-update-v1".equals(json.getString("schema"))
+                || !"stable".equals(json.getString("channel"))) {
+            throw new IllegalArgumentException("The update manifest has an unsupported schema or channel.");
+        }
+        if (!"active".equals(json.getString("status"))) {
+            throw new IllegalArgumentException("This FlexFactor release is not active.");
+        }
+        String sourceRevision = UpdatePolicy.requireRevision(json.getString("sourceRevision"));
+        JSONObject compatibility = json.getJSONObject("compatibility");
+        if (!("android-v" + androidVersion(json)).equals(compatibility.getString("engineRef"))
+                || compatibility.getString("cloudServiceVersion").trim().isEmpty()) {
+            throw new IllegalArgumentException("The update is not bound to a compatible cloud engine.");
+        }
+        JSONObject platforms = json.getJSONObject("platforms");
+        JSONObject source = platforms.getJSONObject("source");
+        if (!"buckeye7066/flexfactor".equals(source.getString("repository"))
+                || !sourceRevision.equals(UpdatePolicy.requireRevision(source.getString("revision")))) {
+            throw new IllegalArgumentException("The update is not bound to the canonical source revision.");
+        }
+        JSONObject android = platforms.getJSONObject("androidDirect");
+        String packageName = android.getString("packageName");
         if (!UpdatePolicy.PACKAGE_NAME.equals(packageName)) {
             throw new IllegalArgumentException("The update manifest names a different app.");
         }
-        long versionCode = json.getLong("versionCode");
-        String versionName = json.getString("versionName").trim();
+        long versionCode = android.getLong("versionCode");
+        String versionName = android.getString("versionName").trim();
         if (versionCode <= 0 || versionName.isEmpty()) {
             throw new IllegalArgumentException("The update manifest has an invalid version.");
         }
-        URI apkUri = UpdatePolicy.requireReleaseApk(json.getString("apkUrl"));
-        String sha256 = UpdatePolicy.requireSha256(json.getString("sha256"));
-        return new UpdateInfo(versionCode, versionName, apkUri, sha256);
+        URI apkUri = UpdatePolicy.requireReleaseApk(android.getString("url"));
+        UpdatePolicy.requireVersionedApk(apkUri, versionName);
+        String sha256 = UpdatePolicy.requireSha256(android.getString("sha256"));
+        if (!packageName.equals(json.getString("packageName"))
+                || versionCode != json.getLong("versionCode")
+                || !versionName.equals(json.getString("versionName").trim())
+                || !apkUri.toString().equals(json.getString("apkUrl"))
+                || !sha256.equals(UpdatePolicy.requireSha256(json.getString("sha256")))) {
+            throw new IllegalArgumentException("The Android bootstrap fields disagree with the update platform entry.");
+        }
+        return new UpdateInfo(versionCode, versionName, apkUri, sha256, sourceRevision);
+    }
+
+    private static String androidVersion(JSONObject json) {
+        return json.getJSONObject("platforms").getJSONObject("androidDirect")
+                .getString("versionName").trim();
     }
 
     private byte[] readBytes(URI uri, int limit) throws Exception {
@@ -309,12 +342,15 @@ final class AppUpdater {
         final String versionName;
         final URI apkUri;
         final String sha256;
+        final String sourceRevision;
 
-        UpdateInfo(long versionCode, String versionName, URI apkUri, String sha256) {
+        UpdateInfo(long versionCode, String versionName, URI apkUri, String sha256,
+                   String sourceRevision) {
             this.versionCode = versionCode;
             this.versionName = versionName;
             this.apkUri = apkUri;
             this.sha256 = sha256;
+            this.sourceRevision = sourceRevision;
         }
     }
 }

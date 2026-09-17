@@ -515,7 +515,7 @@ jobs:
             -storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD "$aab"
           (cd "$aab_dir" && sha256sum app-play.aab > SHA256SUMS)
           printf '%s\n' "$SOURCE_SHA" > "$aab_dir/SOURCE_COMMIT"
-      - name: Create signed update manifest
+      - name: Create versioned cross-platform update manifest
         shell: bash
         run: |
           apk="android/app/build/outputs/apk/release/app-release.apk"
@@ -530,9 +530,16 @@ jobs:
           cp "android/app/build/outputs/bundle/play/app-play.aab" "$release_aab"
           apk_sha=$(sha256sum "$release_apk" | cut -d' ' -f1)
           apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/flexfactor-${version_name}.apk"
-          printf '{\n  "packageName": "com.firer.console.flexfactor",\n  "versionCode": %s,\n  "versionName": "%s",\n  "apkUrl": "%s",\n  "sha256": "%s"\n}\n' \
-            "$version_code" "$version_name" "$apk_url" "$apk_sha" \
-            > "$release_dir/android-update.json"
+          cloud_version=$(node -p "require('./cloud/package.json').version")
+          python release_update_manifest.py \
+            --revision "$SOURCE_SHA" \
+            --version-name "$version_name" \
+            --version-code "$version_code" \
+            --apk-url "$apk_url" \
+            --apk-sha256 "$apk_sha" \
+            --cloud-version "$cloud_version" \
+            --engine-ref "$RELEASE_TAG" \
+            --output "$release_dir/android-update.json"
       - name: Revalidate live main before publication
         shell: bash
         env:
@@ -676,7 +683,7 @@ jobs:
           ensure_asset \
             "$release_dir/android-update.json" \
             "android-update.json" \
-            "Signed update manifest"
+            "Versioned update manifest"
           ensure_asset \
             "$release_dir/flexfactor-${version_name}.aab" \
             "flexfactor-${version_name}.aab" \

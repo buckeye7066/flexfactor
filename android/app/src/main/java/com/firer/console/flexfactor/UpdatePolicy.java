@@ -45,6 +45,22 @@ final class UpdatePolicy {
         return candidate > installed;
     }
 
+    static String requireRevision(String value) {
+        String normalized = value == null ? "" : value.toLowerCase(Locale.ROOT);
+        if (!normalized.matches("^[0-9a-f]{40}$")) {
+            throw new IllegalArgumentException("The update manifest has an invalid source revision.");
+        }
+        return normalized;
+    }
+
+    static void requireVersionedApk(URI uri, String versionName) {
+        String expected = "/buckeye7066/flexfactor/releases/download/android-v"
+                + versionName + "/flexfactor-" + versionName + ".apk";
+        if (!expected.equals(uri.getPath())) {
+            throw new IllegalArgumentException("The update APK does not match the declared version.");
+        }
+    }
+
     private static URI requireHttps(String value) {
         try {
             URI uri = URI.create(value);
