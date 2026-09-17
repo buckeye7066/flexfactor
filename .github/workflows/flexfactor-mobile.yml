@@ -50,6 +50,8 @@ permissions:
 
 jobs:
   flexfactor:
+    # The deployed 3.5.6 cloud owns this caller during the guarded tag-first
+    # interval. Promotion advances it after the cloud engine is upgraded.
     uses: buckeye7066/flexfactor/.github/workflows/mobile-run.yml@android-v3.5.6
     with:
       request_id: ${{ inputs.request_id }}
