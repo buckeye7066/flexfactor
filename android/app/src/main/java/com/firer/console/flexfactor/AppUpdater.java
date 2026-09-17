@@ -122,8 +122,7 @@ final class AppUpdater {
         }
         String sourceRevision = UpdatePolicy.requireRevision(json.getString("sourceRevision"));
         JSONObject compatibility = json.getJSONObject("compatibility");
-        if (!("android-v" + androidVersion(json)).equals(compatibility.getString("engineRef"))
-                || compatibility.getString("cloudServiceVersion").trim().isEmpty()) {
+        if (compatibility.getString("cloudServiceVersion").trim().isEmpty()) {
             throw new IllegalArgumentException("The update is not bound to a compatible cloud engine.");
         }
         JSONObject platforms = json.getJSONObject("platforms");
@@ -142,6 +141,8 @@ final class AppUpdater {
         if (versionCode <= 0 || versionName.isEmpty()) {
             throw new IllegalArgumentException("The update manifest has an invalid version.");
         }
+        UpdatePolicy.requireCompatibleEngineRef(
+                compatibility.getString("engineRef"), versionName);
         URI apkUri = UpdatePolicy.requireReleaseApk(android.getString("url"));
         UpdatePolicy.requireVersionedApk(apkUri, versionName);
         String sha256 = UpdatePolicy.requireSha256(android.getString("sha256"));
@@ -153,11 +154,6 @@ final class AppUpdater {
             throw new IllegalArgumentException("The Android bootstrap fields disagree with the update platform entry.");
         }
         return new UpdateInfo(versionCode, versionName, apkUri, sha256, sourceRevision);
-    }
-
-    private static String androidVersion(JSONObject json) {
-        return json.getJSONObject("platforms").getJSONObject("androidDirect")
-                .getString("versionName").trim();
     }
 
     private byte[] readBytes(URI uri, int limit) throws Exception {

@@ -15,6 +15,7 @@ SCHEMA = "flexfactor-update-v1"
 REPOSITORY = "buckeye7066/flexfactor"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 REVISION = re.compile(r"[0-9a-f]{40}")
+VERSION = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)")
 
 
 class ManifestError(ValueError):
@@ -51,7 +52,8 @@ def validate_manifest(value: dict) -> dict:
     if not isinstance(android, dict):
         raise ManifestError("Android direct-update entry is missing")
     version = android.get("versionName")
-    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", version):
+    version_match = VERSION.fullmatch(version) if isinstance(version, str) else None
+    if not version_match:
         raise ManifestError("Android version is invalid")
     if not isinstance(android.get("versionCode"), int) or android["versionCode"] <= 0:
         raise ManifestError("Android version code is invalid")
@@ -71,8 +73,15 @@ def validate_manifest(value: dict) -> dict:
     compatibility = value.get("compatibility")
     if not isinstance(compatibility, dict) or not compatibility.get("cloudServiceVersion"):
         raise ManifestError("cloud compatibility is missing")
-    if compatibility.get("engineRef") != f"android-v{version}":
-        raise ManifestError("cloud engine ref does not match the Android release")
+    engine_ref = compatibility.get("engineRef", "")
+    engine_match = re.fullmatch(r"android-v([0-9]+)\.([0-9]+)\.([0-9]+)", engine_ref)
+    if not engine_match:
+        raise ManifestError("cloud engine ref is invalid")
+    app_parts = tuple(map(int, version_match.groups()))
+    engine_parts = tuple(map(int, engine_match.groups()))
+    if (engine_parts[:2] != app_parts[:2]
+            or engine_parts[2] not in (app_parts[2], app_parts[2] - 1)):
+        raise ManifestError("cloud engine is not compatible with the Android release")
     return value
 
 

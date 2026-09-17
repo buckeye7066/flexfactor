@@ -35,10 +35,21 @@ class ReleaseUpdateManifestTests(unittest.TestCase):
             validate_manifest(self.changed(("status",), "withdrawn"))
 
     def test_mismatched_source_or_cloud_revision_is_rejected(self):
-        for path in (("platforms", "source", "revision"),
-                     ("compatibility", "engineRef")):
-            with self.subTest(path=path), self.assertRaises(ManifestError):
-                validate_manifest(self.changed(path, "android-v9.9.9"))
+        with self.assertRaises(ManifestError):
+            validate_manifest(self.changed(("platforms", "source", "revision"), "c" * 40))
+
+    def test_current_or_one_patch_staged_cloud_engine_is_compatible(self):
+        staged = build_manifest(
+            revision=self.revision, version_name="3.5.10", version_code=30510,
+            apk_url="https://github.com/buckeye7066/flexfactor/releases/download/android-v3.5.10/flexfactor-3.5.10.apk",
+            apk_sha256="b" * 64, cloud_version="1.1.5",
+            engine_ref="android-v3.5.9")
+        validate_manifest(staged)
+        for engine in ("android-v3.5.8", "android-v3.6.0", "main", "android-v4.0.0"):
+            with self.subTest(engine=engine), self.assertRaises(ManifestError):
+                rejected = copy.deepcopy(staged)
+                rejected["compatibility"]["engineRef"] = engine
+                validate_manifest(rejected)
 
     def test_apk_url_is_bound_to_the_declared_version_and_repository(self):
         for url in (

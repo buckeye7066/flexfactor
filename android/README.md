@@ -102,6 +102,9 @@ The updater accepts only the active stable channel, then checks the fixed releas
 origin, package name, version-bound URL, SHA-256, and signing-certificate lineage
 before opening Android's installer. A withdrawn or cross-revision manifest is
 reported as unavailable rather than being treated as an update.
+The compatibility record names the cloud engine actually declared by the
+release source. It may match the Android release or trail by the one patch used
+by the guarded tag-first rollout; other major, minor, or patch drift is refused.
 The manifest temporarily repeats the original Android fields so clients that
 predate this schema can bootstrap into it; schema-aware clients require both
 representations to agree.

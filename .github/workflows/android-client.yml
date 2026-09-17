@@ -72,10 +72,12 @@ jobs:
           declared_engine=$(sed -n \
             's/^export const ENGINE_REF = "\(android-v[^"]*\)";/\1/p' \
             cloud/lib/config.js)
+          declared_service_version=$(node -p "require('./cloud/package.json').version")
           if [ -z "$declared_engine" ]; then
             echo "Could not resolve the managed cloud engine" >&2
             exit 1
           fi
+          test -n "$declared_service_version"
           rollout_engine=""
           if [ -f cloud/ENGINE_ROLLOUT_PENDING ]; then
             # During a tag-first rollout the deployed cloud still advertises
@@ -115,7 +117,9 @@ jobs:
               https://flexfactor-cloud.vercel.app/api/health) || health='{}'
             if jq -e --arg engine "$expected_engine" \
                 --arg rollout "$rollout_engine" \
+                --arg version "$declared_service_version" \
                 '.ok == true and .oauth_device_configured == true
+                 and .version == $version
                  and (.engine_ref == $engine
                       or ($rollout != "" and .engine_ref == $rollout))' \
                 <<<"$health"; then
@@ -531,6 +535,10 @@ jobs:
           apk_sha=$(sha256sum "$release_apk" | cut -d' ' -f1)
           apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/flexfactor-${version_name}.apk"
           cloud_version=$(node -p "require('./cloud/package.json').version")
+          engine_ref=$(sed -n \
+            's/^export const ENGINE_REF = "\(android-v[^"]*\)";/\1/p' \
+            cloud/lib/config.js)
+          test -n "$engine_ref"
           python release_update_manifest.py \
             --revision "$SOURCE_SHA" \
             --version-name "$version_name" \
@@ -538,7 +546,7 @@ jobs:
             --apk-url "$apk_url" \
             --apk-sha256 "$apk_sha" \
             --cloud-version "$cloud_version" \
-            --engine-ref "$RELEASE_TAG" \
+            --engine-ref "$engine_ref" \
             --output "$release_dir/android-update.json"
       - name: Revalidate live main before publication
         shell: bash
