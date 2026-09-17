@@ -969,6 +969,40 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
         and coverage.get("executed_control_total", 0) >= coverage.get("discovered_control_total", 0))
     unresolved_secrets = [f for f in secrets
                           if not str(f.get("disposition", "")).startswith("accepted-")]
+    # A VACUOUSLY complete inventory is not evidence of a source audit.
+    # `complete_source_inventory` is `all(...)` over the index's SOURCE files,
+    # and `all([])` is True - so an EMPTY inventory satisfied it and this gate
+    # PASSED on zero files. That is the exact shape of the 2026-08-24 live
+    # 10-program audit: name resolution selected the hidden config sibling
+    # `~/.ellie` instead of the checkout `~/Ellie`, `_file_tree` refuses to
+    # walk dot-directories so nothing could ever be found inside it, and the
+    # program ran to completion with files_total=0 and analyzed_source_files=0
+    # - a full audit of nothing, reported as finished. Re-measured 2026-09-17
+    # against an empty tree: all eight gates returned "pass" and
+    # quality_gates() reported passed=True.
+    #
+    # Zero source files is therefore BLOCKED, never pass: `ran=True` (the
+    # inventory WAS built and its answer is on the record) with `passed=None`,
+    # which is this module's existing vocabulary for "no evidence either way"
+    # and can never read as a proven audit. It is deliberately not `fail` - an
+    # empty inventory is an absence of evidence, not proof of a defect.
+    #
+    # NOT a changed-file question: an incremental run that changed nothing
+    # still builds a FULL repository index with source files in it, so it keeps
+    # passing here. Changed-file scope lives in the separate `rescan` gate.
+    inventory_totals = dict(index.get("totals") or {})
+    inventory_sources = int(inventory_totals.get(
+        "tracked_or_relevant_source_files") or 0)
+    inventory_name = "Relevant source inventory"
+    if inventory_sources:
+        inventory_passed = bool(index.get("complete_source_inventory"))
+    else:
+        inventory_passed = None
+        inventory_name += " (EMPTY - no source file was inventoried)"
+        inventory_totals["empty_source_inventory"] = True
+        inventory_totals["reason"] = (
+            "no source file was inventoried, so nothing was analyzed; a name "
+            "match alone is not evidence that a source audit succeeded")
     gates = [
         gate("build", "Compilation/build", baseline_ran, baseline_passed,
              {"result": baseline_passed}),
@@ -981,8 +1015,8 @@ def quality_gates(*, run_id: str, baseline_ran: bool, baseline_passed: bool | No
               "accepted_test_fixtures": [f for f in secrets
                                            if str(f.get("disposition", "")).startswith("accepted-")]},
              "security"),
-        gate("inventory", "Relevant source inventory", True,
-             bool(index.get("complete_source_inventory")), index.get("totals")),
+        gate("inventory", inventory_name, True,
+             inventory_passed, inventory_totals),
         gate("rescan", "Changed-file rescan", True, bool(rescan.get("complete")), rescan),
         # NOT a tautology. `dependency_blast_radius` hardcodes "ran": True on
         # every return path, so ran-implies-passed was a gate that could not
