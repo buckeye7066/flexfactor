@@ -23,6 +23,104 @@ REP = sb.capability_report()
 IS_WIN = sb.IS_WINDOWS
 TMP = tempfile.gettempdir()
 
+# A GRANDCHILD IS MEASURED BY A HEARTBEAT, NEVER BY ITS PID.
+#
+# The pid a sandboxed process reports is not a host pid under any
+# PID-namespace mechanism. Measured on WSL2 Ubuntu 2026-09-17, strongest=bwrap
+# (`--unshare-all`, which is the default because `Limits.network` is False):
+# the child reported `GRANDCHILD 3`, and host `/proc/3` does not exist - while
+# the child's own namespace pid 2 IS a live host process. So a pid-based
+# `assertFalse(pid_alive(gpid))` passed VACUOUSLY: it never observed the
+# grandchild at all, and could even have observed an unrelated host process.
+# On a mechanism without a namespace (strongest=rlimit, the ubuntu CI runner)
+# the pid IS a host pid, but it can be REUSED under load, which made
+# `test_spawn_and_kill_tree` fail intermittently on CI while passing 40/40 on
+# an idle host.
+#
+# A file the grandchild keeps rewriting is immune to both: it advances only
+# while that process is really running, wherever its pid lives.
+_HEARTBEAT_GRANDCHILD = textwrap.dedent("""
+    import os, sys, time
+    path = sys.argv[1]
+    part = path + ".part"
+    n = 0
+    while n < 4000:            # bounded: never leave an endless orphan behind
+        n += 1
+        with open(part, "w") as fh:
+            fh.write(str(n))
+        try:
+            os.replace(part, path)   # atomic: a reader never sees a torn value
+        except OSError:
+            pass
+        time.sleep(0.05)
+""")
+
+# Spawns the heartbeat grandchild, then outlives it. argv: script, beat file.
+_HEARTBEAT_CHILD = textwrap.dedent("""
+    import subprocess, sys, time
+    subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])
+    time.sleep(60)
+""")
+
+
+def _heartbeat_paths(tag: str) -> tuple[str, str]:
+    """Write the grandchild program to TMP; return (script, beat file).
+
+    TMP is used because every POSIX mechanism binds TMPDIR read-write at the
+    same path (see `_prepare_posix`), so the heartbeat is visible from the host
+    even inside a bwrap filesystem namespace.
+    """
+    stamp = f"{os.getpid()}_{time.time_ns()}_{tag}"
+    script = os.path.join(TMP, f"ff_beat_{stamp}.py")
+    beat = os.path.join(TMP, f"ff_beat_{stamp}.txt")
+    with open(script, "w", encoding="utf-8") as fh:
+        fh.write(_HEARTBEAT_GRANDCHILD)
+    return script, beat
+
+
+def _unlink(*paths: str) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _beat(path: str) -> int:
+    """The grandchild's current heartbeat count, 0 when it never wrote one."""
+    for _ in range(20):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = (fh.read() or "").strip()
+            return int(text) if text else 0
+        except ValueError:
+            return 0
+        except OSError:
+            time.sleep(0.02)   # Windows: the writer may hold it for an instant
+    return 0
+
+
+def _wait_for_beat(path: str, above: int = 0, timeout: float = 25.0) -> int:
+    deadline = time.time() + timeout
+    latest = _beat(path)
+    while latest <= above and time.time() < deadline:
+        time.sleep(0.05)
+        latest = _beat(path)
+    return latest
+
+
+def _assert_heartbeat_stopped(case: unittest.TestCase, beat: str, what: str) -> None:
+    """The heartbeat must not advance any more.
+
+    Read AFTER a settle so a kill still in flight is not mistaken for a
+    survivor, then require 30 heartbeat intervals of silence.
+    """
+    time.sleep(0.5)
+    stopped = _beat(beat)
+    time.sleep(1.5)
+    case.assertEqual(stopped, _beat(beat),
+                     f"grandchild heartbeat kept advancing after {what}")
+
 
 def _blocked(what: str) -> str:
     return f"BLOCKED: {what} on this host (strongest={REP['strongest']}, platform={REP['platform']})"
@@ -126,25 +224,27 @@ class RunContainedTests(unittest.TestCase):
         self.assertEqual(cp.stdout, "")
 
     def test_timeout_kills_whole_tree_including_grandchild(self):
-        child = textwrap.dedent("""
-            import subprocess, sys, time
-            g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-            print("GRANDCHILD", g.pid, flush=True)
-            time.sleep(60)
-        """)
+        """A timeout must kill the GRANDCHILD too - measured, not assumed.
+
+        This used to read the grandchild's own reported pid and assert it was
+        not alive on the host. Under any PID-namespace mechanism that pid is
+        not a host pid, so the assertion could not fail: see the measurement
+        recorded beside `_HEARTBEAT_GRANDCHILD`.
+        """
+        script, beat = _heartbeat_paths("timeout")
+        self.addCleanup(_unlink, script, beat, beat + ".part")
         t0 = time.time()
-        cp = sb.run_contained([PY, "-c", child], TMP, limits=Limits(timeout_s=3))
+        cp = sb.run_contained([PY, "-c", _HEARTBEAT_CHILD, script, beat], TMP,
+                              limits=Limits(timeout_s=3))
         self.assertEqual(cp.returncode, 124, cp.stderr)
         self.assertTrue(cp.flexfactor_launch_error)
         self.assertIn("timed out", cp.stderr)
         self.assertLess(time.time() - t0, 40)
-        line = [l for l in cp.stdout.splitlines() if l.startswith("GRANDCHILD")]
-        self.assertTrue(line, f"grandchild pid never reported: {cp.stdout!r} {cp.stderr!r}")
-        gpid = int(line[0].split()[1])
-        deadline = time.time() + 10
-        while sb.pid_alive(gpid) and time.time() < deadline:
-            time.sleep(0.2)
-        self.assertFalse(sb.pid_alive(gpid), f"grandchild {gpid} survived the tree kill")
+        # VERIFY THE VERIFICATION: without a heartbeat the check below is vacuous.
+        self.assertGreater(_beat(beat), 0,
+                           "the grandchild never wrote a heartbeat, so 'the tree "
+                           "was killed' would prove nothing")
+        _assert_heartbeat_stopped(self, beat, "the timeout tree kill")
 
     def test_grandchild_check_can_fail(self):
         # verify-your-verification: pid_alive must report True for a live process
@@ -259,35 +359,34 @@ class RawSocketExfilTests(unittest.TestCase):
 
 class SpawnContainedTests(unittest.TestCase):
     def test_spawn_and_kill_tree(self):
-        child = textwrap.dedent("""
-            import subprocess, sys, time, os
-            g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-            open(sys.argv[1], "w").write(str(g.pid))
-            time.sleep(60)
-        """)
-        pidfile = os.path.join(TMP, f"ff_sandbox_spawn_{os.getpid()}.txt")
-        proc, err, kill_tree = sb.spawn_contained([PY, "-c", child, pidfile], TMP,
-                                                  limits=Limits(timeout_s=60))
+        """`kill_tree()` must stop the GRANDCHILD, not only the direct child.
+
+        Heartbeat-measured for the reasons recorded beside
+        `_HEARTBEAT_GRANDCHILD`: the previous pid-identity form failed on the
+        ubuntu CI runner (host pid, reusable under load) and failed locally
+        under bwrap (namespace pid, never a host pid at all).
+        """
+        script, beat = _heartbeat_paths("spawn")
+        self.addCleanup(_unlink, script, beat, beat + ".part")
+        proc, err, kill_tree = sb.spawn_contained(
+            [PY, "-c", _HEARTBEAT_CHILD, script, beat], TMP,
+            limits=Limits(timeout_s=60))
         self.assertIsNotNone(proc, err)
         self.assertEqual(err, "")
         try:
-            deadline = time.time() + 20
-            while time.time() < deadline and not (os.path.exists(pidfile)
-                                                  and os.path.getsize(pidfile) > 0):
-                time.sleep(0.1)
-            with open(pidfile, encoding="utf-8") as fh:
-                gpid = int(fh.read())
-            self.assertTrue(sb.pid_alive(gpid))
+            first = _wait_for_beat(beat)
+            self.assertGreater(first, 0,
+                               "the grandchild never started, so 'kill_tree "
+                               "stopped it' would prove nothing")
+            # VERIFY THE VERIFICATION: the heartbeat really does ADVANCE while
+            # the tree is alive, so a frozen one afterwards is meaningful.
+            self.assertGreater(_wait_for_beat(beat, above=first, timeout=10.0), first,
+                               "the heartbeat never advanced while the grandchild "
+                               "was running; 'stopped' would be indistinguishable "
+                               "from 'never ran'")
         finally:
             kill_tree()
-            try:
-                os.remove(pidfile)
-            except OSError:
-                pass
-        deadline = time.time() + 10
-        while sb.pid_alive(gpid) and time.time() < deadline:
-            time.sleep(0.2)
-        self.assertFalse(sb.pid_alive(gpid), "grandchild survived kill_tree()")
+        _assert_heartbeat_stopped(self, beat, "kill_tree()")
         self.assertIsNotNone(proc.poll())
 
     def test_spawn_missing_exe_returns_error_not_raise(self):
