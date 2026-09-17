@@ -20,8 +20,8 @@ class ReleaseUpdateManifestTests(unittest.TestCase):
         target[path[-1]] = value
         return result
 
-    def test_builds_one_signal_for_source_android_and_cloud(self):
-        self.assertEqual(self.revision, self.manifest["platforms"]["source"]["revision"])
+    def test_builds_one_signal_for_android_and_cloud(self):
+        self.assertNotIn("source", self.manifest["platforms"])
         self.assertEqual("android-v3.6.0", self.manifest["compatibility"]["engineRef"])
         self.assertEqual(30600, self.manifest["platforms"]["androidDirect"]["versionCode"])
         self.assertEqual(30600, self.manifest["versionCode"])
@@ -34,9 +34,9 @@ class ReleaseUpdateManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "not active"):
             validate_manifest(self.changed(("status",), "withdrawn"))
 
-    def test_mismatched_source_or_cloud_revision_is_rejected(self):
+    def test_malformed_source_revision_is_rejected(self):
         with self.assertRaises(ManifestError):
-            validate_manifest(self.changed(("platforms", "source", "revision"), "c" * 40))
+            validate_manifest(self.changed(("sourceRevision",), "c" * 39))
 
     def test_current_or_one_patch_staged_cloud_engine_is_compatible(self):
         staged = build_manifest(

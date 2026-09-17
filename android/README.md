@@ -97,7 +97,7 @@ The protected `android-release` environment supplies:
 
 Missing signing material fails the release; it never falls back to a debug key.
 The release publishes one versioned `flexfactor-update-v1` signal that binds the
-canonical source revision, compatible cloud engine, and platform artifacts.
+canonical source revision, compatible cloud engine, and Android artifacts.
 The updater accepts only the active stable channel, then checks the fixed release
 origin, package name, version-bound URL, SHA-256, and signing-certificate lineage
 before opening Android's installer. A withdrawn or cross-revision manifest is

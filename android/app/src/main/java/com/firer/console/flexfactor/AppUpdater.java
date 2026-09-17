@@ -126,11 +126,6 @@ final class AppUpdater {
             throw new IllegalArgumentException("The update is not bound to a compatible cloud engine.");
         }
         JSONObject platforms = json.getJSONObject("platforms");
-        JSONObject source = platforms.getJSONObject("source");
-        if (!"buckeye7066/flexfactor".equals(source.getString("repository"))
-                || !sourceRevision.equals(UpdatePolicy.requireRevision(source.getString("revision")))) {
-            throw new IllegalArgumentException("The update is not bound to the canonical source revision.");
-        }
         JSONObject android = platforms.getJSONObject("androidDirect");
         String packageName = android.getString("packageName");
         if (!UpdatePolicy.PACKAGE_NAME.equals(packageName)) {

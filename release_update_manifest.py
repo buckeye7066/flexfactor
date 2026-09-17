@@ -43,11 +43,6 @@ def validate_manifest(value: dict) -> dict:
     platforms = value.get("platforms")
     if not isinstance(platforms, dict):
         raise ManifestError("platform map is missing")
-    source = platforms.get("source")
-    if not isinstance(source, dict) or source.get("repository") != REPOSITORY:
-        raise ManifestError("source update repository is not canonical")
-    if source.get("revision") != revision:
-        raise ManifestError("source platform revision does not match the release")
     android = platforms.get("androidDirect")
     if not isinstance(android, dict):
         raise ManifestError("Android direct-update entry is missing")
@@ -98,7 +93,6 @@ def build_manifest(*, revision: str, version_name: str, version_code: int,
             "engineRef": engine_ref or f"android-v{version_name}",
         },
         "platforms": {
-            "source": {"repository": REPOSITORY, "revision": revision},
             "androidDirect": {
                 "packageName": "com.firer.console.flexfactor",
                 "versionCode": version_code,
