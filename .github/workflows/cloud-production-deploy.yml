@@ -60,7 +60,7 @@ jobs:
           vercel project inspect flexfactor-cloud --token "$VERCEL_TOKEN" >/dev/null
           vercel link --yes --project flexfactor-cloud --token "$VERCEL_TOKEN"
 
-      - name: Build an immutable preview deployment
+      - name: Build an immutable staged production deployment
         id: preview
         working-directory: cloud
         env:
@@ -69,13 +69,13 @@ jobs:
           set -euo pipefail
           cloud_sha=$(git log -1 --format=%H -- .)
           printf '%s' "$cloud_sha" | grep -Eq '^[0-9a-f]{40}$'
-          deployment_url=$(vercel deploy --yes --token "$VERCEL_TOKEN" \
+          deployment_url=$(vercel deploy --prod --skip-domain --yes --token "$VERCEL_TOKEN" \
             --env "FLEXFACTOR_CLOUD_SOURCE_SHA=$cloud_sha" | tail -n 1)
           printf '%s' "$deployment_url" \
             | grep -Eq '^https://[A-Za-z0-9.-]+\.vercel\.app$'
           printf 'deployment_url=%s\n' "$deployment_url" >> "$GITHUB_OUTPUT"
 
-      - name: Prove preview health and engine identity
+      - name: Prove staged production health and engine identity
         working-directory: cloud
         env:
           DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
@@ -129,8 +129,10 @@ jobs:
         env:
           DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
         run: |
+          set -euo pipefail
           export CLOUD_SOURCE_SHA="$(git log -1 --format=%H -- .)"
-          node --input-type=module <<'JS'
+          for attempt in {1..30}; do
+            if node --input-type=module <<'JS'
           import assert from "node:assert/strict";
           import { ENGINE_REF, SERVICE_NAME, SERVICE_VERSION } from "./lib/config.js";
 
@@ -149,3 +151,10 @@ jobs:
           assert.equal(health.deployment_url, process.env.DEPLOYMENT_URL);
           console.log(JSON.stringify(health));
           JS
+            then
+              exit 0
+            fi
+            if [ "$attempt" -lt 30 ]; then sleep 2; fi
+          done
+          echo "Production alias did not converge to the verified deployment" >&2
+          exit 1

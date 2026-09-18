@@ -111,6 +111,24 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
         self.assertNotRegex(proof, r'Live 3\.\d+\.\d+ acceptance proof')
 
 
+class CloudDeploymentIntegrityTests(unittest.TestCase):
+    def test_promotion_preserves_the_verified_environment_and_build(self):
+        source = (ROOT / ".github/workflows/cloud-production-deploy.yml").read_text(encoding="utf-8")
+        build = source.split("deployment_url=$(vercel deploy", 1)[1].split("| tail -n 1)", 1)[0]
+        self.assertIn("--prod", build)
+        self.assertIn("--skip-domain", build)
+        self.assertIn("FLEXFACTOR_CLOUD_SOURCE_SHA=$cloud_sha", build)
+
+    def test_production_alias_verification_bounds_propagation_retries(self):
+        source = (ROOT / ".github/workflows/cloud-production-deploy.yml").read_text(encoding="utf-8")
+        verify = source.split("- name: Prove the production alias", 1)[1]
+        self.assertIn("for attempt in {1..30}", verify)
+        self.assertIn("sleep 2", verify)
+        self.assertIn("health.source_revision, process.env.CLOUD_SOURCE_SHA", verify)
+        self.assertIn("health.deployment_url, process.env.DEPLOYMENT_URL", verify)
+        self.assertIn("exit 1", verify)
+
+
 class ManagedAndroidInvariants(unittest.TestCase):
     def test_launcher_declares_no_termux_runtime_permission(self):
         manifest = (ANDROID / "AndroidManifest.xml").read_text(encoding="utf-8")
