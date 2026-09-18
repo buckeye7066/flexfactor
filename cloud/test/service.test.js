@@ -113,10 +113,10 @@ function storedClaim(request, overrides = {}) {
 }
 
 test("the reusable workflow is pinned to the release that carries this client", () => {
-  assert.equal(ENGINE_REF, "android-v3.5.8");
+  assert.equal(ENGINE_REF, "android-v3.5.9");
   assert.match(
     mobileWorkflow(),
-    /^[ \t]*uses: buckeye7066\/flexfactor\/\.github\/workflows\/mobile-run\.yml@android-v3\.5\.8$/m,
+    /^[ \t]*uses: buckeye7066\/flexfactor\/\.github\/workflows\/mobile-run\.yml@android-v3\.5\.9$/m,
   );
   for (const mode of ["refactor", "scout", "audit", "prodready"]) {
     assert.match(mobileWorkflow(), new RegExp(mode));
@@ -720,5 +720,5 @@ test("protected-branch retry preserves an engine upgraded during the initial wri
 });
 
 test("downgrade protection has a distinct cloud release identity", () => {
-  assert.equal(SERVICE_VERSION, "1.1.8");
+  assert.equal(SERVICE_VERSION, "1.1.9");
 });
