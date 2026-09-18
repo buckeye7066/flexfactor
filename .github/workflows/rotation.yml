@@ -181,7 +181,7 @@ jobs:
         run: |
           import subprocess, json, os
           successes = []
-          for model in ("claude-sonnet-4.6", "gpt-5.4", "claude-haiku-4.5", "auto"):
+          for model in ("claude-sonnet-5", "gpt-5.6-terra", "gpt-5.6-luna"):
               try:
                   result = subprocess.run(["copilot", "-s", "--no-ask-user", "--no-auto-update",
                       "--no-color", "--no-custom-instructions", "--available-tools=", "--model", model],
@@ -200,22 +200,3 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
               output.write("Verified Copilot models: " + json.dumps(successes) + "\n")
           if not successes: raise SystemExit("No configured Copilot model completed the bounded probe")
-          # Diagnostic only: do not treat an opaque auto model as an independent reviewer.
-          metadata = subprocess.run(["copilot", "-s", "--no-ask-user", "--no-auto-update",
-              "--no-color", "--no-custom-instructions", "--available-tools=", "--model", "auto",
-              "--output-format", "json"], input="Reply with exactly OK. Do not use tools.",
-              text=True, capture_output=True, timeout=45)
-          models, types = [], []
-          def inspect(value):
-              if isinstance(value, dict):
-                  for key, item in value.items():
-                      if "model" in key.lower() and isinstance(item, str) and len(item) < 100:
-                          models.append({key:item})
-                      elif key == "type" and isinstance(item, str): types.append(item)
-                      if isinstance(item, (dict, list)): inspect(item)
-              elif isinstance(value, list):
-                  for item in value: inspect(item)
-          for line in metadata.stdout.splitlines():
-              try: inspect(json.loads(line))
-              except ValueError: pass
-          print(json.dumps({"model_metadata":models,"event_types":types,"exit":metadata.returncode}), flush=True)
