@@ -437,6 +437,11 @@ jobs:
           PY
           exit "$rc"
 
+      - name: Emit bounded redacted failure diagnostics
+        if: failure()
+        shell: bash
+        run: python engine/.github/scripts/redact_mobile_diagnostics.py mobile-run.log
+
       - name: Write the phone-readable run summary
         if: always()
         shell: bash
