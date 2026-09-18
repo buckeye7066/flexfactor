@@ -29,17 +29,18 @@ jobs:
           python -m unittest test_purpose_evidence_routing -v
           python -m py_compile flexfactor.py test_purpose_evidence_routing.py
           git diff --check
-      - name: Remove one-time patch machinery and publish only the feature branch
+      - name: Store verified source object without updating any branch
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/fix/purpose-evidence-routing-20260918
-          git rm -- .github/scripts/apply-purpose-evidence-fix.py .github/workflows/materialize-purpose-evidence-fix.yml
-          git add -- flexfactor.py
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'Fix purpose citation validation inside provider routing'
-          gh auth setup-git
-          git push origin HEAD:refs/heads/fix/purpose-evidence-routing-20260918
+          python - <<'PY' > "$RUNNER_TEMP/purpose-source.json"
+          import base64, json, pathlib
+          content = base64.b64encode(pathlib.Path('flexfactor.py').read_bytes()).decode('ascii')
+          print(json.dumps({'encoding': 'base64', 'content': content}))
+          PY
+          sha=$(gh api --method POST repos/buckeye7066/flexfactor/git/blobs --input "$RUNNER_TEMP/purpose-source.json" --jq .sha)
+          test "$sha" = ae08575e27a9a62c3f7387144182bc22b04ce9a8
+          printf 'Verified source blob: %s\nNo branch updated by Actions.\n' "$sha"
