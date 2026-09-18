@@ -473,6 +473,7 @@ jobs:
           path: |
             mobile-result.json
             mobile-run.log
+            mobile-steering.log
             mobile-before.txt
             mobile-after.txt
             mobile-phone-summary/orchestrator-receipt.json
