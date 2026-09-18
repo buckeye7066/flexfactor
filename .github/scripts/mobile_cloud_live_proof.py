@@ -39,10 +39,10 @@ if (released.get("schema") != "flexfactor-update-v1"
         or released.get("channel") != "stable"
         or released.get("status") != "active"):
     raise SystemExit("The public Android release manifest is not active stable v1")
-CLIENT_VERSION = str(released.get("version_name", ""))
+CLIENT_VERSION = str(released.get("versionName", ""))
 if CLIENT_VERSION != SOURCE_VERSION:
     raise SystemExit("The authorized source is not the published Android client")
-if released.get("source_revision") != os.environ["EXPECTED_SHA"]:
+if released.get("sourceRevision") != os.environ["EXPECTED_SHA"]:
     raise SystemExit("The public Android release does not identify the authorized source")
 HEADERS = {
     "Accept": "application/json, application/zip",

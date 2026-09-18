@@ -92,7 +92,7 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
                  "mobile_cloud_live_proof.py").read_text(encoding="utf-8")
         self.assertIn('Path("android/app/build.gradle.kts")', proof)
         self.assertIn('releases/latest/download/', proof)
-        self.assertIn('released.get("source_revision") != os.environ["EXPECTED_SHA"]', proof)
+        self.assertIn('released.get("sourceRevision") != os.environ["EXPECTED_SHA"]', proof)
         self.assertIn('CLIENT_VERSION != SOURCE_VERSION', proof)
         self.assertIn('"X-FlexFactor-Client-Version": CLIENT_VERSION', proof)
         self.assertIn('"client_version": CLIENT_VERSION', proof)
