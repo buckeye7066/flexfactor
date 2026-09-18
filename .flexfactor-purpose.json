@@ -307,8 +307,8 @@
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "efbe7e39a2ab710d83b78398825bdb3ccb7f6cc13e2802ffd74c5529128a9c00",
-      "observed_at": "2026-09-18T21:40:29.903057+00:00",
+      "content_hash": "5b2adbd4d8c1e46b0ac9820954985c84dcaddd16507c0066ceb69ecfe7629642",
+      "observed_at": "2026-09-18T21:53:22.653150+00:00",
       "excerpt": "Subscription-first ladder and author exclusion."
     },
     {

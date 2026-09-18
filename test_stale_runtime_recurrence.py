@@ -129,9 +129,13 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
                 backend.complete.side_effect = complete
                 return backend
             provider = rotation.RotatingProvider(rotation.Rotator(rotation.Catalog(routes),
-                store=rotation.StateStore(os.path.join(root,"state.json"))), factory,tier=rotation.STRONG)
+                store=rotation.StateStore(os.path.join(root,"state.json"))), factory,tier=rotation.STRONG,allow_paid=True,paid_first=True)
             self.assertEqual(provider.complete("coding task"), "verified MAI response")
             self.assertEqual(visited,["gpt-5.6-luna","mai-code-1.1-flash"])
+            # Exclusion is per request, not global model-health state.
+            self.assertEqual(provider.complete("another coding task"), "verified MAI response")
+            self.assertEqual(visited, ["gpt-5.6-luna", "mai-code-1.1-flash"] * 2)
+
 
 
     def test_current_queue_preflight_resolves_targets_before_work_when_dashboard_active(self):

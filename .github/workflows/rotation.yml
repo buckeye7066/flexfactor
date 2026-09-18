@@ -198,7 +198,7 @@ jobs:
               if route.api == "copilot-cli" and route.model in {"gpt-5.6-luna","mai-code-1.1-flash"}]
           with tempfile.TemporaryDirectory() as directory:
               provider = rotation.RotatingProvider(rotation.Rotator(rotation.Catalog(routes),
-                  store=rotation.StateStore(str(Path(directory)/"rotation.json"))), make_cli_provider, tier=rotation.STRONG)
+                  store=rotation.StateStore(str(Path(directory)/"rotation.json"))), make_cli_provider, tier=rotation.STRONG, allow_paid=True, paid_first=True)
               result = provider.structured("Return only the requested JSON.",
                   "Set answer to OK. Do not use tools.",
                   {"type":"object","properties":{"answer":{"type":"string"}},

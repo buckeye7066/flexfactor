@@ -734,7 +734,8 @@ class Rotator:
                    pin: Optional[str] = None, pin_strict: bool = True,
                    now: Optional[float] = None,
                    intent: Optional[CallIntent] = None,
-                   paid_first: bool = False) -> Selection:
+                   paid_first: bool = False,
+                   excluded_route_ids: Optional[frozenset[str]] = None) -> Selection:
         """Choose the next route, and stamp the choice in the same breath.
 
         Read, select and stamp happen inside ONE held lock. Splitting them --
@@ -745,6 +746,7 @@ class Rotator:
         """
         now = time.time() if now is None else now
         requested = tier if tier in TIER_CHAIN else LIGHT
+        excluded_route_ids = frozenset(excluded_route_ids or ())
         if intent is not None and intent.avoid_families:
             permitted_tiers = set(TIER_CHAIN[TIER_CHAIN.index(requested):])
             excluded = set(intent.avoid_families) | set(_OPAQUE_MODEL_FAMILIES)
@@ -779,7 +781,7 @@ class Rotator:
             if resolved_pin:
                 outcome["selection"] = self._resolve_pin(
                     resolved_pin, state, now, pin_strict, tier, allow_paid,
-                    reasons, intent)
+                    reasons, intent, excluded_route_ids)
                 if outcome.get("selection") is not None:
                     self._stamp(state, outcome["selection"], now)
                 return
@@ -796,7 +798,8 @@ class Rotator:
                     selection = self._pick_in_tier(
                         candidate_tier, allow_paid, state, now, reasons, intent,
                         paid_first=paid_first,
-                        paid_capacity=paid_capacity, cost_class=cost_class)
+                        paid_capacity=paid_capacity, cost_class=cost_class,
+                        excluded_route_ids=excluded_route_ids)
                     if selection is None:
                         continue
                     selection.requested_tier = requested
@@ -852,7 +855,8 @@ class Rotator:
     def _resolve_pin(self, pin: str, state: Dict[str, Any], now: float,
                      strict: bool, tier: str, allow_paid: bool,
                      reasons: Dict[str, str],
-                     intent: Optional[CallIntent] = None) -> Optional[Selection]:
+                     intent: Optional[CallIntent] = None,
+                     excluded_route_ids: frozenset[str] = frozenset()) -> Optional[Selection]:
         """Runs INSIDE the state lock, so it must never call back into
         next_route -- that would re-enter the lock and deadlock. The non-strict
         fallback therefore inlines a tier walk instead of recursing."""
@@ -869,7 +873,7 @@ class Rotator:
         # the pin can come from the SHARED state file (another app's "global"
         # pin), so honoring it blind here let a $0 call silently go paid and
         # re-selected an exhausted daily allowance on every call.
-        usable = [r for r in matches if r.enabled
+        usable = [r for r in matches if r.enabled and r.id not in excluded_route_ids
                   and (allow_paid or r.is_free)
                   and not (intent is not None and intent.avoid_families
                            and route_model_family(r) in (
@@ -907,7 +911,8 @@ class Rotator:
             start = TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT)
             for candidate_tier in TIER_CHAIN[start:]:
                 fallback = self._pick_in_tier(
-                    candidate_tier, allow_paid, state, now, reasons, intent)
+                    candidate_tier, allow_paid, state, now, reasons, intent,
+                    excluded_route_ids=excluded_route_ids)
                 if fallback is not None:
                     fallback.catalog_stale = self.catalog.is_stale
                     return fallback
@@ -924,9 +929,12 @@ class Rotator:
                       intent: Optional[CallIntent] = None,
                       paid_first: bool = False,
                       paid_capacity: Optional[bool] = None,
-                      cost_class: Optional[str] = None) -> Optional[Selection]:
+                      cost_class: Optional[str] = None,
+                      excluded_route_ids: frozenset[str] = frozenset()) -> Optional[Selection]:
         candidates: List[Route] = []
         for route in self.catalog.routes:
+            if route.id in excluded_route_ids:
+                continue
             if route.tier != tier:
                 continue
             if cost_class is not None and route.cost_class != cost_class:
@@ -1705,12 +1713,15 @@ class RotatingProvider:
         # Call-local on purpose: another call's bytes may be answered fine.
         refused_families: set = set()
         refused_route_ids: set = set()
+        selection_exclusions: set = set()
         attempt = 0
         while attempt < attempts:
             attempt += 1
             # Only name the optional kwargs when they apply: test doubles and
             # older Rotator shapes take the original signature.
             extra: Dict[str, Any] = {}
+            if selection_exclusions:
+                extra["excluded_route_ids"] = frozenset(selection_exclusions)
             if intent is not None:
                 extra["intent"] = intent
             free_only_fallback = self._allow_paid and not allow_paid_for_call
@@ -1732,7 +1743,7 @@ class RotatingProvider:
                     # precise signature-drift message and only when optional
                     # policy metadata was supplied.
                     if (not extra or "unexpected keyword argument" not in str(exc)
-                            or self._paid_first
+                            or self._paid_first or selection_exclusions
                             or (intent is not None and intent.avoid_families)):
                         raise
                     selection = self.rotator.next_route(
@@ -1829,6 +1840,7 @@ class RotatingProvider:
                 if payload_fault or not _is_retryable(exc):
                     raise
                 if type(exc).__name__ == "CopilotModelSelectionError":
+                    selection_exclusions.add(route.id)
                     refused_route_ids.add(route.id)
                 if is_model_refusal(exc):
                     refused_route_ids.add(route.id)
