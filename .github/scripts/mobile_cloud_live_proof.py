@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -19,17 +20,26 @@ BASE = "https://flexfactor-cloud.vercel.app"
 TOKEN = os.environ["FLEXFACTOR_LIVE_PROOF_TOKEN"].strip()
 REPOSITORY = os.environ["TARGET_REPOSITORY"]
 REQUEST_ID = str(uuid.uuid4())
+ANDROID_BUILD = Path("android/app/build.gradle.kts")
+VERSION_MATCH = re.search(
+    r'^\s*versionName\s*=\s*"([^"]+)"',
+    ANDROID_BUILD.read_text(encoding="utf-8"),
+    re.MULTILINE,
+)
+if VERSION_MATCH is None:
+    raise SystemExit("Android versionName is missing from the authorized source")
+CLIENT_VERSION = VERSION_MATCH.group(1)
 HEADERS = {
     "Accept": "application/json, application/zip",
     "Authorization": f"Bearer {TOKEN}",
     "Content-Type": "application/json",
     "User-Agent": "FlexFactor-Mobile-Live-Proof",
-    "X-FlexFactor-Client-Version": "3.5.6",
+    "X-FlexFactor-Client-Version": CLIENT_VERSION,
 }
 
 proof = {
     "source_sha": os.environ["EXPECTED_SHA"],
-    "client_version": "3.5.6",
+    "client_version": CLIENT_VERSION,
     "target_repository": REPOSITORY,
     "request_id": REQUEST_ID,
     "stage": "initialized",
@@ -93,7 +103,7 @@ run_request = {
     "ref": "main",
     "file": "",
     "goal": "",
-    "guidance": "Live 3.5.6 acceptance proof; do not apply proposed changes.",
+    "guidance": f"Live {CLIENT_VERSION} acceptance proof; do not apply proposed changes.",
     "scout_apply": False,
     "max_cost": 1,
     "threshold": 90,
