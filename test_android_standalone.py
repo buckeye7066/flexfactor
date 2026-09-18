@@ -87,6 +87,17 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
         self.assertIn("repository: buckeye7066/flexfactor", engine)
         self.assertIn(f"ref: android-v{_android_version_name()}", engine)
 
+    def test_live_journey_reports_the_version_it_actually_exercises(self):
+        proof = (ROOT / ".github" / "scripts" /
+                 "mobile_cloud_live_proof.py").read_text(encoding="utf-8")
+        self.assertIn('Path("android/app/build.gradle.kts")', proof)
+        self.assertIn('releases/latest/download/', proof)
+        self.assertIn('released.get("sourceRevision") != os.environ["EXPECTED_SHA"]', proof)
+        self.assertIn('CLIENT_VERSION != SOURCE_VERSION', proof)
+        self.assertIn('"X-FlexFactor-Client-Version": CLIENT_VERSION', proof)
+        self.assertIn('"client_version": CLIENT_VERSION', proof)
+        self.assertNotRegex(proof, r'Live 3\.\d+\.\d+ acceptance proof')
+
 
 class ManagedAndroidInvariants(unittest.TestCase):
     def test_launcher_declares_no_termux_runtime_permission(self):
