@@ -542,6 +542,21 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertNotIn("startUpdate();", launch)
         self.assertIn("void check(CheckCallback callback)", updater)
 
+class MobileFailureDiagnosticTests(unittest.TestCase):
+    def test_mobile_workflow_bounds_and_redacts_failure_diagnostics(self):
+        workflow = (ROOT / ".github" / "workflows" / "mobile-run.yml").read_text(
+            encoding="utf-8")
+        diagnostic = workflow.split(
+            "- name: Emit bounded redacted failure diagnostics", 1)[1].split(
+                "- name: Write the phone-readable run summary", 1)[0]
+        self.assertIn("if: failure()", diagnostic)
+        self.assertIn("maximum = 64 * 1024", diagnostic)
+        self.assertIn("stream.seek(max(0, stream.tell() - maximum))", diagnostic)
+        self.assertIn("from flexfactor_egress import redact_text", diagnostic)
+        self.assertIn("[-24:]", diagnostic)
+        self.assertIn("publication_reason", diagnostic)
+        self.assertNotIn("read_bytes()", diagnostic)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
