@@ -440,7 +440,37 @@ jobs:
       - name: Emit bounded redacted failure diagnostics
         if: failure()
         shell: bash
-        run: python engine/.github/scripts/redact_mobile_diagnostics.py mobile-run.log
+        run: |
+          python - mobile-run.log mobile-result.json <<'PY'
+          import json, pathlib, sys
+
+          sys.path.insert(0, str(pathlib.Path("engine").resolve()))
+          from flexfactor_egress import redact_text
+
+          maximum = 64 * 1024
+          source = pathlib.Path(sys.argv[1])
+          if source.is_file():
+              with source.open("rb") as stream:
+                  stream.seek(0, 2)
+                  stream.seek(max(0, stream.tell() - maximum))
+                  raw = stream.read(maximum)
+              clean, _ = redact_text(raw.decode("utf-8", "replace"))
+              lines = [" ".join(line.strip().split())[:240]
+                       for line in clean.splitlines() if line.strip()][-24:]
+          else:
+              lines = ["Execution failed before a bounded log was created."]
+          result = pathlib.Path(sys.argv[2])
+          if result.is_file():
+              value = json.loads(result.read_text(encoding="utf-8"))
+              # These fields are workflow-authored values, never target output.
+              lines.append("result: exit_code=%r; publication_required=%r; "
+                           "publication_complete=%r; publication_reason=%r" % (
+                               value.get("exit_code"), value.get("publication_required"),
+                               value.get("publication_complete"),
+                               value.get("publication_reason")))
+          detail = " | ".join(lines).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=FlexFactor bounded failure::{detail}")
+          PY
 
       - name: Write the phone-readable run summary
         if: always()

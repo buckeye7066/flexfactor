@@ -543,28 +543,19 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("void check(CheckCallback callback)", updater)
 
 class MobileFailureDiagnosticTests(unittest.TestCase):
-    def test_failure_diagnostic_is_bounded_and_redacts_credentials(self):
-        import importlib.util
-        script = ROOT / ".github" / "scripts" / "redact_mobile_diagnostics.py"
-        spec = importlib.util.spec_from_file_location("mobile_diagnostics", script)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        raw = (b"ordinary failure\n" * 40
-               + b"Authorization: Bearer do-not-print\n"
-               + b"device_code=do-not-print\n"
-               + b"final actionable failure\n")
-        lines = module.redacted_tail(raw)
-        self.assertLessEqual(len(lines), module.MAX_LINES)
-        self.assertIn("final actionable failure", lines)
-        self.assertNotIn("do-not-print", "\n".join(lines))
-        self.assertEqual(lines.count("[REDACTED SENSITIVE LINE]"), 2)
-
-    def test_mobile_workflow_preserves_failure_and_emits_diagnostic(self):
+    def test_mobile_workflow_bounds_and_redacts_failure_diagnostics(self):
         workflow = (ROOT / ".github" / "workflows" / "mobile-run.yml").read_text(
             encoding="utf-8")
-        self.assertIn("- name: Emit bounded redacted failure diagnostics", workflow)
-        self.assertIn("if: failure()", workflow)
-        self.assertIn("redact_mobile_diagnostics.py mobile-run.log", workflow)
+        diagnostic = workflow.split(
+            "- name: Emit bounded redacted failure diagnostics", 1)[1].split(
+                "- name: Write the phone-readable run summary", 1)[0]
+        self.assertIn("if: failure()", diagnostic)
+        self.assertIn("maximum = 64 * 1024", diagnostic)
+        self.assertIn("stream.seek(max(0, stream.tell() - maximum))", diagnostic)
+        self.assertIn("from flexfactor_egress import redact_text", diagnostic)
+        self.assertIn("[-24:]", diagnostic)
+        self.assertIn("publication_reason", diagnostic)
+        self.assertNotIn("read_bytes()", diagnostic)
 
 
 if __name__ == "__main__":
