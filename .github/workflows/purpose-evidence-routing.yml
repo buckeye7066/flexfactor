@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'flexfactor.py'
+      - '.flexfactor-purpose.json'
       - 'flexfactor_purpose.py'
       - 'flexfactor_rotation.py'
       - 'test_purpose_evidence_routing.py'
@@ -13,6 +14,7 @@ on:
     branches: [main]
     paths:
       - 'flexfactor.py'
+      - '.flexfactor-purpose.json'
       - 'flexfactor_purpose.py'
       - 'flexfactor_rotation.py'
       - 'test_purpose_evidence_routing.py'
@@ -42,6 +44,6 @@ jobs:
         with:
           python-version: '3.12'
       - name: Validate exact evidence within provider routing
-        run: python -m unittest -v test_purpose_evidence_routing
+        run: python -m unittest -v test_purpose_evidence_routing test_stale_runtime_recurrence flexfactor_tests.PurposeContractTests.test_repos_own_contract_file_is_readable_end_to_end
       - name: Compile changed Python surfaces
         run: python -m py_compile flexfactor.py test_purpose_evidence_routing.py
