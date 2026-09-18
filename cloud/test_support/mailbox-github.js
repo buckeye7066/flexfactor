@@ -22,7 +22,7 @@ export function withMailboxGithub(fallback, options = {}) {
     const internalClaim = method === 'PATCH' && body?.value
       && (() => { try { const c = JSON.parse(body.value); return c.steering && c.state !== 'dispatched'; } catch { return false; } })();
     if (internalSecret || mailboxPath || internalClaim
-        || (state.active && (path === '/user' || path.endsWith('/actions/secrets/public-key')))) {
+        || ((state.active || state.releases.size) && path === '/user') || (state.active && path.endsWith('/actions/secrets/public-key'))) {
       state.mailboxCalls.push(call);
     } else {
       const response = await fallback(url, request);
@@ -54,7 +54,7 @@ export function withMailboxGithub(fallback, options = {}) {
       if (!release) return reply(404, {});
       if (!match[2] && method === 'GET') return reply(200, release);
       if (!match[2] && method === 'DELETE') { state.releases.delete(release.id); return reply(204); }
-      if (match[2] && method === 'GET') return reply(200, release.assets.map(({ data, ...asset }) => asset));
+      if (match[2] && method === 'GET') return reply(200, release.assets.slice(0, 100).map(({ data, ...asset }) => asset));
       if (match[2] && method === 'POST') {
         const asset = { id: ++state.nextAsset, name: parsed.searchParams.get('name'),
           size: Buffer.byteLength(request.body), uploader: { id: 7 }, data: body };

@@ -72,7 +72,7 @@ export async function pollOnce(config, fetchImpl = fetch, submit = submitToEngin
   const bytes = await apiRead(config, `${prefix}/${config.release_id}/assets?per_page=100`,
     512 * 1024, fetchImpl);
   const assets = bytes && JSON.parse(bytes);
-  if (!Array.isArray(assets) || assets.length >= MAX_MAILBOX_ASSETS)
+  if (!Array.isArray(assets) || assets.length > MAX_MAILBOX_ASSETS)
     throw new Error('Steering mailbox exceeds its asset limit');
   const delivered = [];
   for (const asset of assets) {
@@ -92,17 +92,26 @@ export async function pollOnce(config, fetchImpl = fetch, submit = submitToEngin
   }
   return delivered;
 }
+async function stdinKey() {
+  if ('STEERING_PRIVATE_KEY' in process.env) throw new Error('Environment key transport is forbidden');
+  let text='';
+  for await (const chunk of process.stdin) {
+    text+=chunk.toString('utf8');
+    if(Buffer.byteLength(text)>45) throw new Error('Invalid steering handoff size');
+  }
+  if(!/^[A-Za-z0-9+/]{43}=\n?$/.test(text)) throw new Error('Invalid steering handoff');
+  return text.trim();
+}
 async function main() {
   const { steeringPublicKey } = await import('../../cloud/lib/steering-mailbox.js');
   const config = {
-    token: process.env.GH_TOKEN, privateKey: process.env.STEERING_PRIVATE_KEY,
+    token: process.env.GH_TOKEN, privateKey: await stdinKey(),
     request_id: process.env.REQUEST_ID, repository: process.env.TARGET_REPOSITORY,
     release_id: Number(process.env.STEERING_RELEASE_ID), author_id: Number(process.env.GITHUB_ACTOR_ID),
     engineRoot: resolve(dirname(fileURLToPath(import.meta.url)), '../..'),
     targetPath: resolve('target'),
   };
   config.public_key = await steeringPublicKey(config.privateKey);
-  delete process.env.STEERING_PRIVATE_KEY;
   if (!config.token || !Number.isSafeInteger(config.release_id) || config.release_id <= 0
       || !Number.isSafeInteger(config.author_id) || config.author_id <= 0)
     throw new Error('Required private steering identity is unavailable');

@@ -406,13 +406,12 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("submitSteering", api)
         service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
         self.assertIn("ownedSteeringMailbox", service)
-        self.assertIn("node engine/.github/scripts/mobile_steering_poll.mjs", workflow)
+        self.assertIn("node engine/.github/scripts/mobile_steering_launch.mjs", workflow)
         self.assertNotIn("/actions/variables/", workflow)
         reader = (ROOT / ".github" / "scripts" / "mobile_steering_poll.mjs").read_text(encoding="utf-8")
         self.assertIn("submit_session_routing", reader)
         self.assertIn("source='android'", reader)
-        self.assertLess(workflow.index("unset STEERING_PRIVATE_KEY"),
-                        workflow.index("python engine/flexfactor.py"))
+        self.assertNotIn("STEERING_PRIVATE_KEY:", workflow.split("- name: Run FlexFactor", 1)[1])
 
     def test_all_modes_support_a_durable_thirty_target_sequential_queue(self):
         activity = (ANDROID / "java" / "com" / "firer" / "console" /

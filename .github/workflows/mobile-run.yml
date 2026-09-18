@@ -312,12 +312,20 @@ jobs:
           printf 'GIT_ASKPASS=%s\n' "$askpass" >> "$GITHUB_ENV"
           printf 'GIT_TERMINAL_PROMPT=0\n' >> "$GITHUB_ENV"
 
+      - name: Initialize private steering before target execution
+        shell: bash
+        env:
+          STEERING_PRIVATE_KEY: ${{ secrets.STEERING_PRIVATE_KEY }}
+          STEERING_RELEASE_ID: ${{ inputs.steering_release_id }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          TARGET_REPOSITORY: ${{ inputs.target_repository }}
+        run: node engine/.github/scripts/mobile_steering_launch.mjs
+
       - name: Run FlexFactor
         id: flexfactor
         shell: bash
         env:
           MODE: ${{ inputs.mode }}
-          STEERING_PRIVATE_KEY: ${{ secrets.STEERING_PRIVATE_KEY }}
           STEERING_RELEASE_ID: ${{ inputs.steering_release_id }}
           TARGET_FILE: ${{ inputs.file }}
           TARGET_GOAL: ${{ inputs.goal }}
@@ -334,20 +342,9 @@ jobs:
           before="$(git -C target rev-parse HEAD)"
           printf '%s\n' "$before" > mobile-before.txt
           rc=0
-          rm -f mobile-steering-ready
-          node engine/.github/scripts/mobile_steering_poll.mjs &
-          steering_pid=$!
+          steering_pid="$(cat mobile-steering.pid)"
           trap 'kill "$steering_pid" 2>/dev/null || true' EXIT
-          unset STEERING_PRIVATE_KEY
-          for attempt in {1..60}; do
-            [ -f mobile-steering-ready ] && break
-            kill -0 "$steering_pid" 2>/dev/null || break
-            sleep 1
-          done
-          if [ ! -f mobile-steering-ready ]; then
-            echo "Private run steering did not initialize; execution was not started." >&2
-            exit 1
-          fi
+          test -f mobile-steering-ready && kill -0 "$steering_pid" 2>/dev/null || exit 1
           if [ "$MODE" = refactor ]; then
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
             git -C target switch -c "$branch" || rc=$?

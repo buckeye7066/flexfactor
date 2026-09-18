@@ -1233,16 +1233,31 @@ async function deleteOwnedSteeringMailbox(token, request, steering, fetchImpl) {
   const release = await ownedSteeringMailbox(token, request, steering, fetchImpl);
   if (!release) return;
   const identity = mailboxIdentity(steering, request);
-  const assets = await githubJson(token, 'GET',
-    `/repos/${request.repository}/releases/${identity.release_id}/assets?per_page=100`, undefined, fetchImpl);
-  if (!Array.isArray(assets) || assets.length >= MAX_MAILBOX_ASSETS)
-    throw new ServiceError(409, 'steering_cleanup_failed', 'Mailbox asset ownership could not be bounded.');
-  try { assets.forEach((asset) => assertMailboxAsset(asset, identity)); }
-  catch { throw new ServiceError(409, 'steering_cleanup_failed', 'Unrecognized mailbox content was preserved.'); }
-  const removed = await githubRaw(token, 'DELETE',
-    `/repos/${request.repository}/releases/${identity.release_id}`, undefined, fetchImpl);
-  if (![204, 404].includes(removed.status))
-    throw new ServiceError(502, 'steering_cleanup_failed', safeGitHubError(removed));
+  // Capacity admission is advisory under concurrency. Drain bounded pages,
+  // keeping the cleanup claim until the parent is proven empty. A full page
+  // is work to perform, never a permanently unremovable mailbox.
+  for (let page = 0; page < 10; page += 1) {
+    const assets = await githubJson(token, 'GET',
+      `/repos/${request.repository}/releases/${identity.release_id}/assets?per_page=100`, undefined, fetchImpl);
+    if (!Array.isArray(assets) || assets.length > MAX_MAILBOX_ASSETS)
+      throw new ServiceError(409, 'steering_cleanup_failed', 'Invalid mailbox asset page.');
+    try { assets.forEach((asset) => assertMailboxAsset(asset, identity)); }
+    catch { throw new ServiceError(409, 'steering_cleanup_failed', 'Unrecognized mailbox content was preserved.'); }
+    if (!assets.length) {
+      const removed = await githubRaw(token, 'DELETE',
+        `/repos/${request.repository}/releases/${identity.release_id}`, undefined, fetchImpl);
+      if (![204, 404].includes(removed.status))
+        throw new ServiceError(502, 'steering_cleanup_failed', safeGitHubError(removed));
+      return;
+    }
+    for (const asset of assets) {
+      const removed = await githubRaw(token, 'DELETE',
+        `/repos/${request.repository}/releases/assets/${asset.id}`, undefined, fetchImpl);
+      if (![204, 404].includes(removed.status))
+        throw new ServiceError(502, 'steering_cleanup_failed', safeGitHubError(removed));
+    }
+  }
+  throw new ServiceError(409, 'steering_cleanup_incomplete', 'Bounded cleanup made progress; retry the terminal status.');
 }
 async function persistRequestClaim(token, request, claim, fetchImpl) {
   await githubJson(token, 'PATCH',
@@ -1272,6 +1287,9 @@ async function initializeSteeringMailbox(token, run, claim, fetchImpl) {
   await persistRequestClaim(token, run, claim, fetchImpl);
 }
 async function uploadSteeringMessage(token, request, steering, comment, fetchImpl) {
+  const owner = await githubJson(token, 'GET', '/user', undefined, fetchImpl);
+  if (owner?.id !== steering.author_id)
+    throw new ServiceError(403, 'steering_owner_mismatch', 'Only the original run owner can send steering.');
   const release = await ownedSteeringMailbox(token, request, steering, fetchImpl);
   if (!release) throw new ServiceError(409, 'steering_mailbox_missing', 'The run steering mailbox is unavailable.');
   const assets = await githubJson(token, 'GET',

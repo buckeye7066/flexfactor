@@ -237,7 +237,8 @@ test("failed postwrite steering cleanup remains visible and can be retried by te
     () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "A late instruction.", github.fetch),
     (error) => error instanceof ServiceError && error.status >= 500,
   );
-  assert.equal(github.hasSteering(), true);
+  assert.equal(github.mailbox.releases.size, 1);
+  assert.equal(github.hasSteering(), false, "owned messages drain before parent cleanup is retried");
   assert.equal(github.variables.has(CLAIM_NAME), true);
   assert.equal(github.mailbox.allCalls.some((call) =>
     call.method === "DELETE" && call.path.endsWith(`/${CLAIM_NAME}`)), false);

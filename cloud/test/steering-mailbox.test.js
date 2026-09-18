@@ -13,7 +13,7 @@ const repository = 'owner/disposable';
 test('job steering never asks its job token to read repository variables', () => {
   const workflow = readFileSync(new URL('../../.github/workflows/mobile-run.yml', import.meta.url), 'utf8');
   assert.doesNotMatch(workflow, /\/actions\/variables\//);
-  assert.match(workflow, /mobile_steering_poll\.mjs/);
+  assert.match(workflow, /mobile_steering_launch\.mjs/);
 });
 
 test('steering is sealed for one request and tampering is rejected', async () => {

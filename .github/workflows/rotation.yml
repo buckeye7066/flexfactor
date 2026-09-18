@@ -9,6 +9,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      probe_copilot:
+        description: Run bounded live capability checks instead of the offline suite
+        type: boolean
+        default: false
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
@@ -16,6 +21,7 @@ concurrency:
 
 jobs:
   unit-tests:
+    if: github.event_name != 'workflow_dispatch' || !inputs.probe_copilot
     name: unit-tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -66,6 +72,7 @@ jobs:
           python test_live_cursor_aitime_proof.py
 
   integration-tests:
+    if: github.event_name != 'workflow_dispatch' || !inputs.probe_copilot
     name: offline-integration-tests
     runs-on: ubuntu-latest
     env:
@@ -130,6 +137,7 @@ jobs:
           PY
 
   lint:
+    if: github.event_name != 'workflow_dispatch' || !inputs.probe_copilot
     name: lint
     runs-on: ubuntu-latest
     steps:
@@ -152,3 +160,40 @@ jobs:
           python -m py_compile scripts/live_cursor_aitime_proof.py
           python -m py_compile test_flexfactor_capacity.py
           python -m py_compile test_live_cursor_aitime_proof.py
+
+  copilot-access:
+    if: github.event_name == 'workflow_dispatch' && inputs.probe_copilot && github.actor == github.repository_owner
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      copilot-requests: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+      - name: Install the production-pinned CLI
+        run: npm install --global @github/copilot@1.0.81 --no-audit --no-fund
+      - name: Prove concrete model access without files or tools
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import subprocess, json, os
+          successes = []
+          for model in ("claude-sonnet-4.6", "gpt-5.4", "claude-haiku-4.5"):
+              try:
+                  result = subprocess.run(["copilot", "-s", "--no-ask-user", "--no-auto-update",
+                      "--no-color", "--no-custom-instructions", "--available-tools=", "--model", model],
+                      input="Reply with exactly OK. Do not use tools.", text=True,
+                      capture_output=True, timeout=45)
+                  ok = result.returncode == 0 and result.stdout.strip() == "OK"
+                  blob = (result.stdout + result.stderr).lower()
+                  reason = "ok" if ok else "model unavailable" if "not available" in blob else "authentication or allowance" if any(x in blob for x in ("authentication", "unauthorized", "quota", "credit", "subscription")) else "CLI response did not pass"
+              except subprocess.TimeoutExpired:
+                  ok, reason = False, "bounded timeout"
+              print(json.dumps({"model":model,"passed":ok,"reason":reason}), flush=True)
+              if ok: successes.append(model)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write("Verified Copilot models: " + json.dumps(successes) + "\n")
+          if not successes: raise SystemExit("No configured Copilot model completed the bounded probe")

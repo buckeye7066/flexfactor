@@ -182,3 +182,26 @@ test('caller cannot inject an internal steering credential',async()=>{
   assert.equal(api.mailbox.releases.size,0);assert.equal(api.mailbox.secrets.size,0);
   assert.equal(api.dispatches,0);
 });
+
+test('concurrent capacity overflow remains drainable and terminal cleanup removes all pages',async(t)=>{
+  const api=await started(),config=readerConfig(api,testDirectory(t));
+  await submitSteering(OWNER_TOKEN,REQUEST.repository,REQUEST.request_id,'Original instruction',api.fetch);
+  const release=api.mailbox.releases.get(config.release_id), seed=structuredClone(release.assets[0]);
+  release.assets=Array.from({length:100},(_,i)=>({...seed,id:1000+i}));
+  const delivered=await pollOnce(config,jobReader(api),async()=>{});
+  assert.equal(delivered.length,100);assert.equal(release.assets.length,0);
+  release.assets=Array.from({length:205},(_,i)=>({...seed,id:2000+i}));
+  api.run.status='completed';api.run.conclusion='success';
+  await runStatus(OWNER_TOKEN,REQUEST.repository,99,REQUEST.request_id,api.fetch);
+  assert.equal(api.mailbox.releases.size,0);assert.equal(api.mailbox.secrets.size,0);
+  assert.equal(api.variables.size,0);
+});
+test('a different collaborator is rejected before any mailbox write',async()=>{
+  const api=await started();
+  api.mailbox.hook=async(call)=>call.path==='/user'?response(200,{id:8,login:'collaborator'}):undefined;
+  const offset=api.mailbox.allCalls.length;
+  await assert.rejects(submitSteering('collaborator-session',REQUEST.repository,
+    REQUEST.request_id,'Do not enqueue this',api.fetch),error=>error.code==='steering_owner_mismatch');
+  assert.ok(api.mailbox.allCalls.slice(offset).every(call=>call.method==='GET'));
+  assert.equal([...api.mailbox.releases.values()][0].assets.length,0);
+});
