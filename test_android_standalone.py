@@ -911,22 +911,52 @@ class MobileModeAcceptanceTests(unittest.TestCase):
         self.assertFalse(saves[-1]['result_validated'])
 
     def test_remaining_modes_have_serial_independent_job_budgets(self):
-        import yaml
-        workflow = yaml.safe_load((ROOT / '.github/workflows/mobile-cloud-live-proof.yml').read_text(encoding='utf-8'))
-        jobs = workflow['jobs']
+        import re
+        source = (ROOT / '.github/workflows/mobile-cloud-live-proof.yml').read_text(encoding='utf-8')
+        jobs = {match.group(1): match.group(2) for match in re.finditer(
+            r'^  ([a-z-]+):\n(.*?)(?=^  [a-z-]+:|\Z)', source.split('jobs:\n', 1)[1], re.M | re.S)}
         self.assertTrue({'remaining-refactor', 'remaining-audit', 'remaining-prodready'}.issubset(jobs))
+        shared = jobs['live-proof']
+        self.assertIn('steps: &acceptance_steps', shared)
+        self.assertIn('Authorize the exact main revision and triggering owner', shared)
+        self.assertIn('Upload redacted live proof', shared)
+        self.assertIn('${{ github.job }}', shared)
         for mode in ('refactor', 'audit', 'prodready'):
             job = jobs['remaining-' + mode]
-            self.assertEqual(job['timeout-minutes'], 360)
-            self.assertEqual(job['env']['MODE'], mode)
-            self.assertEqual(job['environment'], 'Production')
-            self.assertIn('remaining', job['if'])
-            self.assertTrue(any('Authorize the exact main' in step.get('name', '') for step in job['steps']))
-            upload = next(step for step in job['steps'] if step.get('name') == 'Upload redacted live proof')
-            self.assertIn('github.job', upload['with']['name'])
-        self.assertEqual(jobs['remaining-audit']['needs'], 'remaining-refactor')
-        self.assertEqual(jobs['remaining-prodready']['needs'], 'remaining-audit')
-        self.assertEqual(workflow['concurrency']['group'], 'flexfactor-cloud-production')
+            self.assertIn('timeout-minutes: 360', job)
+            self.assertIn('MODE: ' + mode, job)
+            self.assertIn('environment: Production', job)
+            self.assertIn("if: inputs.mode == 'remaining'", job)
+            self.assertIn('steps: *acceptance_steps', job)
+        self.assertIn('needs: remaining-refactor', jobs['remaining-audit'])
+        self.assertIn('needs: remaining-audit', jobs['remaining-prodready'])
+        self.assertIn('group: flexfactor-cloud-production', source)
+
+
+
+    def test_timeout_preserves_original_request_as_nonvalidated_evidence(self):
+        import json, os, subprocess, sys, tempfile, textwrap
+        from pathlib import Path
+        source = (ROOT / '.github/workflows/mobile-cloud-live-proof.yml').read_text(encoding='utf-8')
+        self.assertIn('timeout-minutes: 300', source)
+        start = source.split('      - name: Preserve incomplete acceptance evidence', 1)[1]
+        step = start.split('      - name: Upload redacted live proof', 1)[0]
+        self.assertIn("steps.exercise.outcome != 'success'", step)
+        code = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'mobile-cloud-live-proof.json'
+            original = {'request_id': 'original-request', 'run_id': 99, 'stage': 'steering-accepted'}
+            path.write_text(json.dumps(original), encoding='utf-8')
+            result = subprocess.run([sys.executable, '-c', code], cwd=directory,
+                                    env=dict(os.environ, STEP_OUTCOME='failure'),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            saved = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(saved['request_id'], original['request_id'])
+            self.assertEqual(saved['run_id'], 99)
+            self.assertFalse(saved['result_validated'])
+            self.assertEqual(saved['stage'], 'observation-incomplete')
+            self.assertEqual(saved['verification_step_outcome'], 'failure')
 
 
 if __name__ == "__main__":

@@ -54,7 +54,27 @@ jobs:
           fetch-tags: true
 
       - name: Exercise the released mobile control-plane path live
+        id: exercise
+        timeout-minutes: 300
         run: python .github/scripts/mobile_cloud_live_proof.py
+
+      - name: Preserve incomplete acceptance evidence
+        if: always() && steps.exercise.outcome != 'success'
+        shell: python
+        env:
+          STEP_OUTCOME: ${{ steps.exercise.outcome }}
+        run: |
+          import json, os, pathlib
+          path = pathlib.Path('mobile-cloud-live-proof.json')
+          try:
+              proof = json.loads(path.read_text(encoding='utf-8'))
+          except (OSError, ValueError):
+              proof = {}
+          if proof.get('stage') != 'validation-failed':
+              proof['stage'] = 'observation-incomplete'
+          proof['result_validated'] = False
+          proof['verification_step_outcome'] = os.environ['STEP_OUTCOME']
+          path.write_text(json.dumps(proof, indent=2) + '\n', encoding='utf-8')
 
       - name: Upload redacted live proof
         if: always()
