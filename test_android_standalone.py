@@ -44,6 +44,18 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
     pin and reusable-workflow pin to the Android release version.
     """
 
+    def test_documented_android_release_matches_apk_version(self):
+        version = _android_version_name()
+        for name, pattern in (
+            ("README.md", r"^Android (\d+\.\d+\.\d+) is a native phone interface"),
+            ("android/README.md", r"^# FlexFactor Mobile (\d+\.\d+\.\d+)$"),
+        ):
+            with self.subTest(document=name):
+                source = (ROOT / name).read_text(encoding="utf-8")
+                match = re.search(pattern, source, re.MULTILINE)
+                self.assertIsNotNone(match, f"{name} has no release identity")
+                self.assertEqual(match.group(1), version)
+
     def test_cloud_engine_ref_is_current_or_explicitly_staged_one_patch(self):
         source = (CLOUD / "lib" / "config.js").read_text(encoding="utf-8")
         match = re.search(r'ENGINE_REF = "(android-v[^"]+)"', source)
