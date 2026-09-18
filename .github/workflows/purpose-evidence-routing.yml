@@ -1,0 +1,47 @@
+name: Purpose evidence routing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'flexfactor.py'
+      - 'flexfactor_purpose.py'
+      - 'flexfactor_rotation.py'
+      - 'test_purpose_evidence_routing.py'
+      - '.github/workflows/purpose-evidence-routing.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'flexfactor.py'
+      - 'flexfactor_purpose.py'
+      - 'flexfactor_rotation.py'
+      - 'test_purpose_evidence_routing.py'
+      - '.github/workflows/purpose-evidence-routing.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: purpose-evidence-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evidence-regressions:
+    name: purpose-evidence (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Validate exact evidence within provider routing
+        run: python -m unittest -v test_purpose_evidence_routing
+      - name: Compile changed Python surfaces
+        run: python -m py_compile flexfactor.py test_purpose_evidence_routing.py
