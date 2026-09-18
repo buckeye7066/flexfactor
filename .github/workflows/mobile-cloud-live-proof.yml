@@ -42,6 +42,8 @@ jobs:
         with:
           ref: ${{ inputs.expected_sha }}
           persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Exercise the released mobile control-plane path live
         run: python .github/scripts/mobile_cloud_live_proof.py

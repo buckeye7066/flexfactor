@@ -15,6 +15,8 @@ import urllib.request
 import uuid
 import zipfile
 
+from mobile_release_identity import verify_release_identity, verify_cloud_health
+
 
 BASE = "https://flexfactor-cloud.vercel.app"
 TOKEN = os.environ["FLEXFACTOR_LIVE_PROOF_TOKEN"].strip()
@@ -42,8 +44,12 @@ if (released.get("schema") != "flexfactor-update-v1"
 CLIENT_VERSION = str(released.get("versionName", ""))
 if CLIENT_VERSION != SOURCE_VERSION:
     raise SystemExit("The authorized source is not the published Android client")
-if released.get("sourceRevision") != os.environ["EXPECTED_SHA"]:
-    raise SystemExit("The public Android release does not identify the authorized source")
+
+identity = verify_release_identity(
+    Path.cwd(), os.environ["EXPECTED_SHA"], released, SOURCE_VERSION)
+with urllib.request.urlopen(BASE + "/api/health", timeout=30) as response:
+    deployed_health = json.load(response)
+verify_cloud_health(deployed_health, identity)
 HEADERS = {
     "Accept": "application/json, application/zip",
     "Authorization": f"Bearer {TOKEN}",
@@ -53,7 +59,10 @@ HEADERS = {
 }
 
 proof = {
-    "source_sha": os.environ["EXPECTED_SHA"],
+    "source_sha": identity["release_source_sha"],
+    "verification_sha": identity["verification_sha"],
+    "cloud_version": identity["cloud_version"],
+    "engine_ref": identity["engine_ref"],
     "client_version": CLIENT_VERSION,
     "target_repository": REPOSITORY,
     "request_id": REQUEST_ID,

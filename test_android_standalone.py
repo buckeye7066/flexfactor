@@ -104,7 +104,7 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
                  "mobile_cloud_live_proof.py").read_text(encoding="utf-8")
         self.assertIn('Path("android/app/build.gradle.kts")', proof)
         self.assertIn('releases/latest/download/', proof)
-        self.assertIn('released.get("sourceRevision") != os.environ["EXPECTED_SHA"]', proof)
+        self.assertIn("verify_release_identity(", proof)
         self.assertIn('CLIENT_VERSION != SOURCE_VERSION', proof)
         self.assertIn('"X-FlexFactor-Client-Version": CLIENT_VERSION', proof)
         self.assertIn('"client_version": CLIENT_VERSION', proof)
@@ -568,6 +568,131 @@ class MobileFailureDiagnosticTests(unittest.TestCase):
         self.assertIn("[-24:]", diagnostic)
         self.assertIn("publication_reason", diagnostic)
         self.assertNotIn("read_bytes()", diagnostic)
+
+
+class MobileReleaseIdentityTests(unittest.TestCase):
+    """Exercise source binding with real local git history, not mocked refs."""
+
+    def setUp(self):
+        import importlib.util
+        import subprocess
+        import tempfile
+        self.process = subprocess
+        self.temporary = tempfile.TemporaryDirectory(prefix="ff-release-proof-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        module = ROOT / ".github" / "scripts" / "mobile_release_identity.py"
+        self.assertTrue(module.is_file(), "component-bound release verifier is required")
+        spec = importlib.util.spec_from_file_location("mobile_release_identity", module)
+        self.identity = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.identity)
+        self.git("init", "-q", "-b", "main")
+        self.write("android/app/build.gradle.kts", 'versionName = "3.5.8"\n')
+        self.write("cloud/lib/config.js", 'export const SERVICE_VERSION = "1.1.6";\nexport const ENGINE_REF = "android-v3.5.7";\n')
+        self.write("cloud/ENGINE_ROLLOUT_PENDING", "android-v3.5.8\n")
+        self.release = self.commit("signed Android source")
+        self.git("tag", "android-v3.5.8")
+        self.write("cloud/lib/config.js", 'export const SERVICE_VERSION = "1.1.7";\nexport const ENGINE_REF = "android-v3.5.8";\n')
+        (self.root / "cloud/ENGINE_ROLLOUT_PENDING").unlink()
+        self.head = self.commit("activate published engine")
+        self.manifest = {"schema": "flexfactor-update-v1", "channel": "stable",
+                         "status": "active", "versionName": "3.5.8",
+                         "sourceRevision": self.release}
+
+    def git(self, *args):
+        return self.process.check_output(
+            ["git", *args], cwd=self.root, text=True, stderr=self.process.STDOUT).strip()
+
+    def write(self, name, text):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def commit(self, message):
+        self.git("add", "--all")
+        self.git("-c", "user.name=Release proof tests", "-c",
+                 "user.email=release-proof@example.invalid", "commit", "-qm", message)
+        return self.git("rev-parse", "HEAD")
+
+    def verify(self, expected=None):
+        return self.identity.verify_release_identity(
+            self.root, expected or self.head, self.manifest, "3.5.8")
+
+    def test_cloud_rollout_keeps_exact_signed_release_binding(self):
+        result = self.verify()
+        self.assertEqual(result["release_source_sha"], self.release)
+        self.assertEqual(result["verification_sha"], self.head)
+        self.assertNotEqual(self.release, self.head)
+        self.assertEqual(result["engine_ref"], "android-v3.5.8")
+        self.assertEqual(result["cloud_version"], "1.1.7")
+
+    def test_whitespace_in_paths_cannot_create_a_cloud_exception(self):
+        self.write(" cloud/unreleased.py", "print('not cloud runtime')\n")
+        self.head = self.commit("unreleased path with leading whitespace")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_unreleased_engine_changes_block_the_proof(self):
+        self.write("flexfactor.py", "print('not released')\n")
+        self.head = self.commit("unreleased engine change")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_unreleased_android_changes_block_the_proof(self):
+        self.write("android/app/src/main/MainActivity.java", "// unreleased\n")
+        self.head = self.commit("unreleased Android change")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_unreleased_runner_changes_block_the_proof(self):
+        self.write(".github/workflows/mobile-run.yml", "name: unreleased\n")
+        self.head = self.commit("unreleased runner change")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_manifest_cannot_name_a_different_source_than_the_tag(self):
+        self.manifest["sourceRevision"] = self.head
+        with self.assertRaisesRegex(ValueError, "release tag"):
+            self.verify()
+
+    def test_checkout_must_be_the_authorized_main_revision(self):
+        with self.assertRaisesRegex(ValueError, "authorized"):
+            self.verify(expected=self.release)
+
+    def test_released_source_must_be_an_ancestor(self):
+        self.git("checkout", "--orphan", "unrelated")
+        self.head = self.commit("unrelated history with identical files")
+        with self.assertRaisesRegex(ValueError, "ancestor"):
+            self.verify()
+
+    def test_cloud_cannot_still_point_to_the_old_engine(self):
+        self.write("cloud/lib/config.js", 'export const SERVICE_VERSION = "1.1.7";\nexport const ENGINE_REF = "android-v3.5.7";\n')
+        self.head = self.commit("stale cloud engine")
+        with self.assertRaisesRegex(ValueError, "engine"):
+            self.verify()
+
+    def test_incomplete_rollout_blocks_live_verification(self):
+        self.write("cloud/ENGINE_ROLLOUT_PENDING", "android-v3.5.8\n")
+        self.head = self.commit("unfinished rollout")
+        with self.assertRaisesRegex(ValueError, "pending"):
+            self.verify()
+
+    def test_proof_maintenance_does_not_relabel_the_signed_release(self):
+        self.write(".github/scripts/mobile_cloud_live_proof.py", "# proof maintenance\n")
+        self.head = self.commit("proof maintenance only")
+        result = self.verify()
+        self.assertEqual(result["release_source_sha"], self.release)
+        self.assertEqual(result["verification_sha"], self.head)
+
+    def test_live_cloud_must_match_the_current_version_and_released_engine(self):
+        expected = self.verify()
+        health = {"ok": True, "oauth_device_configured": True,
+                  "version": "1.1.7", "engine_ref": "android-v3.5.8"}
+        self.identity.verify_cloud_health(health, expected)
+        for key, bad in (("ok", False), ("oauth_device_configured", False),
+                         ("version", "1.1.6"), ("engine_ref", "android-v3.5.7")):
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                self.identity.verify_cloud_health({**health, key: bad}, expected)
 
 
 if __name__ == "__main__":
