@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -19,17 +20,41 @@ BASE = "https://flexfactor-cloud.vercel.app"
 TOKEN = os.environ["FLEXFACTOR_LIVE_PROOF_TOKEN"].strip()
 REPOSITORY = os.environ["TARGET_REPOSITORY"]
 REQUEST_ID = str(uuid.uuid4())
+ANDROID_BUILD = Path("android/app/build.gradle.kts")
+VERSION_MATCH = re.search(
+    r'^\s*versionName\s*=\s*"([^"]+)"',
+    ANDROID_BUILD.read_text(encoding="utf-8"),
+    re.MULTILINE,
+)
+if VERSION_MATCH is None:
+    raise SystemExit("Android versionName is missing from the authorized source")
+SOURCE_VERSION = VERSION_MATCH.group(1)
+UPDATE_MANIFEST = (
+    "https://github.com/buckeye7066/flexfactor/releases/latest/download/"
+    "android-update.json"
+)
+with urllib.request.urlopen(UPDATE_MANIFEST, timeout=30) as response:
+    released = json.load(response)
+if (released.get("schema") != "flexfactor-update-v1"
+        or released.get("channel") != "stable"
+        or released.get("status") != "active"):
+    raise SystemExit("The public Android release manifest is not active stable v1")
+CLIENT_VERSION = str(released.get("versionName", ""))
+if CLIENT_VERSION != SOURCE_VERSION:
+    raise SystemExit("The authorized source is not the published Android client")
+if released.get("sourceRevision") != os.environ["EXPECTED_SHA"]:
+    raise SystemExit("The public Android release does not identify the authorized source")
 HEADERS = {
     "Accept": "application/json, application/zip",
     "Authorization": f"Bearer {TOKEN}",
     "Content-Type": "application/json",
     "User-Agent": "FlexFactor-Mobile-Live-Proof",
-    "X-FlexFactor-Client-Version": "3.5.6",
+    "X-FlexFactor-Client-Version": CLIENT_VERSION,
 }
 
 proof = {
     "source_sha": os.environ["EXPECTED_SHA"],
-    "client_version": "3.5.6",
+    "client_version": CLIENT_VERSION,
     "target_repository": REPOSITORY,
     "request_id": REQUEST_ID,
     "stage": "initialized",
@@ -93,7 +118,7 @@ run_request = {
     "ref": "main",
     "file": "",
     "goal": "",
-    "guidance": "Live 3.5.6 acceptance proof; do not apply proposed changes.",
+    "guidance": f"Live {CLIENT_VERSION} acceptance proof; do not apply proposed changes.",
     "scout_apply": False,
     "max_cost": 1,
     "threshold": 90,
