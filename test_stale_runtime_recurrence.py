@@ -100,6 +100,13 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
             self.assertEqual(provider.complete("Review the provided source"), "verified answer")
             self.assertEqual(visited[:2], [routes[0].id, routes[1].id])
 
+    def test_fresh_runner_uses_current_concrete_copilot_models(self):
+        routes = [r for r in ff._builtin_route_catalog(rotation) if r.api == "copilot-cli"]
+        models = {r.model for r in routes}
+        self.assertTrue({"claude-sonnet-5", "gpt-5.6-terra", "gpt-5.6-luna"}.issubset(models))
+        self.assertNotIn("auto", models)
+        self.assertTrue(all(r.model == r.wire_model for r in routes))
+
     def test_current_queue_preflight_resolves_targets_before_work_when_dashboard_active(self):
         source = inspect.getsource(ff.run_audit)
         self.assertIn("resolved_targets", source)

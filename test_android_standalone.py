@@ -191,7 +191,7 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("contents: write", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
         self.assertIn("secrets.ANTHROPIC_API_KEY", workflow)
-        self.assertIn("@github/copilot@1.0.81", workflow)
+        self.assertIn("@github/copilot@1.0.86", workflow)
         self.assertIn("qwen2.5-coder:7b", workflow)
         self.assertIn("deepseek-coder:6.7b", workflow)
         self.assertIn("ollama pull deepseek-coder:6.7b", workflow)
@@ -228,7 +228,8 @@ class ManagedAndroidInvariants(unittest.TestCase):
             '$rollout != "" and .engine_ref == $rollout', control_plane)
         self.assertIn(
             'declared_engine" != "$android_engine', control_plane)
-        self.assertIn("options: [auto]", workflow)
+        self.assertIn('if provider != "auto":', workflow)
+        self.assertIn("options: [auto]", (CLOUD / "lib/workflow.js").read_text(encoding="utf-8"))
         self.assertNotIn('--provider "$PROVIDER"', workflow)
         self.assertIn("publication_complete", workflow)
         self.assertIn("merge-base --is-ancestor", workflow)
@@ -394,6 +395,15 @@ class ManagedAndroidInvariants(unittest.TestCase):
             "private void refreshRunLabel", 1)[0]
         self.assertIn("record.matches(activeRequest)", polling)
         self.assertIn("record.matches(queue.activeRequest())", polling)
+
+    def test_managed_steering_and_owner_probe_preserve_their_security_boundaries(self):
+        workflow = (ROOT / ".github/workflows/mobile-run.yml").read_text(encoding="utf-8")
+        self.assertNotIn("  workflow_dispatch:", workflow)
+        self.assertIn("  workflow_call:", workflow)
+        self.assertIn("STEERING_PRIVATE_KEY: ${{ secrets.STEERING_PRIVATE_KEY }}", workflow)
+        probe = (ROOT / ".github/workflows/rotation.yml").read_text(encoding="utf-8")
+        self.assertIn("github.triggering_actor == github.repository_owner", probe)
+        self.assertIn("inputs.probe_copilot && 'live-probe' || 'ci'", probe)
 
     def test_active_audits_accept_authenticated_phone_steering(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /

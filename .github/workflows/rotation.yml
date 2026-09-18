@@ -169,6 +169,9 @@ jobs:
       contents: read
       copilot-requests: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
@@ -179,17 +182,15 @@ jobs:
           COPILOT_GITHUB_TOKEN: ${{ github.token }}
         shell: python
         run: |
-          import subprocess, json, os
-          result = subprocess.run(["copilot", "-s", "--no-ask-user", "--no-auto-update",
-              "--no-color", "--no-custom-instructions", "--available-tools=", "--model", "auto",
-              "--output-format", "json"], input='Reply with exactly {"answer":"OK"}. Do not use tools.',
-              text=True, capture_output=True, timeout=45)
-          emitted = 0
-          for line in result.stdout.splitlines():
-              try: event = json.loads(line)
-              except ValueError: continue
-              if event.get("type") in ("session.auto_mode_resolved", "model.call_start", "model.call_finished", "assistant.message", "result"):
-                  clean = json.dumps(event).replace(os.environ["COPILOT_GITHUB_TOKEN"], "[redacted]")
-                  print(clean[:6000], flush=True)
-                  emitted += 1
-          if result.returncode or emitted < 2: raise SystemExit("Verified model metadata was not returned")
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd()))
+          from providers.cli_provider import CliProvider
+          provider = CliProvider("copilot-cli", "gpt-5.6-luna", "copilot", timeout=90)
+          result = provider.structured("Return only the requested JSON.",
+              "Set answer to OK. Do not use tools.",
+              {"type":"object","properties":{"answer":{"type":"string"}},
+               "required":["answer"],"additionalProperties":False})
+          assert result == {"answer":"OK"}, "Actual adapter response did not match"
+          print(json.dumps({"adapter":"copilot-cli","model":provider.model,
+              "structured_response_verified":True,"explicit_or_identity_checked_auto":True}))
