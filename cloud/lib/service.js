@@ -7,6 +7,10 @@ import {
   WORKFLOW_PATH,
 } from "./config.js";
 import { mobileWorkflow } from "./workflow.js";
+import { generateSteeringKeyPair, sealPrivateKeyForGitHub, steeringSecretName,
+  validateMailboxClaim, mailboxIdentity, mailboxTag, draftMailboxPayload,
+  assertMailbox, assertMailboxAsset, sealSteering, MAX_ENVELOPE_BYTES,
+  MAX_MAILBOX_ASSETS } from "./steering-mailbox.js";
 
 const GITHUB_API = "https://api.github.com";
 const GITHUB_OAUTH = "https://github.com/login";
@@ -426,7 +430,8 @@ function requestSecretName(requestId, provider) {
 }
 
 function isRequestScopedSecretName(name, requestId) {
-  return [...ALLOWED_SECRETS].some((provider) => name === requestSecretName(requestId, provider));
+  return name === steeringSecretName(requestId)
+    || [...ALLOWED_SECRETS].some((provider) => name === requestSecretName(requestId, provider));
 }
 
 async function putRepositorySecret(token, request, name, value, fetchImpl) {
@@ -619,12 +624,14 @@ async function ensureTargetWorkflow(token, repository, branch, fetchImpl) {
     "github_request_failed", safeGitHubError(written));
 }
 
-function workflowInputs(request, providerSecretWrites) {
+function workflowInputs(request, providerSecretWrites, steering) {
   const cost = Number.isInteger(request.max_cost) ? String(request.max_cost) : String(request.max_cost);
   return {
     request_id: request.request_id,
     mode: request.mode,
     provider: "auto",
+    steering_release_id: String(steering.release_id),
+    steering_secret_name: steeringSecretName(request.request_id),
     openai_secret_name: providerSecretWrites.find((item) => item.provider === "OPENAI_API_KEY")?.name || "",
     anthropic_secret_name: providerSecretWrites.find((item) => item.provider === "ANTHROPIC_API_KEY")?.name || "",
     target_ref: request.ref,
@@ -668,6 +675,7 @@ function normalizeRequestClaim(value, request, label = "GitHub request claim") {
     run_id: Number(claim.run_id || 0),
     ephemeral_secrets: [...new Set(names)],
     created_at: typeof claim.created_at === "string" ? claim.created_at : "",
+    ...(claim.steering ? { steering: validateMailboxClaim(claim.steering, request.request_id, request.repository) } : {}),
   };
 }
 
@@ -722,8 +730,7 @@ async function markRequestDispatched(token, request, claim, runId, fetchImpl) {
   await githubJson(token, "PATCH",
     `/repos/${request.repository}/actions/variables/${name}`, {
       name,
-      value: requestClaimValue(
-        request, claim.ephemeral_secrets, "dispatched", runId, claim.created_at),
+      value: JSON.stringify({ ...claim, state: "dispatched", run_id: runId }),
     }, fetchImpl);
 }
 
@@ -740,7 +747,8 @@ function steeringVariableName(requestId) {
   return `FLEXFACTOR_STEERING_${requestId.replaceAll("-", "").slice(0, 16).toUpperCase()}`;
 }
 
-async function deleteSteering(token, request, fetchImpl) {
+async function deleteSteering(token, request, fetchImpl, steering = null) {
+  await deleteOwnedSteeringMailbox(token, request, steering, fetchImpl);
   const removed = await githubRaw(token, "DELETE",
     `/repos/${request.repository}/actions/variables/${steeringVariableName(request.request_id)}`,
     undefined, fetchImpl);
@@ -753,7 +761,7 @@ async function deleteSteering(token, request, fetchImpl) {
 async function deleteClaimResources(token, request, claim, fetchImpl) {
   // Keep the cleanup manifest until every dependent resource is gone. Each
   // delete accepts 404, so a partial failure is safe to retry on the next poll.
-  await deleteSteering(token, request, fetchImpl);
+  await deleteSteering(token, request, fetchImpl, claim?.steering);
   if (!claim) return false;
   for (const name of claim.ephemeral_secrets) {
     await deleteEphemeralSecret(token, request.repository, name, fetchImpl);
@@ -928,7 +936,17 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   // state: its saved target ref or caller workflow may have been deleted after
   // GitHub accepted the original dispatch but before the phone stored the ID.
   const priorClaim = await readRequestClaim(token, run, fetchImpl);
-  if (priorClaim) return recoverClaimedRequest(token, run, priorClaim, fetchImpl);
+  if (priorClaim) {
+    const age = Date.now() - parseInstant(priorClaim.created_at);
+    // A preparation lease outlives the cloud's five-minute invocation limit.
+    // Only a definitely pre-dispatch stale claim may be cleaned and retried.
+    if (priorClaim.run_id === 0 && ['preparing', 'ready'].includes(priorClaim.steering?.phase)
+        && age >= DISPATCH_PENDING_MS && parseInstant(priorClaim.created_at) > 0) {
+      const existing = await existingDispatchedRun(token, run, fetchImpl, priorClaim);
+      if (existing) return existing;
+      await deleteClaimResources(token, run, priorClaim, fetchImpl);
+    } else return recoverClaimedRequest(token, run, priorClaim, fetchImpl);
+  }
   const existingRun = await existingDispatchedRun(token, run, fetchImpl);
   if (existingRun) return existingRun;
   const metadata = await githubJson(token, "GET", `/repos/${run.repository}`, undefined, fetchImpl);
@@ -947,7 +965,7 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   // continues through its subscription and free/local routes.
   const suppliedWrites = await prepareProviderSecrets(encryptedSecrets);
   const providerSecretWrites = ephemeralProviderWrites(run, suppliedWrites);
-  const ephemeralNames = providerSecretWrites.map((item) => item.name);
+  const ephemeralNames = [...providerSecretWrites.map((item) => item.name), steeringSecretName(run.request_id)];
   const ownership = await claimRequest(token, run, ephemeralNames, fetchImpl);
   if (!ownership.owned) {
     return recoverClaimedRequest(token, run, ownership.claim, fetchImpl);
@@ -956,7 +974,10 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   try {
     const workflowChanged = await ensureTargetWorkflow(
       token, run.repository, workflowRef, fetchImpl);
+    await initializeSteeringMailbox(token, run, ownership.claim, fetchImpl);
     await applyProviderSecrets(token, run, providerSecretWrites, fetchImpl);
+    ownership.claim.steering.phase = 'dispatching';
+    await persistRequestClaim(token, run, ownership.claim, fetchImpl);
     const submittedAt = Date.now();
     const path = `/repos/${run.repository}/actions/workflows/${WORKFLOW_FILE}/dispatches`;
     let result;
@@ -964,7 +985,7 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
       dispatchAttempted = true;
       result = await githubRaw(token, "POST", path, {
         ref: workflowRef,
-        inputs: workflowInputs(run, providerSecretWrites),
+        inputs: workflowInputs(run, providerSecretWrites, ownership.claim.steering),
         return_run_details: true,
       }, fetchImpl);
       if (result.status >= 200 && result.status < 300) break;
@@ -1019,7 +1040,8 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
     // can recover but can never dispatch the UUID twice.
     // This invocation exclusively owns a pre-dispatch claim. No recovery path
     // releases it, so rollback cannot race a newer claim created by a retry.
-    if (!dispatchAttempted) await deleteClaimResources(token, run, ownership.claim, fetchImpl);
+    if (!dispatchAttempted && !ownership.claim.steeringCreationAmbiguous)
+      await deleteClaimResources(token, run, ownership.claim, fetchImpl);
     throw error;
   }
 }
@@ -1157,30 +1179,11 @@ export async function submitSteering(token, repository, requestId, comment, fetc
   const request = { repository, request_id: cleanRequestId };
   const before = await inspectSteeringRun(token, request, fetchImpl);
   if (!acceptsSteering(before)) throw inactiveSteeringError();
-  const name = steeringVariableName(cleanRequestId);
-  const path = `/repos/${repository}/actions/variables/${name}`;
-  const existing = await githubRaw(token, "GET", path, undefined, fetchImpl);
-  let comments = [];
-  if (existing.status === 200) {
-    const stored = parseJson(existing.body, "GitHub").value;
-    try { comments = JSON.parse(stored || "[]"); } catch { comments = []; }
-    if (!Array.isArray(comments)) comments = [];
-  } else if (existing.status !== 404) {
-    throw new ServiceError(existing.status >= 500 ? 502 : existing.status,
-      "github_request_failed", safeGitHubError(existing));
+  if (!before.claim?.steering || before.claim.steering.phase !== 'dispatching') {
+    throw new ServiceError(409, 'steering_upgrade_required',
+      'This older run has no readable private steering channel. Start a run with the updated engine.');
   }
-  comments.push({ id: crypto.randomUUID(), comment: value, created_at: new Date().toISOString() });
-  comments = comments.slice(-8);
-  const serialized = JSON.stringify(comments);
-  if (serialized.length > 40_000) {
-    throw new ServiceError(409, "steering_queue_full", "The active build's steering queue is full.");
-  }
-  const payload = { name, value: serialized };
-  if (existing.status === 200) {
-    await githubJson(token, "PATCH", path, payload, fetchImpl);
-  } else {
-    await githubJson(token, "POST", `/repos/${repository}/actions/variables`, payload, fetchImpl);
-  }
+  await uploadSteeringMessage(token, request, before.claim.steering, value, fetchImpl);
   // A terminal status poll may delete the claim while this write is in flight.
   // Remove a late write only on proven completion or an absent claim. Ambiguous
   // claims and failed inspection remain intact for a later authenticated retry.
@@ -1191,9 +1194,111 @@ export async function submitSteering(token, repository, requestId, comment, fetc
   }
   if (!acceptsSteering(after)) {
     if (!after.claim || after.run?.status === "completed") {
-      await deleteSteering(token, request, fetchImpl);
+      await deleteSteering(token, request, fetchImpl, before.claim.steering);
     }
     throw inactiveSteeringError();
   }
   return { accepted: true };
+}
+
+async function ownedSteeringMailbox(token, request, steering, fetchImpl) {
+  const identity = mailboxIdentity(steering, request);
+  const result = await githubRaw(token, 'GET',
+    `/repos/${request.repository}/releases/${identity.release_id}`, undefined, fetchImpl);
+  if (result.status === 404) return null;
+  if (result.status !== 200) throw new ServiceError(502, 'steering_mailbox_unavailable', safeGitHubError(result));
+  const release = parseJson(result.body, 'steering mailbox');
+  try { assertMailbox(release, identity); }
+  catch { throw new ServiceError(409, 'steering_mailbox_changed', 'The private steering mailbox identity changed.'); }
+  return release;
+}
+async function deleteOwnedSteeringMailbox(token, request, steering, fetchImpl) {
+  if (!steering) return;
+  if (!steering.release_id) {
+    // A timed-out draft creation may have succeeded. Locate only our exact
+    // request, public key and authenticated creator before releasing its claim.
+    for (let page = 1; page <= 10; page += 1) {
+      const rows = await githubJson(token, 'GET',
+        `/repos/${request.repository}/releases?per_page=100&page=${page}`, undefined, fetchImpl);
+      if (!Array.isArray(rows)) throw new ServiceError(502, 'steering_cleanup_failed', 'Invalid draft listing.');
+      for (const row of rows) {
+        if (row.tag_name !== mailboxTag(request.request_id)) continue;
+        const found = { ...steering, release_id: row.id };
+        await deleteOwnedSteeringMailbox(token, request, found, fetchImpl);
+      }
+      if (rows.length < 100) return;
+    }
+    throw new ServiceError(409, 'steering_cleanup_incomplete', 'The bounded draft search could not prove cleanup.');
+  }
+  const release = await ownedSteeringMailbox(token, request, steering, fetchImpl);
+  if (!release) return;
+  const identity = mailboxIdentity(steering, request);
+  const assets = await githubJson(token, 'GET',
+    `/repos/${request.repository}/releases/${identity.release_id}/assets?per_page=100`, undefined, fetchImpl);
+  if (!Array.isArray(assets) || assets.length >= MAX_MAILBOX_ASSETS)
+    throw new ServiceError(409, 'steering_cleanup_failed', 'Mailbox asset ownership could not be bounded.');
+  try { assets.forEach((asset) => assertMailboxAsset(asset, identity)); }
+  catch { throw new ServiceError(409, 'steering_cleanup_failed', 'Unrecognized mailbox content was preserved.'); }
+  const removed = await githubRaw(token, 'DELETE',
+    `/repos/${request.repository}/releases/${identity.release_id}`, undefined, fetchImpl);
+  if (![204, 404].includes(removed.status))
+    throw new ServiceError(502, 'steering_cleanup_failed', safeGitHubError(removed));
+}
+async function persistRequestClaim(token, request, claim, fetchImpl) {
+  await githubJson(token, 'PATCH',
+    `/repos/${request.repository}/actions/variables/${requestVariableName(request.request_id)}`, {
+      name: requestVariableName(request.request_id), value: JSON.stringify(claim),
+    }, fetchImpl);
+}
+async function initializeSteeringMailbox(token, run, claim, fetchImpl) {
+  const owner = await githubJson(token, 'GET', '/user', undefined, fetchImpl);
+  if (!Number.isSafeInteger(owner.id) || owner.id <= 0)
+    throw new ServiceError(502, 'steering_identity_unavailable', 'GitHub did not identify the request owner.');
+  const pair = await generateSteeringKeyPair();
+  claim.steering = { schema: 1, phase: 'preparing', release_id: 0,
+    public_key: pair.public_key, author_id: owner.id };
+  await persistRequestClaim(token, run, claim, fetchImpl);
+  const repositoryKey = await providerPublicKey(token, run.repository, fetchImpl);
+  const sealed = await sealPrivateKeyForGitHub(pair.private_key, repositoryKey);
+  pair.private_key = '';
+  await putRepositorySecret(token, run, steeringSecretName(run.request_id), sealed, fetchImpl);
+  claim.steeringCreationAmbiguous = true;
+  const release = await githubJson(token, 'POST', `/repos/${run.repository}/releases`,
+    draftMailboxPayload(run, claim.steering), fetchImpl);
+  claim.steering.release_id = release.id;
+  assertMailbox(release, mailboxIdentity(claim.steering, run));
+  claim.steering.phase = 'ready';
+  delete claim.steeringCreationAmbiguous;
+  await persistRequestClaim(token, run, claim, fetchImpl);
+}
+async function uploadSteeringMessage(token, request, steering, comment, fetchImpl) {
+  const release = await ownedSteeringMailbox(token, request, steering, fetchImpl);
+  if (!release) throw new ServiceError(409, 'steering_mailbox_missing', 'The run steering mailbox is unavailable.');
+  const assets = await githubJson(token, 'GET',
+    `/repos/${request.repository}/releases/${release.id}/assets?per_page=100`, undefined, fetchImpl);
+  if (!Array.isArray(assets) || assets.length >= MAX_MAILBOX_ASSETS - 1)
+    throw new ServiceError(409, 'steering_queue_full', 'The private steering mailbox is full.');
+  const box = await sealSteering(steering.public_key, request.request_id, request.repository, comment);
+  const name = `steering-${crypto.randomUUID()}.json`;
+  const body = JSON.stringify(box);
+  const uploaded = await requestUpload(token, request.repository, release.id, name, body, fetchImpl);
+  assertMailboxAsset(uploaded, mailboxIdentity(steering, request));
+  return uploaded;
+}
+async function requestUpload(token, repository, releaseId, name, body, fetchImpl) {
+  if (!REPOSITORY.test(repository) || !Number.isSafeInteger(releaseId) || releaseId <= 0
+      || !/^steering-[0-9a-f-]{36}\.json$/.test(name)
+      || Buffer.byteLength(body) > MAX_ENVELOPE_BYTES)
+    throw new ServiceError(400, 'invalid_steering_upload', 'The encrypted message is invalid.');
+  const result = await request(fetchImpl,
+    `https://uploads.github.com/repos/${repository}/releases/${releaseId}/assets?name=${encode(name)}`, {
+      method: 'POST', redirect: 'error', body,
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json',
+        'Content-Type': 'application/json', 'X-GitHub-Api-Version': API_VERSION,
+        'User-Agent': 'FlexFactor-Cloud/1.0' },
+    }, 64 * 1024);
+  if (result.status === 404) throw inactiveSteeringError();
+  if (result.status !== 201)
+    throw new ServiceError(502, 'steering_upload_failed', safeGitHubError(result));
+  return parseJson(result.body, 'encrypted steering asset');
 }

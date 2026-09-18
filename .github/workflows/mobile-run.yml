@@ -61,6 +61,14 @@ on:
         required: true
         default: "6"
         type: string
+      steering_release_id:
+        description: Private steering mailbox allocated by the managed cloud
+        required: true
+        type: string
+      steering_secret_name:
+        description: Exact request-scoped steering key name
+        required: true
+        type: string
   workflow_call:
     inputs:
       request_id: {required: true, type: string}
@@ -75,7 +83,10 @@ on:
       max_cost: {required: true, type: string}
       threshold: {required: true, type: string}
       max_iterations: {required: true, type: string}
+      steering_release_id: {required: true, type: string}
+      steering_secret_name: {required: true, type: string}
     secrets:
+      STEERING_PRIVATE_KEY: {required: true}
       OPENAI_API_KEY: {required: false}
       ANTHROPIC_API_KEY: {required: false}
 
@@ -116,6 +127,8 @@ jobs:
         shell: python
         env:
           INPUT_REQUEST_ID: ${{ inputs.request_id }}
+          INPUT_STEERING_RELEASE_ID: ${{ inputs.steering_release_id }}
+          INPUT_STEERING_SECRET_NAME: ${{ inputs.steering_secret_name }}
           INPUT_MODE: ${{ inputs.mode }}
           INPUT_PROVIDER: ${{ inputs.provider }}
           INPUT_TARGET_REPOSITORY: ${{ inputs.target_repository }}
@@ -142,6 +155,11 @@ jobs:
           goal = os.environ["INPUT_GOAL"].strip()
           guidance = os.environ["INPUT_GUIDANCE"].strip()
           uuid.UUID(request_id)
+          if not re.fullmatch(r"[1-9][0-9]{0,14}", os.environ["INPUT_STEERING_RELEASE_ID"]):
+              raise SystemExit("invalid private steering mailbox")
+          expected_secret = "FLEXFACTOR_" + request_id.replace("-", "").upper() + "_STEERING_KEY"
+          if os.environ["INPUT_STEERING_SECRET_NAME"] != expected_secret:
+              raise SystemExit("steering key does not belong to this request")
           if mode not in {"refactor", "scout", "audit", "prodready"}:
               raise SystemExit("unsupported mode")
           if provider != "auto":
@@ -201,7 +219,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: buckeye7066/flexfactor
-          ref: android-v3.5.8
+          ref: android-v3.5.9
           path: engine
           persist-credentials: false
 
@@ -273,6 +291,10 @@ jobs:
           python -m playwright install --with-deps chromium
           python -m pip check
 
+      - name: Install the pinned private steering transport
+        shell: bash
+        run: npm ci --prefix engine/cloud --ignore-scripts --no-audit --no-fund
+
       - name: Configure target publication identity
         shell: bash
         working-directory: target
@@ -295,6 +317,8 @@ jobs:
         shell: bash
         env:
           MODE: ${{ inputs.mode }}
+          STEERING_PRIVATE_KEY: ${{ secrets.STEERING_PRIVATE_KEY }}
+          STEERING_RELEASE_ID: ${{ inputs.steering_release_id }}
           TARGET_FILE: ${{ inputs.file }}
           TARGET_GOAL: ${{ inputs.goal }}
           FLEXFACTOR_GUIDING_PROMPT: ${{ inputs.guidance }}
@@ -310,46 +334,20 @@ jobs:
           before="$(git -C target rev-parse HEAD)"
           printf '%s\n' "$before" > mobile-before.txt
           rc=0
-          steering_name="FLEXFACTOR_STEERING_$(printf '%s' "$REQUEST_ID" | tr -d '-' | cut -c1-16 | tr '[:lower:]' '[:upper:]')"
-          export STEERING_NAME="$steering_name"
-          python - <<'PY' &
-          import json, os, pathlib, time, urllib.error, urllib.request
-          import sys
-
-          sys.path.insert(0, str(pathlib.Path("engine").resolve()))
-          import flexfactor_steering
-
-          api = ("https://api.github.com/repos/" + os.environ["TARGET_REPOSITORY"]
-                 + "/actions/variables/" + os.environ["STEERING_NAME"])
-          headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
-              "X-GitHub-Api-Version": "2026-03-10",
-              "User-Agent": "FlexFactor-Mobile-Steering",
-          }
-          seen = set()
-          while True:
-              try:
-                  with urllib.request.urlopen(
-                          urllib.request.Request(api, headers=headers), timeout=20) as response:
-                      queue = json.loads(json.load(response).get("value", "[]"))
-                  for item in queue if isinstance(queue, list) else []:
-                      ident = str(item.get("id", ""))
-                      comment = str(item.get("comment", ""))
-                      if ident and ident not in seen and comment:
-                          flexfactor_steering.submit(
-                              "target", str(pathlib.Path("target").resolve()), comment,
-                              source="android")
-                          seen.add(ident)
-              except urllib.error.HTTPError as error:
-                  if error.code != 404:
-                      print("[steering] GitHub check failed; will retry", file=sys.stderr)
-              except Exception:
-                  print("[steering] queue check failed; will retry", file=sys.stderr)
-              time.sleep(20)
-          PY
+          rm -f mobile-steering-ready
+          node engine/.github/scripts/mobile_steering_poll.mjs &
           steering_pid=$!
           trap 'kill "$steering_pid" 2>/dev/null || true' EXIT
+          unset STEERING_PRIVATE_KEY
+          for attempt in {1..60}; do
+            [ -f mobile-steering-ready ] && break
+            kill -0 "$steering_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if [ ! -f mobile-steering-ready ]; then
+            echo "Private run steering did not initialize; execution was not started." >&2
+            exit 1
+          fi
           if [ "$MODE" = refactor ]; then
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
             git -C target switch -c "$branch" || rc=$?

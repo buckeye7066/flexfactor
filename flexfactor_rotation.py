@@ -1833,7 +1833,8 @@ class RotatingProvider:
                     # A refusal is not a pool failure; do not let it consume a
                     # healthy pool's attempt.
                     attempts = min(route_bound, attempts + 1)
-                if isinstance(exc, ProviderHealthError) or is_model_retired_error(exc):
+                if (isinstance(exc, ProviderHealthError) or is_model_retired_error(exc)
+                        or is_model_selection_error(exc)):
                     # A dead route has not consumed its healthy siblings' pool.
                     # Extend only route-scoped failures, bounded by identities
                     # and by the caller's total preflight transport-call cap.
@@ -2076,6 +2077,13 @@ _TRANSPORT_FAULT_TYPES = ("CliUnavailable", "CrossFamilyRescueRequired")
 # three strikes cool a whole POOL for five minutes. A secret in the audited repo
 # must never bench a provider.
 _PAYLOAD_FAULT_MARKERS = ("flexfactor_egress_blocked",)
+
+
+def is_model_selection_error(exc: BaseException) -> bool:
+    """An unavailable CLI model does not exhaust its subscription's siblings."""
+    return type(exc).__name__ == "CliUnavailable" and bool(re.search(
+        r'model ["\'][^"\']+["\'] from --model flag is not available',
+        str(exc), re.IGNORECASE))
 
 
 def is_transport_dead_error(exc: BaseException) -> bool:

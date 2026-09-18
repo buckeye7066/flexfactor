@@ -75,6 +75,31 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
                 self.assertEqual(len(failures), 1)
                 self.assertIsInstance(failures[0], ff.StructuredOutputShapeError)
 
+    def test_unavailable_copilot_model_keeps_other_subscription_models_eligible(self):
+        from providers.cli_provider import CliUnavailable
+        with tempfile.TemporaryDirectory() as root:
+            catalog = ff._builtin_route_catalog(rotation)
+            routes = [r for r in catalog if r.api == "copilot-cli"]
+            self.assertGreaterEqual(len(routes), 2,
+                                    "one unavailable model must not eliminate Copilot")
+            self.assertTrue(all(r.model != "auto" and r.model == r.wire_model for r in routes))
+            self.assertGreaterEqual(len({rotation.model_family(r.model) for r in routes}), 2)
+            visited = []
+            def factory(route):
+                backend = mock.Mock()
+                def complete(*args, **kwargs):
+                    visited.append(route.id)
+                    if route.id == routes[0].id:
+                        raise CliUnavailable('Error: Model "claude-sonnet-4.6" from --model flag is not available.')
+                    return "verified answer"
+                backend.complete.side_effect = complete
+                return backend
+            provider = rotation.RotatingProvider(rotation.Rotator(
+                rotation.Catalog(routes), store=rotation.StateStore(os.path.join(root, "state.json"))),
+                factory, tier=rotation.STRONG)
+            self.assertEqual(provider.complete("Review the provided source"), "verified answer")
+            self.assertEqual(visited[:2], [routes[0].id, routes[1].id])
+
     def test_current_queue_preflight_resolves_targets_before_work_when_dashboard_active(self):
         source = inspect.getsource(ff.run_audit)
         self.assertIn("resolved_targets", source)

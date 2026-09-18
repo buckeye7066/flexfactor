@@ -1,3 +1,5 @@
+import { steeringSecretName } from "../lib/steering-mailbox.js";
+import { withMailboxGithub } from "../test_support/mailbox-github.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -34,8 +36,9 @@ function queuedFetch(responses) {
       ? null : (Buffer.isBuffer(next.body) ? next.body : JSON.stringify(next.body));
     return new Response(body, { status: next.status ?? 200, headers });
   };
-  implementation.calls = calls;
-  return implementation;
+  const wrapped = withMailboxGithub(implementation);
+  wrapped.calls = calls;
+  return wrapped;
 }
 
 function validRun(overrides = {}) {
@@ -422,7 +425,7 @@ test("phone credentials never overwrite an owner's existing repository secret", 
   assert.equal(isolatedWrite.options.method, "PUT");
   assert.equal(JSON.parse(isolatedWrite.options.body).encrypted_value, sealed.encrypted_value);
   const claimCreate = JSON.parse(fetcher.calls[5].options.body);
-  assert.deepEqual(JSON.parse(claimCreate.value).ephemeral_secrets, [scopedOpenAI]);
+  assert.deepEqual(JSON.parse(claimCreate.value).ephemeral_secrets, [scopedOpenAI, steeringSecretName(validRun().request_id)]);
 });
 
 test("a partial credential-write failure removes every phone credential and its request claim", async () => {
@@ -633,23 +636,18 @@ test("artifact downloads return only a bounded GitHub-signed archive", async () 
   assert.equal(fetcher.calls[3].options.headers.Authorization, undefined);
 });
 
-test("steering uses a bounded repository variable and never reflects the bearer token", async () => {
+test("legacy runs reject unavailable steering instead of acknowledging undeliverable input", async () => {
   const request = validRun();
-  const claim = storedClaim(request, { state: "dispatched", run_id: 99 });
-  const activeRun = { body: { id: 99, status: "in_progress",
-    path: ".github/workflows/flexfactor-mobile.yml",
-    display_title: `FlexFactor audit \u00b7 ${request.request_id}` } };
   const fetcher = queuedFetch([
-    claim, activeRun,
-    { status: 404, body: { message: "Not Found" } }, { status: 201, body: {} },
-    claim, activeRun,
+    storedClaim(request, { state: "dispatched", run_id: 99 }),
+    { body: { id: 99, status: "in_progress", path: ".github/workflows/flexfactor-mobile.yml",
+      display_title: `FlexFactor audit \u00b7 ${request.request_id}` } },
   ]);
-  assert.deepEqual(await submitSteering("gho_steering_token", "owner/project",
-    "4d32c8e5-6f2b-4a98-a7f5-99594c49b2f8", "Re-run the accessibility checks", fetcher),
-  { accepted: true });
-  const payload = JSON.parse(fetcher.calls[3].options.body);
-  assert.match(payload.name, /^FLEXFACTOR_STEERING_[A-F0-9]{16}$/);
-  assert.doesNotMatch(fetcher.calls[3].options.body, /gho_steering_token/);
+  await assert.rejects(() => submitSteering("gho_steering_token", request.repository,
+    request.request_id, "Run the full suite", fetcher),
+    (error) => error.code === "steering_upgrade_required");
+  assert.ok(fetcher.calls.every((call) => call.options.method === "GET"));
+  assert.equal(fetcher.mailbox.mailboxCalls.length, 0);
 });
 
 test("upstream errors never include the access token", async () => {

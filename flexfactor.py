@@ -5107,6 +5107,21 @@ def _builtin_route_catalog(fr):
             tier=fr.STRONG, capabilities=model_capabilities,
             capabilities_source="declared",
         ),
+        # A plan or installation may reject one model without rejecting its
+        # Copilot subscription. Keep concrete, independently identifiable
+        # alternatives in the SAME existing pool before dropping to local AI.
+        fr.Route(
+            id="builtin/copilot-gpt-5-4", backend="copilot", backend_label="GitHub Copilot",
+            model="gpt-5.4", wire_model="gpt-5.4", api="copilot-cli", base_url="",
+            pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.STRONG, capabilities=model_capabilities, capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/copilot-haiku-4-5", backend="copilot", backend_label="GitHub Copilot",
+            model="claude-haiku-4.5", wire_model="claude-haiku-4.5", api="copilot-cli", base_url="",
+            pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.LIGHT, capabilities=model_capabilities, capabilities_source="declared",
+        ),
         fr.Route(
             id="builtin/anthropic-sonnet-5", backend="anthropic_api",
             backend_label="Anthropic", model="claude-sonnet-5",

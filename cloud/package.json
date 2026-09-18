@@ -9,5 +9,8 @@
   "scripts": {
     "test": "node --test",
     "check": "node scripts/check-syntax.mjs"
+  },
+  "dependencies": {
+    "libsodium-wrappers": "0.8.4"
   }
 }
