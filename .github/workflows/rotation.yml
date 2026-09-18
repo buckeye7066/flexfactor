@@ -164,7 +164,7 @@ jobs:
   copilot-access:
     if: github.event_name == 'workflow_dispatch' && inputs.probe_copilot && github.actor == github.repository_owner
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 6
     permissions:
       contents: read
       copilot-requests: write
@@ -173,7 +173,7 @@ jobs:
         with:
           node-version: "22"
       - name: Install the production-pinned CLI
-        run: npm install --global @github/copilot@1.0.81 --no-audit --no-fund
+        run: npm install --global @github/copilot@1.0.86 --no-audit --no-fund
       - name: Prove concrete model access without files or tools
         env:
           COPILOT_GITHUB_TOKEN: ${{ github.token }}
@@ -181,7 +181,7 @@ jobs:
         run: |
           import subprocess, json, os
           successes = []
-          for model in ("claude-sonnet-4.6", "gpt-5.4", "claude-haiku-4.5"):
+          for model in ("claude-sonnet-4.6", "gpt-5.4", "claude-haiku-4.5", "auto"):
               try:
                   result = subprocess.run(["copilot", "-s", "--no-ask-user", "--no-auto-update",
                       "--no-color", "--no-custom-instructions", "--available-tools=", "--model", model],
@@ -192,7 +192,10 @@ jobs:
                   reason = "ok" if ok else "model unavailable" if "not available" in blob else "authentication or allowance" if any(x in blob for x in ("authentication", "unauthorized", "quota", "credit", "subscription")) else "CLI response did not pass"
               except subprocess.TimeoutExpired:
                   ok, reason = False, "bounded timeout"
-              print(json.dumps({"model":model,"passed":ok,"reason":reason}), flush=True)
+              detail = ""
+              if not ok and reason != "bounded timeout":
+                  detail = result.stderr.strip().replace(os.environ["COPILOT_GITHUB_TOKEN"], "[redacted]")[:400]
+              print(json.dumps({"model":model,"passed":ok,"reason":reason,"detail":detail}), flush=True)
               if ok: successes.append(model)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
               output.write("Verified Copilot models: " + json.dumps(successes) + "\n")

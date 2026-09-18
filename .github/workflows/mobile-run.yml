@@ -280,7 +280,7 @@ jobs:
       - name: Install GitHub Copilot CLI
         shell: bash
         run: |
-          npm install --global @github/copilot@1.0.81
+          npm install --global @github/copilot@1.0.86
           copilot --version
 
       - name: Install the engine and browser runtime
