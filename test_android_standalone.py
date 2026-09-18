@@ -826,5 +826,138 @@ class MobileReleaseIdentityTests(unittest.TestCase):
                 self.identity.verify_cloud_health({**health, key: bad}, expected)
 
 
+
+class MobileModeAcceptanceTests(unittest.TestCase):
+    def helpers(self):
+        import ast
+        path = ROOT / '.github/scripts/mobile_cloud_live_proof.py'
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        names = {'build_live_request', 'validate_live_result', 'record_live_result'}
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        self.assertEqual({node.name for node in functions}, names)
+        namespace = {}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
+        return namespace
+
+    def test_each_live_mode_keeps_its_boundaries(self):
+        build = self.helpers()['build_live_request']
+        for mode in ('refactor', 'scout', 'audit', 'prodready'):
+            request = build('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', mode)
+            self.assertEqual(request['mode'], mode)
+            self.assertEqual(request['max_cost'], 1)
+            self.assertFalse(request['scout_apply'])
+            self.assertEqual(request['file'], 'stats_utils.py' if mode == 'refactor' else '')
+            self.assertEqual(bool(request['goal']), mode == 'refactor')
+            self.assertEqual('do not apply' in request['guidance'], mode == 'scout')
+        for mode, repo in [('unknown', 'buckeye7066/flexfactor-demo-tinystats'), ('audit', 'buckeye7066/GrantFlow')]:
+            with self.assertRaises(ValueError):
+                build('request-1', repo, '3.5.9', mode)
+
+    def test_result_cannot_substitute_another_request_or_unpublished_repair(self):
+        helper = self.helpers()
+        request = helper['build_live_request']('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', 'audit')
+        good = dict(request_id='request-1', mode='audit', target_repository=request['repository'],
+                    target_ref='main', success=True, exit_code=0, publication_required=False,
+                    publication_complete=True, source_before='a'*40, source_after='a'*40,
+                    run_url='https://github.com/' + request['repository'] + '/actions/runs/99')
+        validate = helper['validate_live_result']
+        validate(good, request, 99)
+        invalid = {'request_id': 'request-2', 'mode': 'scout', 'target_repository': 'owner/other',
+                   'target_ref': 'old', 'success': False, 'exit_code': False,
+                   'publication_complete': False, 'source_after': 'b'*40, 'run_url': 'https://github.com/other'}
+        for field, value in invalid.items():
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate(dict(good, **{field: value}), request, 99)
+        for field in good:
+            incomplete = dict(good)
+            del incomplete[field]
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                validate(incomplete, request, 99)
+        validate(dict(good, source_after='b'*40, publication_required=True), request, 99)
+
+
+
+    def test_refactor_requires_an_actual_published_change(self):
+        helper = self.helpers()
+        request = helper['build_live_request']('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', 'refactor')
+        result = dict(request_id='request-1', mode='refactor', target_repository=request['repository'],
+                      target_ref='main', success=True, exit_code=0, publication_required=False,
+                      publication_complete=True, source_before='a'*40, source_after='a'*40,
+                      run_url='https://github.com/' + request['repository'] + '/actions/runs/99')
+        with self.assertRaisesRegex(ValueError, 'source change'):
+            helper['validate_live_result'](result, request, 99)
+        result.update(source_after='b'*40, publication_required=True)
+        helper['validate_live_result'](result, request, 99)
+
+    def test_failed_validation_never_records_successful_proof(self):
+        helper = self.helpers()
+        request = helper['build_live_request']('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', 'audit')
+        result = dict(request_id='request-1', mode='audit', target_repository=request['repository'],
+                      target_ref='main', success=True, exit_code=0, publication_required=False,
+                      publication_complete=True, source_before='a'*40, source_after='a'*40,
+                      run_url='https://github.com/' + request['repository'] + '/actions/runs/99')
+        saves = []
+        for changed in ({'run_url': 'wrong'}, {'source_after': 'invalid'}):
+            with self.assertRaises(ValueError):
+                helper['record_live_result'](dict(result, **changed), request, 99, {'conclusion': 'success'}, lambda **kw: saves.append(kw))
+            self.assertEqual(saves[-1]['stage'], 'validation-failed')
+            self.assertFalse(saves[-1]['result_validated'])
+            self.assertNotEqual(saves[-1].get('phone_result_success'), True)
+        helper['record_live_result'](result, request, 99, {'conclusion': 'success'}, lambda **kw: saves.append(kw))
+        self.assertEqual(saves[-1]['stage'], 'artifact-validated')
+        self.assertTrue(saves[-1]['result_validated'])
+        with self.assertRaises(ValueError):
+            helper['record_live_result'](result, request, 99, {'conclusion': 'failure'}, lambda **kw: saves.append(kw))
+        self.assertFalse(saves[-1]['result_validated'])
+
+    def test_remaining_modes_have_serial_independent_job_budgets(self):
+        import re
+        source = (ROOT / '.github/workflows/mobile-cloud-live-proof.yml').read_text(encoding='utf-8')
+        jobs = {match.group(1): match.group(2) for match in re.finditer(
+            r'^  ([a-z-]+):\n(.*?)(?=^  [a-z-]+:|\Z)', source.split('jobs:\n', 1)[1], re.M | re.S)}
+        self.assertTrue({'remaining-refactor', 'remaining-audit', 'remaining-prodready'}.issubset(jobs))
+        shared = jobs['live-proof']
+        self.assertIn('steps: &acceptance_steps', shared)
+        self.assertIn('Authorize the exact main revision and triggering owner', shared)
+        self.assertIn('Upload redacted live proof', shared)
+        self.assertIn('${{ github.job }}', shared)
+        for mode in ('refactor', 'audit', 'prodready'):
+            job = jobs['remaining-' + mode]
+            self.assertIn('timeout-minutes: 360', job)
+            self.assertIn('MODE: ' + mode, job)
+            self.assertIn('environment: Production', job)
+            self.assertIn("if: inputs.mode == 'remaining'", job)
+            self.assertIn('steps: *acceptance_steps', job)
+        self.assertIn('needs: remaining-refactor', jobs['remaining-audit'])
+        self.assertIn('needs: remaining-audit', jobs['remaining-prodready'])
+        self.assertIn('group: flexfactor-cloud-production', source)
+
+
+
+    def test_timeout_preserves_original_request_as_nonvalidated_evidence(self):
+        import json, os, subprocess, sys, tempfile, textwrap
+        from pathlib import Path
+        source = (ROOT / '.github/workflows/mobile-cloud-live-proof.yml').read_text(encoding='utf-8')
+        self.assertIn('timeout-minutes: 300', source)
+        start = source.split('      - name: Preserve incomplete acceptance evidence', 1)[1]
+        step = start.split('      - name: Upload redacted live proof', 1)[0]
+        self.assertIn("steps.exercise.outcome != 'success'", step)
+        code = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'mobile-cloud-live-proof.json'
+            original = {'request_id': 'original-request', 'run_id': 99, 'stage': 'steering-accepted'}
+            path.write_text(json.dumps(original), encoding='utf-8')
+            result = subprocess.run([sys.executable, '-c', code], cwd=directory,
+                                    env=dict(os.environ, STEP_OUTCOME='failure'),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            saved = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(saved['request_id'], original['request_id'])
+            self.assertEqual(saved['run_id'], 99)
+            self.assertFalse(saved['result_validated'])
+            self.assertEqual(saved['stage'], 'observation-incomplete')
+            self.assertEqual(saved['verification_step_outcome'], 'failure')
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

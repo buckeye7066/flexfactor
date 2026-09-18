@@ -20,10 +20,71 @@ from mobile_release_identity import (
 )
 
 
+def build_live_request(request_id, repository, client_version, mode):
+    """Exercise only the designated disposable target, with a one-dollar cap."""
+    if repository != 'buckeye7066/flexfactor-demo-tinystats':
+        raise ValueError('Live acceptance is restricted to the disposable repository')
+    if mode not in ('refactor', 'scout', 'audit', 'prodready'):
+        raise ValueError('Unsupported live acceptance mode')
+    guidance = (f'Live {client_version} acceptance proof; do not apply proposed changes.'
+                if mode == 'scout' else
+                f'Live {client_version} acceptance: apply verified defect repairs only, '
+                'preserve documented behavior, run the project tests, and publish only through the normal verification gates.')
+    goal = ('Correct mean to divide by the number of values; use a fresh default bucket '
+            'in append_item; make parse_port enforce 1-65535 and raise ValueError on invalid input. '
+            'Preserve the documented APIs and do not weaken validation or tests.')
+    return {'request_id': request_id, 'mode': mode, 'provider': 'auto',
+            'repository': repository, 'ref': 'main',
+            'file': 'stats_utils.py' if mode == 'refactor' else '',
+            'goal': goal if mode == 'refactor' else '', 'guidance': guidance,
+            'scout_apply': False, 'max_cost': 1, 'threshold': 90, 'max_iterations': 1}
+
+
+def validate_live_result(result, request, run_id):
+    """Require the exact correlated result and truthful publication evidence."""
+    if not isinstance(result, dict):
+        raise ValueError('The phone result is not a structured object')
+    expected = {'request_id': request['request_id'], 'mode': request['mode'],
+                'target_repository': request['repository'], 'target_ref': request['ref'],
+                'run_url': f"https://github.com/{request['repository']}/actions/runs/{run_id}"}
+    if any(result.get(key) != value for key, value in expected.items()):
+        raise ValueError('The phone result does not identify the requested run')
+    if (result.get('success') is not True or type(result.get('exit_code')) is not int
+            or result['exit_code'] != 0 or result.get('publication_complete') is not True):
+        raise ValueError('The phone result does not prove completed execution and publication')
+    before, after = result.get('source_before'), result.get('source_after')
+    if any(not isinstance(sha, str) or len(sha) != 40
+           or any(ch not in '0123456789abcdef' for ch in sha) for sha in (before, after)):
+        raise ValueError('The phone result omitted valid source revisions')
+    if request['mode'] == 'refactor' and before == after:
+        raise ValueError('Refactor acceptance requires a verified published source change')
+    if result.get('publication_required') is not (before != after):
+        raise ValueError('The phone result contradicts its source-change evidence')
+
+
+def record_live_result(result, request, run_id, terminal, save):
+    """An inspected artifact is not a pass until every acceptance check succeeds."""
+    try:
+        if terminal.get('conclusion') != 'success':
+            raise ValueError('The target run did not conclude successfully')
+        validate_live_result(result, request, run_id)
+    except ValueError as error:
+        save(stage='validation-failed', result_validated=False,
+             phone_result_present=True, validation_error=str(error))
+        raise
+    save(stage='artifact-validated', result_validated=True, phone_result_present=True,
+         phone_result_success=True, phone_result_mode=result['mode'],
+         phone_result_exit_code=result['exit_code'],
+         phone_result_publication_required=result['publication_required'],
+         phone_result_publication_complete=result['publication_complete'],
+         source_before=result['source_before'], source_after=result['source_after'])
+
+
 BASE = "https://flexfactor-cloud.vercel.app"
 TOKEN = os.environ["FLEXFACTOR_LIVE_PROOF_TOKEN"].strip()
 REPOSITORY = os.environ["TARGET_REPOSITORY"]
 REQUEST_ID = str(uuid.uuid4())
+MODE = os.environ.get("MODE", "scout")
 ANDROID_BUILD = Path("android/app/build.gradle.kts")
 VERSION_MATCH = re.search(
     r'^\s*versionName\s*=\s*"([^"]+)"',
@@ -73,6 +134,7 @@ proof = {
     "target_repository": REPOSITORY,
     "request_id": REQUEST_ID,
     "stage": "initialized",
+    "mode": MODE,
 }
 
 
@@ -126,20 +188,8 @@ if not target_visible:
     raise SystemExit("Live proof target was not returned by repository discovery")
 save_proof(stage="repository-discovered")
 
-run_request = {
-    "request_id": REQUEST_ID,
-    "mode": "scout",
-    "provider": "auto",
-    "repository": REPOSITORY,
-    "ref": "main",
-    "file": "",
-    "goal": "",
-    "guidance": f"Live {CLIENT_VERSION} acceptance proof; do not apply proposed changes.",
-    "scout_apply": False,
-    "max_cost": 1,
-    "threshold": 90,
-    "max_iterations": 1,
-}
+run_request = build_live_request(REQUEST_ID, REPOSITORY, CLIENT_VERSION, MODE)
+
 dispatch_body = {"request": run_request, "encrypted_secrets": {}}
 started = json_request("POST", "/api/runs/dispatch", dispatch_body)
 run_id = int(started.get("id", 0))
@@ -167,7 +217,7 @@ save_proof(stage="dispatch-recovered", dispatch_recovered_same_run=True)
 steering = json_request("POST", "/api/runs/steer", {
     "repository": REPOSITORY,
     "request_id": REQUEST_ID,
-    "comment": "Live proof steering: keep this Scout read-only and report only verified findings.",
+    "comment": run_request["guidance"],
 })
 if steering.get("accepted") is not True:
     raise SystemExit("Active steering was not accepted")
@@ -207,20 +257,5 @@ with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                        if Path(name).name == "mobile-result.json")
     result = json.loads(bundle.read(result_name))
 
-save_proof(
-    stage="artifact-inspected",
-    phone_result_present=True,
-    phone_result_success=bool(result.get("success")),
-    phone_result_mode=result.get("mode"),
-    phone_result_exit_code=result.get("exit_code"),
-    phone_result_publication_required=result.get("publication_required"),
-    phone_result_publication_complete=result.get("publication_complete"),
-)
+record_live_result(result, run_request, run_id, terminal, save_proof)
 print(json.dumps(proof))
-
-if terminal.get("conclusion") != "success":
-    raise SystemExit("Live mobile run did not conclude successfully")
-if result.get("success") is not True:
-    raise SystemExit("Phone-readable result did not report success")
-if result.get("mode") != "scout":
-    raise SystemExit("Phone-readable result reported the wrong mode")
