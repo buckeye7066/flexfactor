@@ -205,6 +205,7 @@ jobs:
                    test_ci_skip_policy.py \
                    test_live_cursor_aitime_proof.py \
                    test_stale_runtime_recurrence.py \
+                   test_purpose_evidence_routing.py \
                    test_build_target.py \
                    test_source_app_update.py \
                    test_release_update_manifest.py \
