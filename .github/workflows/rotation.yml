@@ -16,7 +16,7 @@ on:
         default: false
 
 concurrency:
-  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
+  group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.probe_copilot && 'live-probe' || 'ci' }}"
   cancel-in-progress: true
 
 jobs:
@@ -162,7 +162,7 @@ jobs:
           python -m py_compile test_live_cursor_aitime_proof.py
 
   copilot-access:
-    if: github.event_name == 'workflow_dispatch' && inputs.probe_copilot && github.actor == github.repository_owner
+    if: github.event_name == 'workflow_dispatch' && inputs.probe_copilot && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner
     runs-on: ubuntu-latest
     timeout-minutes: 6
     permissions:
@@ -180,23 +180,16 @@ jobs:
         shell: python
         run: |
           import subprocess, json, os
-          successes = []
-          for model in ("claude-sonnet-5", "gpt-5.6-terra", "gpt-5.6-luna"):
-              try:
-                  result = subprocess.run(["copilot", "-s", "--no-ask-user", "--no-auto-update",
-                      "--no-color", "--no-custom-instructions", "--available-tools=", "--model", model],
-                      input="Reply with exactly OK. Do not use tools.", text=True,
-                      capture_output=True, timeout=45)
-                  ok = result.returncode == 0 and result.stdout.strip() == "OK"
-                  blob = (result.stdout + result.stderr).lower()
-                  reason = "ok" if ok else "model unavailable" if "not available" in blob else "authentication or allowance" if any(x in blob for x in ("authentication", "unauthorized", "quota", "credit", "subscription")) else "CLI response did not pass"
-              except subprocess.TimeoutExpired:
-                  ok, reason = False, "bounded timeout"
-              detail = ""
-              if not ok and reason != "bounded timeout":
-                  detail = result.stderr.strip().replace(os.environ["COPILOT_GITHUB_TOKEN"], "[redacted]")[:400]
-              print(json.dumps({"model":model,"passed":ok,"reason":reason,"detail":detail}), flush=True)
-              if ok: successes.append(model)
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
-              output.write("Verified Copilot models: " + json.dumps(successes) + "\n")
-          if not successes: raise SystemExit("No configured Copilot model completed the bounded probe")
+          result = subprocess.run(["copilot", "-s", "--no-ask-user", "--no-auto-update",
+              "--no-color", "--no-custom-instructions", "--available-tools=", "--model", "auto",
+              "--output-format", "json"], input='Reply with exactly {"answer":"OK"}. Do not use tools.',
+              text=True, capture_output=True, timeout=45)
+          emitted = 0
+          for line in result.stdout.splitlines():
+              try: event = json.loads(line)
+              except ValueError: continue
+              if event.get("type") in ("session.auto_mode_resolved", "model.call_start", "model.call_finished", "assistant.message", "result"):
+                  clean = json.dumps(event).replace(os.environ["COPILOT_GITHUB_TOKEN"], "[redacted]")
+                  print(clean[:6000], flush=True)
+                  emitted += 1
+          if result.returncode or emitted < 2: raise SystemExit("Verified model metadata was not returned")

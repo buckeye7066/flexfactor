@@ -315,7 +315,7 @@ jobs:
       - name: Initialize private steering before target execution
         shell: bash
         env:
-          STEERING_PRIVATE_KEY: ${{ secrets.STEERING_PRIVATE_KEY }}
+          STEERING_PRIVATE_KEY: ${{ secrets[inputs.steering_secret_name] || secrets.STEERING_PRIVATE_KEY }}
           STEERING_RELEASE_ID: ${{ inputs.steering_release_id }}
           REQUEST_ID: ${{ inputs.request_id }}
           TARGET_REPOSITORY: ${{ inputs.target_repository }}
