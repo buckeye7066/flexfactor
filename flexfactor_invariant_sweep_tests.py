@@ -526,7 +526,7 @@ _PROCESS_LAUNCH_SITES = {
     ".github/scripts/mobile_release_identity.py::_git": (
         "Protected owner-only CI release verifier, before the app engine or "
         "provider dependencies are loaded. Calls only read-only Git rev-parse "
-        "and diff metadata with fixed options and validated revision IDs; "
+        "and diff/log metadata with fixed options and validated revision IDs; "
         "no audited target command, shell program, or repository code runs."
     ),
     ".github/scripts/mobile_release_identity.py::verify_release_identity": (

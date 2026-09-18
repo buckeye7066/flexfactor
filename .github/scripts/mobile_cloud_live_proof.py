@@ -15,7 +15,9 @@ import urllib.request
 import uuid
 import zipfile
 
-from mobile_release_identity import verify_release_identity, verify_cloud_health
+from mobile_release_identity import (
+    verify_release_identity, verify_cloud_health, verify_cloud_response,
+)
 
 
 BASE = "https://flexfactor-cloud.vercel.app"
@@ -49,7 +51,9 @@ identity = verify_release_identity(
     Path.cwd(), os.environ["EXPECTED_SHA"], released, SOURCE_VERSION)
 with urllib.request.urlopen(BASE + "/api/health", timeout=30) as response:
     deployed_health = json.load(response)
+    deployed_headers = response.headers
 verify_cloud_health(deployed_health, identity)
+verify_cloud_response(deployed_headers, deployed_health)
 HEADERS = {
     "Accept": "application/json, application/zip",
     "Authorization": f"Bearer {TOKEN}",
@@ -63,6 +67,8 @@ proof = {
     "verification_sha": identity["verification_sha"],
     "cloud_version": identity["cloud_version"],
     "engine_ref": identity["engine_ref"],
+    "cloud_source_sha": identity["cloud_source_sha"],
+    "cloud_deployment_url": deployed_health["deployment_url"],
     "client_version": CLIENT_VERSION,
     "target_repository": REPOSITORY,
     "request_id": REQUEST_ID,
@@ -85,6 +91,7 @@ def request(method: str, path: str, body: object | None = None) -> tuple[int, by
     req = urllib.request.Request(BASE + path, data=payload, method=method, headers=HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=330) as response:
+            verify_cloud_response(response.headers, deployed_health)
             return response.status, response.read(), response.headers.get("Content-Type", "")
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", "replace")[:1000]

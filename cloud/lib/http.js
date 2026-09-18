@@ -1,3 +1,4 @@
+import { deploymentIdentity } from "./deployment.js";
 import { MAX_JSON_BYTES } from "./config.js";
 import { ServiceError, bearerToken } from "./service.js";
 
@@ -27,6 +28,9 @@ function admitOAuth(response) {
 }
 
 export function setSecurityHeaders(response) {
+  const identity = deploymentIdentity();
+  if (identity.source_revision) response.setHeader("X-FlexFactor-Cloud-Source", identity.source_revision);
+  if (identity.deployment_url) response.setHeader("X-FlexFactor-Deployment", identity.deployment_url);
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
   response.setHeader("Referrer-Policy", "no-referrer");

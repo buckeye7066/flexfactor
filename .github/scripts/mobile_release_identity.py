@@ -9,6 +9,7 @@ PROOF_MAINTENANCE = frozenset({
     ".github/scripts/mobile_cloud_live_proof.py",
     ".github/scripts/mobile_release_identity.py",
     ".github/workflows/mobile-cloud-live-proof.yml",
+    ".github/workflows/cloud-production-deploy.yml",
     "test_android_standalone.py",
     "flexfactor_invariant_sweep_tests.py",
 })
@@ -46,7 +47,7 @@ def verify_release_identity(root: Path, expected_sha: str,
         cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
     if ancestor.returncode != 0:
         raise ValueError("The signed release is not an ancestor of authorized main")
-    changed = _git(root, "diff", "--name-only", "-z", release_sha, expected_sha)
+    changed = _git(root, "diff", "--no-renames", "--name-only", "-z", release_sha, expected_sha)
     unpublished = [name for name in changed.split("\0") if name
                    and not name.startswith("cloud/")
                    and name not in PROOF_MAINTENANCE]
@@ -59,8 +60,12 @@ def verify_release_identity(root: Path, expected_sha: str,
     version = re.search(r'SERVICE_VERSION = "([^"]+)"', config)
     if engine is None or engine.group(1) != tag or version is None:
         raise ValueError("The configured cloud engine is not the published Android engine")
+    cloud_source = _git(root, "log", "-1", "--format=%H", expected_sha, "--", "cloud").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", cloud_source):
+        raise ValueError("The authorized cloud source revision is unavailable")
     return {"release_source_sha": release_sha, "verification_sha": expected_sha,
-            "engine_ref": tag, "cloud_version": version.group(1)}
+            "engine_ref": tag, "cloud_version": version.group(1),
+            "cloud_source_sha": cloud_source}
 
 
 def verify_cloud_health(health: dict, identity: dict) -> None:
@@ -69,3 +74,17 @@ def verify_cloud_health(health: dict, identity: dict) -> None:
             or health.get("version") != identity["cloud_version"]
             or health.get("engine_ref") != identity["engine_ref"]):
         raise ValueError("The deployed cloud does not match the verified release rollout")
+
+    if health.get("source_revision") != identity["cloud_source_sha"]:
+        raise ValueError("The deployed cloud source differs from the authorized cloud revision")
+    if not re.fullmatch(r"https://[A-Za-z0-9-]+\.vercel\.app", str(health.get("deployment_url") or "")):
+        raise ValueError("The cloud did not provide its immutable deployment identity")
+
+
+def verify_cloud_response(headers, initial_health: dict) -> None:
+    """Reject alias promotions during the journey, including same-source redeploys."""
+    for header, field in (("X-FlexFactor-Cloud-Source", "source_revision"),
+                          ("X-FlexFactor-Deployment", "deployment_url")):
+        expected = initial_health.get(field)
+        if not expected or headers.get(header) != expected:
+            raise ValueError("The live journey changed cloud deployment identity")
