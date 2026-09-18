@@ -722,5 +722,5 @@ test("protected-branch retry preserves an engine upgraded during the initial wri
 });
 
 test("downgrade protection has a distinct cloud release identity", () => {
-  assert.equal(SERVICE_VERSION, "1.1.7");
+  assert.equal(SERVICE_VERSION, "1.1.8");
 });

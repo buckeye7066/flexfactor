@@ -39,6 +39,7 @@ jobs:
         with:
           ref: ${{ inputs.expected_sha }}
           persist-credentials: false
+          fetch-depth: 0
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -66,7 +67,10 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
           set -euo pipefail
-          deployment_url=$(vercel deploy --yes --token "$VERCEL_TOKEN" | tail -n 1)
+          cloud_sha=$(git log -1 --format=%H -- .)
+          printf '%s' "$cloud_sha" | grep -Eq '^[0-9a-f]{40}$'
+          deployment_url=$(vercel deploy --yes --token "$VERCEL_TOKEN" \
+            --env "FLEXFACTOR_CLOUD_SOURCE_SHA=$cloud_sha" | tail -n 1)
           printf '%s' "$deployment_url" \
             | grep -Eq '^https://[A-Za-z0-9.-]+\.vercel\.app$'
           printf 'deployment_url=%s\n' "$deployment_url" >> "$GITHUB_OUTPUT"
@@ -81,7 +85,7 @@ jobs:
           for attempt in {1..30}; do
             if vercel curl /api/health --deployment "$DEPLOYMENT_URL" \
                 --token "$VERCEL_TOKEN" > preview-health.json; then
-              if node --input-type=module <<'JS'
+              if CLOUD_SOURCE_SHA="$(git log -1 --format=%H -- .)" node --input-type=module <<'JS'
           import assert from "node:assert/strict";
           import { readFile } from "node:fs/promises";
           import { ENGINE_REF, SERVICE_NAME, SERVICE_VERSION } from "./lib/config.js";
@@ -92,6 +96,8 @@ jobs:
           assert.equal(health.service, SERVICE_NAME);
           assert.equal(health.version, SERVICE_VERSION);
           assert.equal(health.engine_ref, ENGINE_REF);
+          assert.equal(health.source_revision, process.env.CLOUD_SOURCE_SHA);
+          assert.equal(health.deployment_url, process.env.DEPLOYMENT_URL);
           console.log(JSON.stringify(health));
           JS
               then
@@ -120,7 +126,10 @@ jobs:
 
       - name: Prove the production alias serves the tested engine
         working-directory: cloud
+        env:
+          DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
         run: |
+          export CLOUD_SOURCE_SHA="$(git log -1 --format=%H -- .)"
           node --input-type=module <<'JS'
           import assert from "node:assert/strict";
           import { ENGINE_REF, SERVICE_NAME, SERVICE_VERSION } from "./lib/config.js";
@@ -136,5 +145,7 @@ jobs:
           assert.equal(health.service, SERVICE_NAME);
           assert.equal(health.version, SERVICE_VERSION);
           assert.equal(health.engine_ref, ENGINE_REF);
+          assert.equal(health.source_revision, process.env.CLOUD_SOURCE_SHA);
+          assert.equal(health.deployment_url, process.env.DEPLOYMENT_URL);
           console.log(JSON.stringify(health));
           JS
