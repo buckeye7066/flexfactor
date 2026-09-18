@@ -832,7 +832,7 @@ class MobileModeAcceptanceTests(unittest.TestCase):
         import ast
         path = ROOT / '.github/scripts/mobile_cloud_live_proof.py'
         tree = ast.parse(path.read_text(encoding='utf-8'))
-        names = {'build_live_request', 'validate_live_result'}
+        names = {'build_live_request', 'validate_live_result', 'record_live_result'}
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
         self.assertEqual({node.name for node in functions}, names)
         namespace = {}
@@ -874,6 +874,59 @@ class MobileModeAcceptanceTests(unittest.TestCase):
             with self.subTest(missing=field), self.assertRaises(ValueError):
                 validate(incomplete, request, 99)
         validate(dict(good, source_after='b'*40, publication_required=True), request, 99)
+
+
+
+    def test_refactor_requires_an_actual_published_change(self):
+        helper = self.helpers()
+        request = helper['build_live_request']('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', 'refactor')
+        result = dict(request_id='request-1', mode='refactor', target_repository=request['repository'],
+                      target_ref='main', success=True, exit_code=0, publication_required=False,
+                      publication_complete=True, source_before='a'*40, source_after='a'*40,
+                      run_url='https://github.com/' + request['repository'] + '/actions/runs/99')
+        with self.assertRaisesRegex(ValueError, 'source change'):
+            helper['validate_live_result'](result, request, 99)
+        result.update(source_after='b'*40, publication_required=True)
+        helper['validate_live_result'](result, request, 99)
+
+    def test_failed_validation_never_records_successful_proof(self):
+        helper = self.helpers()
+        request = helper['build_live_request']('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', 'audit')
+        result = dict(request_id='request-1', mode='audit', target_repository=request['repository'],
+                      target_ref='main', success=True, exit_code=0, publication_required=False,
+                      publication_complete=True, source_before='a'*40, source_after='a'*40,
+                      run_url='https://github.com/' + request['repository'] + '/actions/runs/99')
+        saves = []
+        for changed in ({'run_url': 'wrong'}, {'source_after': 'invalid'}):
+            with self.assertRaises(ValueError):
+                helper['record_live_result'](dict(result, **changed), request, 99, {'conclusion': 'success'}, lambda **kw: saves.append(kw))
+            self.assertEqual(saves[-1]['stage'], 'validation-failed')
+            self.assertFalse(saves[-1]['result_validated'])
+            self.assertNotEqual(saves[-1].get('phone_result_success'), True)
+        helper['record_live_result'](result, request, 99, {'conclusion': 'success'}, lambda **kw: saves.append(kw))
+        self.assertEqual(saves[-1]['stage'], 'artifact-validated')
+        self.assertTrue(saves[-1]['result_validated'])
+        with self.assertRaises(ValueError):
+            helper['record_live_result'](result, request, 99, {'conclusion': 'failure'}, lambda **kw: saves.append(kw))
+        self.assertFalse(saves[-1]['result_validated'])
+
+    def test_remaining_modes_have_serial_independent_job_budgets(self):
+        import yaml
+        workflow = yaml.safe_load((ROOT / '.github/workflows/mobile-cloud-live-proof.yml').read_text(encoding='utf-8'))
+        jobs = workflow['jobs']
+        self.assertTrue({'remaining-refactor', 'remaining-audit', 'remaining-prodready'}.issubset(jobs))
+        for mode in ('refactor', 'audit', 'prodready'):
+            job = jobs['remaining-' + mode]
+            self.assertEqual(job['timeout-minutes'], 360)
+            self.assertEqual(job['env']['MODE'], mode)
+            self.assertEqual(job['environment'], 'Production')
+            self.assertIn('remaining', job['if'])
+            self.assertTrue(any('Authorize the exact main' in step.get('name', '') for step in job['steps']))
+            upload = next(step for step in job['steps'] if step.get('name') == 'Upload redacted live proof')
+            self.assertIn('github.job', upload['with']['name'])
+        self.assertEqual(jobs['remaining-audit']['needs'], 'remaining-refactor')
+        self.assertEqual(jobs['remaining-prodready']['needs'], 'remaining-audit')
+        self.assertEqual(workflow['concurrency']['group'], 'flexfactor-cloud-production')
 
 
 if __name__ == "__main__":

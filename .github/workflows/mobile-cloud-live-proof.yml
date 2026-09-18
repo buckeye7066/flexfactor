@@ -23,6 +23,7 @@ concurrency:
 
 jobs:
   live-proof:
+    if: inputs.mode != 'remaining'
     runs-on: ubuntu-latest
     environment: Production
     timeout-minutes: 360
@@ -30,8 +31,8 @@ jobs:
       FLEXFACTOR_LIVE_PROOF_TOKEN: ${{ secrets.FLEXFACTOR_LIVE_PROOF_GITHUB_TOKEN }}
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       TARGET_REPOSITORY: buckeye7066/flexfactor-demo-tinystats
-      SELECTED_MODE: ${{ inputs.mode || 'scout' }}
-    steps:
+      MODE: ${{ inputs.mode || 'scout' }}
+    steps: &acceptance_steps
       - name: Authorize the exact main revision and triggering owner
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,30 +54,51 @@ jobs:
           fetch-tags: true
 
       - name: Exercise the released mobile control-plane path live
-        shell: bash
-        run: |
-          set -uo pipefail
-          case "$SELECTED_MODE" in
-            scout|refactor|audit|prodready|remaining) ;;
-            *) echo "Unsupported acceptance mode" >&2; exit 2 ;;
-          esac
-          modes="$SELECTED_MODE"
-          if [ "$modes" = remaining ]; then modes="refactor audit prodready"; fi
-          status=0
-          for mode in $modes; do
-            rm -f mobile-cloud-live-proof.json
-            MODE="$mode" python .github/scripts/mobile_cloud_live_proof.py || status=1
-            if [ -f mobile-cloud-live-proof.json ]; then
-              cp mobile-cloud-live-proof.json "mobile-cloud-live-proof-$mode.json"
-            fi
-          done
-          exit "$status"
+        run: python .github/scripts/mobile_cloud_live_proof.py
 
       - name: Upload redacted live proof
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mobile-cloud-live-proof-${{ inputs.expected_sha }}
-          path: mobile-cloud-live-proof*.json
+          name: mobile-cloud-live-proof-${{ inputs.expected_sha }}-${{ github.job }}
+          path: mobile-cloud-live-proof.json
           if-no-files-found: error
           retention-days: 30
+
+  remaining-refactor:
+    if: inputs.mode == 'remaining'
+    runs-on: ubuntu-latest
+    environment: Production
+    timeout-minutes: 360
+    env:
+      FLEXFACTOR_LIVE_PROOF_TOKEN: ${{ secrets.FLEXFACTOR_LIVE_PROOF_GITHUB_TOKEN }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      TARGET_REPOSITORY: buckeye7066/flexfactor-demo-tinystats
+      MODE: refactor
+    steps: *acceptance_steps
+
+  remaining-audit:
+    needs: remaining-refactor
+    if: inputs.mode == 'remaining'
+    runs-on: ubuntu-latest
+    environment: Production
+    timeout-minutes: 360
+    env:
+      FLEXFACTOR_LIVE_PROOF_TOKEN: ${{ secrets.FLEXFACTOR_LIVE_PROOF_GITHUB_TOKEN }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      TARGET_REPOSITORY: buckeye7066/flexfactor-demo-tinystats
+      MODE: audit
+    steps: *acceptance_steps
+
+  remaining-prodready:
+    needs: remaining-audit
+    if: inputs.mode == 'remaining'
+    runs-on: ubuntu-latest
+    environment: Production
+    timeout-minutes: 360
+    env:
+      FLEXFACTOR_LIVE_PROOF_TOKEN: ${{ secrets.FLEXFACTOR_LIVE_PROOF_GITHUB_TOKEN }}
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      TARGET_REPOSITORY: buckeye7066/flexfactor-demo-tinystats
+      MODE: prodready
+    steps: *acceptance_steps

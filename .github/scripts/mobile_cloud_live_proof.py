@@ -42,6 +42,8 @@ def build_live_request(request_id, repository, client_version, mode):
 
 def validate_live_result(result, request, run_id):
     """Require the exact correlated result and truthful publication evidence."""
+    if not isinstance(result, dict):
+        raise ValueError('The phone result is not a structured object')
     expected = {'request_id': request['request_id'], 'mode': request['mode'],
                 'target_repository': request['repository'], 'target_ref': request['ref'],
                 'run_url': f"https://github.com/{request['repository']}/actions/runs/{run_id}"}
@@ -54,8 +56,28 @@ def validate_live_result(result, request, run_id):
     if any(not isinstance(sha, str) or len(sha) != 40
            or any(ch not in '0123456789abcdef' for ch in sha) for sha in (before, after)):
         raise ValueError('The phone result omitted valid source revisions')
+    if request['mode'] == 'refactor' and before == after:
+        raise ValueError('Refactor acceptance requires a verified published source change')
     if result.get('publication_required') is not (before != after):
         raise ValueError('The phone result contradicts its source-change evidence')
+
+
+def record_live_result(result, request, run_id, terminal, save):
+    """An inspected artifact is not a pass until every acceptance check succeeds."""
+    try:
+        if terminal.get('conclusion') != 'success':
+            raise ValueError('The target run did not conclude successfully')
+        validate_live_result(result, request, run_id)
+    except ValueError as error:
+        save(stage='validation-failed', result_validated=False,
+             phone_result_present=True, validation_error=str(error))
+        raise
+    save(stage='artifact-validated', result_validated=True, phone_result_present=True,
+         phone_result_success=True, phone_result_mode=result['mode'],
+         phone_result_exit_code=result['exit_code'],
+         phone_result_publication_required=result['publication_required'],
+         phone_result_publication_complete=result['publication_complete'],
+         source_before=result['source_before'], source_after=result['source_after'])
 
 
 BASE = "https://flexfactor-cloud.vercel.app"
@@ -235,19 +257,5 @@ with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                        if Path(name).name == "mobile-result.json")
     result = json.loads(bundle.read(result_name))
 
-save_proof(
-    stage="artifact-inspected",
-    phone_result_present=True,
-    phone_result_success=bool(result.get("success")),
-    phone_result_mode=result.get("mode"),
-    phone_result_exit_code=result.get("exit_code"),
-    phone_result_publication_required=result.get("publication_required"),
-    phone_result_publication_complete=result.get("publication_complete"),
-)
+record_live_result(result, run_request, run_id, terminal, save_proof)
 print(json.dumps(proof))
-
-if terminal.get("conclusion") != "success":
-    raise SystemExit("Live mobile run did not conclude successfully")
-if result.get("success") is not True:
-    raise SystemExit("Phone-readable result did not report success")
-validate_live_result(result, run_request, run_id)
