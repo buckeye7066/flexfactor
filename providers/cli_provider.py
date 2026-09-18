@@ -50,12 +50,17 @@ import os
 import re
 import shutil
 import signal
+import time
 import subprocess
 from typing import Any, Dict, Optional
 
 
 class CliUnavailable(RuntimeError):
     """Raised when the CLI cannot serve a call; the rotator handles this."""
+
+
+class CopilotModelSelectionError(CliUnavailable):
+    """This call selected another model; the expected model is not unhealthy."""
 
 
 #: Marker used to detect (and refuse) a nested invocation.
@@ -159,7 +164,7 @@ def _argv_for(api: str, binary: str, system: Optional[str],
         # call; `auto` remains accepted for ordinary calls but is explicitly
         # ineligible for family-independent authorization upstream.
         argv = [binary, "-s", "--no-ask-user", "--no-auto-update", "--no-color",
-                "--no-custom-instructions"]
+                "--no-custom-instructions", "--available-tools="]
         if model:
             argv += ["--model", str(model)]
         return argv
@@ -284,13 +289,47 @@ def _run_process_tree(argv: list, **kwargs: Any) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
+def _verified_copilot_answer(text: str, expected: str) -> str:
+    """Accept only completed, tool-free CLI output with a proven exact model."""
+    try:
+        events = [json.loads(line) for line in text.splitlines() if line.strip()]
+        if not events or any(not isinstance(row, dict) for row in events): raise ValueError()
+        selected, started, finished, answers = [], set(), set(), []
+        for row in events:
+            kind, data = row.get("type"), row.get("data", {})
+            if kind == "session.auto_mode_resolved":
+                chosen = data.get("chosenModel")
+                if chosen and chosen != expected: raise CopilotModelSelectionError("CLI selected a different concrete model for this call")
+                selected.append(chosen)
+            elif kind == "model.call_start":
+                if data.get("model") and data.get("model") != expected: raise CopilotModelSelectionError("CLI call model differed from the expected route")
+                if data.get("model") != expected: raise ValueError()
+                started.add(data["turnId"])
+            elif kind == "model.call_finished":
+                if data.get("outcome") != "success": raise ValueError()
+                finished.add(data["turnId"])
+            elif kind == "assistant.message":
+                if data.get("model") != expected or data.get("toolRequests"): raise ValueError()
+                if data.get("phase") == "final_answer": answers.append(data.get("content", ""))
+            elif str(kind).startswith("tool.execution"): raise ValueError()
+        if (not selected or set(selected) != {expected} or not started or started != finished
+                or events[-1].get("type") != "result" or events[-1].get("exitCode") != 0
+                or not answers or not isinstance(answers[-1], str) or not answers[-1].strip()):
+            raise ValueError()
+        return answers[-1]
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise CliUnavailable("Copilot automatic response lacks the required exact model identity or completed result") from None
+
+
 def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
-             timeout: float, model: Optional[str] = None) -> str:
+             timeout: float, model: Optional[str] = None, _verified_auto: bool = False) -> str:
     if os.environ.get(_RECURSION_MARKER):
         raise CliUnavailable(
             f"refusing to invoke {binary}: already running inside a "
             "CLI-provider call (nested agents would fan out per rotation step)")
-    argv = _argv_for(api, binary, system, model)
+    started = time.monotonic()
+    argv = _argv_for(api, binary, system, "auto" if _verified_auto else model)
+    if _verified_auto: argv += ["--output-format", "json"]
     # `codex exec` takes no --append-system-prompt, so the theme is prepended
     # to the prompt instead. Losing it would let a rotated call wander off the
     # run's task, which is the whole reason the theme block exists.
@@ -318,11 +357,20 @@ def _run_cli(api: str, binary: str, prompt: str, *, system: Optional[str],
     out = (proc.stdout or "").strip()
     if proc.returncode != 0:
         tail = ((proc.stderr or "") or out)[-400:]
+        # Some Copilot entitlements permit Auto but reject even the concrete
+        # model Auto selects. Retry once, then require the CLI's actual call
+        # metadata to match this route exactly. Never relabel an opaque answer.
+        if (api == "copilot-cli" and model and model != "auto" and not _verified_auto
+                and f'Model "{model}" from --model flag is not available' in tail):
+            remaining = timeout - (time.monotonic() - started)
+            if remaining > 0:
+                return _run_cli(api, binary, prompt, system=system, timeout=remaining,
+                                model=model, _verified_auto=True)
         raise CliUnavailable(f"{binary}: exited {proc.returncode}: {tail}")
     if not out:
         # An empty answer must never read as a successful empty review.
         raise CliUnavailable(f"{binary}: returned no output")
-    return out
+    return _verified_copilot_answer(out, str(model)) if _verified_auto else out
 
 
 def _inside_managed_codex_session() -> bool:

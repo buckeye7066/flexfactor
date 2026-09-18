@@ -1,3 +1,5 @@
+import { steeringSecretName } from "../lib/steering-mailbox.js";
+import { withMailboxGithub } from "../test_support/mailbox-github.js";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
@@ -74,6 +76,8 @@ function githubStore({ initialClaim, initialSecrets = [] } = {}) {
     }
     throw new Error(`Unexpected GitHub transport: ${method} ${path}`);
   };
+  api.fetch = withMailboxGithub(api.fetch, { variables });
+  api.mailbox = api.fetch.mailbox;
   return api;
 }
 
@@ -125,7 +129,7 @@ test("phone credentials use full-request scoped secret names and caller-only dis
     { OPENAI_API_KEY: sealed, ANTHROPIC_API_KEY: sealed }, api.fetch);
   const names = [scopedName(nextId), scopedName(nextId, "ANTHROPIC_API_KEY")];
   assert.deepEqual([...api.secrets.keys()], names);
-  assert.deepEqual(JSON.parse(api.variables.get(claimName(nextId))).ephemeral_secrets, names);
+  assert.deepEqual(JSON.parse(api.variables.get(claimName(nextId))).ephemeral_secrets, [...names, steeringSecretName(nextId)]);
   const inputs = api.calls.find((call) => call.path.endsWith("/dispatches")).body.inputs;
   assert.equal(inputs.openai_secret_name, names[0]);
   assert.equal(inputs.anthropic_secret_name, names[1]);
@@ -136,7 +140,7 @@ test("an owner's canonical provider secret stays untouched beside the isolated p
   const api = githubStore({ initialSecrets: ["OPENAI_API_KEY"] });
   await dispatch("test_token", request(nextId), { OPENAI_API_KEY: sealed }, api.fetch);
   assert.equal(api.secrets.get("OPENAI_API_KEY"), "existing credential");
-  assert.deepEqual(JSON.parse(api.variables.get(claimName(nextId))).ephemeral_secrets, [scopedName(nextId)]);
+  assert.deepEqual(JSON.parse(api.variables.get(claimName(nextId))).ephemeral_secrets, [scopedName(nextId), steeringSecretName(nextId)]);
   assert.equal(api.secrets.get(scopedName(nextId)), sealed.encrypted_value);
   assert.equal(api.calls.some((call) => call.path === "/actions/secrets/OPENAI_API_KEY"
     && call.method !== "GET"), false);
@@ -158,7 +162,7 @@ test("omitted phone credentials preserve the caller's canonical fallback", async
   assert.equal(inputs.openai_secret_name, "");
   assert.equal(inputs.anthropic_secret_name, "");
   assert.equal(api.secrets.get("OPENAI_API_KEY"), "existing credential");
-  assert.deepEqual(JSON.parse(api.variables.get(claimName(nextId))).ephemeral_secrets, []);
+  assert.deepEqual(JSON.parse(api.variables.get(claimName(nextId))).ephemeral_secrets, [steeringSecretName(nextId)]);
 });
 
 test("generated caller maps scoped inputs to the pinned engine's existing secret interface", () => {
@@ -167,8 +171,8 @@ test("generated caller maps scoped inputs to the pinned engine's existing secret
   const declarations = engine.split("  workflow_call:")[1].split("permissions:")[0]
     .split("    secrets:")[1];
   const names = [...declarations.matchAll(/^      ([A-Z_]+):/gm)].map((item) => item[1]);
-  assert.deepEqual(names, ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
-  for (const [input, name] of [["openai_secret_name", names[0]], ["anthropic_secret_name", names[1]]]) {
+  assert.deepEqual(names, ["STEERING_PRIVATE_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
+  for (const [input, name] of [["openai_secret_name", "OPENAI_API_KEY"], ["anthropic_secret_name", "ANTHROPIC_API_KEY"]]) {
     assert.match(workflow, new RegExp(`      ${input}:\\n        required: false\\n        type: string`));
     assert.ok(workflow.includes(name + ": " + "${{ secrets[inputs." + input + "] || secrets." + name + " }}"));
     assert.equal(workflow.split("    with:")[1].split("    secrets:")[0].includes(`${input}:`), false);

@@ -5101,11 +5101,32 @@ def _builtin_route_catalog(fr):
             # belongs to a different family from the model that authored the
             # candidate.  The CLI adapter forwards this exact identity with
             # --model rather than merely labelling an auto-selected response.
-            model="claude-sonnet-4.6", wire_model="claude-sonnet-4.6",
+            model="gpt-5.6-luna", wire_model="gpt-5.6-luna",
             api="copilot-cli", base_url="",
             pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
             tier=fr.STRONG, capabilities=model_capabilities,
             capabilities_source="declared",
+        ),
+        # A plan or installation may reject one model without rejecting its
+        # Copilot subscription. Keep concrete, independently identifiable
+        # alternatives in the SAME existing pool before dropping to local AI.
+        fr.Route(
+            id="builtin/copilot-mai-code", backend="copilot", backend_label="GitHub Copilot",
+            model="mai-code-1.1-flash", wire_model="mai-code-1.1-flash", api="copilot-cli", base_url="",
+            pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.STRONG, capabilities=model_capabilities, capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/copilot-gpt-5-6-terra", backend="copilot", backend_label="GitHub Copilot",
+            model="gpt-5.6-terra", wire_model="gpt-5.6-terra", api="copilot-cli", base_url="",
+            pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.STRONG, capabilities=model_capabilities, capabilities_source="declared",
+        ),
+        fr.Route(
+            id="builtin/copilot-sonnet-5", backend="copilot", backend_label="GitHub Copilot",
+            model="claude-sonnet-5", wire_model="claude-sonnet-5", api="copilot-cli", base_url="",
+            pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.STRONG, capabilities=model_capabilities, capabilities_source="declared",
         ),
         fr.Route(
             id="builtin/anthropic-sonnet-5", backend="anthropic_api",

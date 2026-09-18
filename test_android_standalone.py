@@ -191,7 +191,7 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("contents: write", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
         self.assertIn("secrets.ANTHROPIC_API_KEY", workflow)
-        self.assertIn("@github/copilot@1.0.81", workflow)
+        self.assertIn("@github/copilot@1.0.86", workflow)
         self.assertIn("qwen2.5-coder:7b", workflow)
         self.assertIn("deepseek-coder:6.7b", workflow)
         self.assertIn("ollama pull deepseek-coder:6.7b", workflow)
@@ -228,7 +228,8 @@ class ManagedAndroidInvariants(unittest.TestCase):
             '$rollout != "" and .engine_ref == $rollout', control_plane)
         self.assertIn(
             'declared_engine" != "$android_engine', control_plane)
-        self.assertIn("options: [auto]", workflow)
+        self.assertIn('if provider != "auto":', workflow)
+        self.assertIn("options: [auto]", (CLOUD / "lib/workflow.js").read_text(encoding="utf-8"))
         self.assertNotIn('--provider "$PROVIDER"', workflow)
         self.assertIn("publication_complete", workflow)
         self.assertIn("merge-base --is-ancestor", workflow)
@@ -395,6 +396,15 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("record.matches(activeRequest)", polling)
         self.assertIn("record.matches(queue.activeRequest())", polling)
 
+    def test_managed_steering_and_owner_probe_preserve_their_security_boundaries(self):
+        workflow = (ROOT / ".github/workflows/mobile-run.yml").read_text(encoding="utf-8")
+        self.assertNotIn("  workflow_dispatch:", workflow)
+        self.assertIn("  workflow_call:", workflow)
+        self.assertIn("STEERING_PRIVATE_KEY: ${{ secrets.STEERING_PRIVATE_KEY }}", workflow)
+        probe = (ROOT / ".github/workflows/rotation.yml").read_text(encoding="utf-8")
+        self.assertIn("github.triggering_actor == github.repository_owner", probe)
+        self.assertIn("inputs.probe_copilot && 'live-probe' || 'ci'", probe)
+
     def test_active_audits_accept_authenticated_phone_steering(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
@@ -405,9 +415,13 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("Steer this build", activity)
         self.assertIn("submitSteering", api)
         service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
-        self.assertIn("FLEXFACTOR_STEERING_", service)
-        self.assertIn("flexfactor_steering.submit", workflow)
-        self.assertIn('source="android"', workflow)
+        self.assertIn("ownedSteeringMailbox", service)
+        self.assertIn("node engine/.github/scripts/mobile_steering_launch.mjs", workflow)
+        self.assertNotIn("/actions/variables/", workflow)
+        reader = (ROOT / ".github" / "scripts" / "mobile_steering_poll.mjs").read_text(encoding="utf-8")
+        self.assertIn("submit_session_routing", reader)
+        self.assertIn("source='android'", reader)
+        self.assertNotIn("STEERING_PRIVATE_KEY:", workflow.split("- name: Run FlexFactor", 1)[1])
 
     def test_all_modes_support_a_durable_thirty_target_sequential_queue(self):
         activity = (ANDROID / "java" / "com" / "firer" / "console" /
