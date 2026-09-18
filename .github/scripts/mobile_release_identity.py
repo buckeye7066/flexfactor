@@ -10,6 +10,7 @@ PROOF_MAINTENANCE = frozenset({
     ".github/scripts/mobile_release_identity.py",
     ".github/workflows/mobile-cloud-live-proof.yml",
     "test_android_standalone.py",
+    "flexfactor_invariant_sweep_tests.py",
 })
 
 

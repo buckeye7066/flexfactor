@@ -523,6 +523,18 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    ".github/scripts/mobile_release_identity.py::_git": (
+        "Protected owner-only CI release verifier, before the app engine or "
+        "provider dependencies are loaded. Calls only read-only Git rev-parse "
+        "and diff metadata with fixed options and validated revision IDs; "
+        "no audited target command, shell program, or repository code runs."
+    ),
+    ".github/scripts/mobile_release_identity.py::verify_release_identity": (
+        "Protected release verifier runs only git merge-base --is-ancestor "
+        "with hashes already verified against the authorized checkout and "
+        "published release tag. This reads commit ancestry, never executes "
+        "target source, and cannot modify the checkout or publish anything."
+    ),
     "source_app_update.py::git": (
         "Owner-invoked source-install bootstrap for FlexFactor itself, before "
         "the runtime and its dependencies are imported. It never receives an "
