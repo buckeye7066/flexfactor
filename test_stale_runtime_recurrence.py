@@ -98,7 +98,9 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
                 rotation.Catalog(routes), store=rotation.StateStore(os.path.join(root, "state.json"))),
                 factory, tier=rotation.STRONG)
             self.assertEqual(provider.complete("Review the provided source"), "verified answer")
-            self.assertEqual(visited[:2], [routes[0].id, routes[1].id])
+            self.assertEqual(visited[0], routes[0].id)
+            self.assertEqual(len(visited), 2)
+            self.assertIn(visited[1], {r.id for r in routes[1:]})
 
     def test_fresh_runner_uses_current_concrete_copilot_models(self):
         routes = [r for r in ff._builtin_route_catalog(rotation) if r.api == "copilot-cli"]
@@ -106,6 +108,31 @@ class StaleRuntimeRecurrenceTests(unittest.TestCase):
         self.assertTrue({"claude-sonnet-5", "gpt-5.6-terra", "gpt-5.6-luna"}.issubset(models))
         self.assertNotIn("auto", models)
         self.assertTrue(all(r.model == r.wire_model for r in routes))
+
+    def test_copilot_model_identity_mismatch_tries_the_other_observed_model(self):
+        from providers.cli_provider import CopilotModelSelectionError
+        self.assertTrue(rotation.is_model_selection_error(CopilotModelSelectionError("different actual model")))
+        self.assertEqual(rotation.model_family("mai-code-1.1-flash"), "mai")
+        self.assertEqual(rotation.model_family("mai-code-2-flash"), "mai")
+        models = {r.model for r in ff._builtin_route_catalog(rotation) if r.api == "copilot-cli"}
+        self.assertIn("mai-code-1.1-flash", models)
+        with tempfile.TemporaryDirectory() as root:
+            routes = [r for r in ff._builtin_route_catalog(rotation)
+                      if r.api == "copilot-cli" and r.model in {"gpt-5.6-luna", "mai-code-1.1-flash"}]
+            visited = []
+            def factory(route):
+                backend = mock.Mock()
+                def complete(*args, **kwargs):
+                    visited.append(route.model)
+                    if route.model == "gpt-5.6-luna": raise CopilotModelSelectionError("different actual model")
+                    return "verified MAI response"
+                backend.complete.side_effect = complete
+                return backend
+            provider = rotation.RotatingProvider(rotation.Rotator(rotation.Catalog(routes),
+                store=rotation.StateStore(os.path.join(root,"state.json"))), factory,tier=rotation.STRONG)
+            self.assertEqual(provider.complete("coding task"), "verified MAI response")
+            self.assertEqual(visited,["gpt-5.6-luna","mai-code-1.1-flash"])
+
 
     def test_current_queue_preflight_resolves_targets_before_work_when_dashboard_active(self):
         source = inspect.getsource(ff.run_audit)

@@ -5111,6 +5111,12 @@ def _builtin_route_catalog(fr):
         # Copilot subscription. Keep concrete, independently identifiable
         # alternatives in the SAME existing pool before dropping to local AI.
         fr.Route(
+            id="builtin/copilot-mai-code", backend="copilot", backend_label="GitHub Copilot",
+            model="mai-code-1.1-flash", wire_model="mai-code-1.1-flash", api="copilot-cli", base_url="",
+            pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.STRONG, capabilities=model_capabilities, capabilities_source="declared",
+        ),
+        fr.Route(
             id="builtin/copilot-gpt-5-6-terra", backend="copilot", backend_label="GitHub Copilot",
             model="gpt-5.6-terra", wire_model="gpt-5.6-terra", api="copilot-cli", base_url="",
             pool="copilot:subscription", cost_class=fr.SUBSCRIPTION,

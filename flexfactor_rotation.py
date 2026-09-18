@@ -547,6 +547,8 @@ def model_family(model_id: str) -> str:
     'ollama/qwen3-coder:30b' both say 'qwen'. Unknown deployment aliases are
     opaque: distinct labels do not prove distinct underlying model families.
     """
+    if str(model_id).lower().rsplit("/", 1)[-1].startswith("mai-"):
+        return "mai"
     seg = str(model_id or "").lower().split("/")[-1]
     for needle, fam in _FAMILY_PATTERNS:
         if needle in seg:
@@ -1799,7 +1801,8 @@ class RotatingProvider:
                 malformed_cooldown: Optional[Tuple[float, str]] = None
                 # A refusal is not charged to the route either: it is a verdict
                 # on these bytes, handled call-locally below.
-                if not payload_fault and not is_model_refusal(exc):
+                if (not payload_fault and not is_model_refusal(exc)
+                        and type(exc).__name__ != "CopilotModelSelectionError"):
                     scope, reset_at = limit_scope(exc)
                     outcome = ("malformed_output"
                                if is_malformed_output(exc)
@@ -1825,6 +1828,8 @@ class RotatingProvider:
                     shape_failed_routes.append((route, malformed_cooldown))
                 if payload_fault or not _is_retryable(exc):
                     raise
+                if type(exc).__name__ == "CopilotModelSelectionError":
+                    refused_route_ids.add(route.id)
                 if is_model_refusal(exc):
                     refused_route_ids.add(route.id)
                     family = route_model_family(route)
@@ -2081,9 +2086,9 @@ _PAYLOAD_FAULT_MARKERS = ("flexfactor_egress_blocked",)
 
 def is_model_selection_error(exc: BaseException) -> bool:
     """An unavailable CLI model does not exhaust its subscription's siblings."""
-    return type(exc).__name__ == "CliUnavailable" and bool(re.search(
+    return type(exc).__name__ == "CopilotModelSelectionError" or (type(exc).__name__ == "CliUnavailable" and bool(re.search(
         r'model ["\'][^"\']+["\'] from --model flag is not available',
-        str(exc), re.IGNORECASE))
+        str(exc), re.IGNORECASE)))
 
 
 def is_transport_dead_error(exc: BaseException) -> bool:
@@ -2174,7 +2179,7 @@ def is_route_capability_error(exc: BaseException) -> bool:
     backend-credential scoped rather than a route capability.
     """
     blob = f"{type(exc).__name__} {exc}".lower()
-    if type(exc).__name__ == "RouteCapabilityError":
+    if type(exc).__name__ in ("RouteCapabilityError", "CopilotModelSelectionError"):
         return True
     if is_transport_dead_error(exc):
         return True

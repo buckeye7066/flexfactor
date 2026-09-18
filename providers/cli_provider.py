@@ -59,6 +59,10 @@ class CliUnavailable(RuntimeError):
     """Raised when the CLI cannot serve a call; the rotator handles this."""
 
 
+class CopilotModelSelectionError(CliUnavailable):
+    """This call selected another model; the expected model is not unhealthy."""
+
+
 #: Marker used to detect (and refuse) a nested invocation.
 _RECURSION_MARKER = "FLEXFACTOR_CLI_PROVIDER_ACTIVE"
 
@@ -293,8 +297,12 @@ def _verified_copilot_answer(text: str, expected: str) -> str:
         selected, started, finished, answers = [], set(), set(), []
         for row in events:
             kind, data = row.get("type"), row.get("data", {})
-            if kind == "session.auto_mode_resolved": selected.append(data.get("chosenModel"))
+            if kind == "session.auto_mode_resolved":
+                chosen = data.get("chosenModel")
+                if chosen and chosen != expected: raise CopilotModelSelectionError("CLI selected a different concrete model for this call")
+                selected.append(chosen)
             elif kind == "model.call_start":
+                if data.get("model") and data.get("model") != expected: raise CopilotModelSelectionError("CLI call model differed from the expected route")
                 if data.get("model") != expected: raise ValueError()
                 started.add(data["turnId"])
             elif kind == "model.call_finished":
