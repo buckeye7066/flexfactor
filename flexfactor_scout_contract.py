@@ -437,7 +437,7 @@ def build_integration_proposal(
     conflicts = analyze_conflicts(project_dir, files_planned, packages)
     rejection = _rejection_reason(evaluation, ev, v)
 
-    benefit_score = b.get("benefit_score")
+    benefit_score = None if evaluation.get("evaluation_complete") is False else b.get("benefit_score")
     integration_cost = _integration_cost(packages, files_planned, conflicts, ev)
 
     proposal = {
@@ -445,7 +445,10 @@ def build_integration_proposal(
         "repo": repo.get("fullName") or ev.get("repo") or "(unknown)",
         "url": repo.get("htmlUrl") or ev.get("provenance"),
         "need": evaluation.get("need"),
-        "recommendation": evaluation.get("recommendation"),
+        "recommendation": "SKIP" if evaluation.get("evaluation_complete") is False else evaluation.get("recommendation"),
+        "evaluation_status": ("incomplete" if evaluation.get("evaluation_complete") is False
+                              else "complete" if evaluation.get("evaluation_complete") is True else "unknown"),
+        "evaluation_error": str(evaluation.get("evaluation_error") or ""),
         "commit_sha": ev.get("commit_sha") or "unpinned",
         "commit_pin_source": ev.get("commit_pin_source"),
         "metadata_screened_only": True,
@@ -576,6 +579,8 @@ def _integration_cost(packages, files_planned, conflicts, ev) -> str:
 
 
 def _rejection_reason(evaluation, ev, v) -> str | None:
+    if evaluation.get("evaluation_complete") is False:
+        return "INCOMPLETE: candidate judgment did not finish; see evaluation_error"
     if evaluation.get("recommendation") == "SKIP":
         return (evaluation.get("benefit") or {}).get("rationale") or "judged unnecessary"
     if v.get("safe_to_integrate") is not True:
@@ -657,6 +662,8 @@ def recommendation_record(evaluation: dict) -> dict:
         "url": proposal.get("url"),
         "need": proposal.get("need"),
         "recommendation": proposal.get("recommendation"),
+        "evaluation_status": proposal.get("evaluation_status", "unknown"),
+        "evaluation_error": proposal.get("evaluation_error", ""),
         "commit_sha": proposal.get("commit_sha") or "unpinned",
         "license": proposal.get("license"),
         "security": proposal.get("security"),
@@ -726,6 +733,8 @@ def build_scout_structured_report(
             "approval_file": FLEXFACTOR_APPLY_APPROVAL_FILE,
         },
     }
+    if "scout_completion" in (profile or {}):
+        report["completion"] = dict(profile["scout_completion"])
     # Self-check: recommendation narratives must not claim safe-to-install.
     # Policy rules may mention the forbidden phrases (to forbid them); those
     # are excluded from the narrative scan. Boolean denial fields are also OK.
