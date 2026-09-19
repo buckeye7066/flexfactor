@@ -232,5 +232,28 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
         self.assertEqual(len(result['competitors']), 2)
 
 
+
+    def test_qualified_discovery_names_preserve_repository_boundaries(self):
+        for first, second in [('foo/bar', 'fo/obar'), ('a-b/c', 'a/b-c'), ('a-b/c', 'ab/c')]:
+            with self.subTest(first=first, second=second):
+                names = [{'name': name, 'search_query': name} for name in [first, second]]
+                result, searches = self.research_external_identities(names, {name: 'https://github.com/' + name for name in [first, second]})
+                self.assertEqual(set(searches), {first, second})
+                self.assertEqual({row['name'] for row in result['competitors']}, {first, second})
+
+    def test_international_identity_cannot_be_proven_from_its_ascii_fragment(self):
+        first, second = 'Calc\u4e00', 'Calc\u4e8c'
+        generic = {'url': 'https://calc.example/docs', 'title': 'Calc', 'content': 'Calc handles numbers.'}
+        self.assertFalse(fc._document_matches_competitor(first, generic))
+        matching = dict(generic, title=first, content=first + ' handles numbers.')
+        self.assertTrue(fc._document_matches_competitor(first, matching))
+        self.assertFalse(fc._document_matches_competitor(second, matching))
+
+    def test_complete_non_ascii_name_on_a_fetched_page_is_attributable(self):
+        name = '\u98de\u4e66'
+        self.assertTrue(fc._document_matches_competitor(name, {
+            'url': 'https://vendor.example/docs', 'title': name, 'content': name + ' documents its features.'}))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

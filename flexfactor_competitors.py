@@ -857,6 +857,9 @@ def _norm(name: str) -> str:
 
 def _discovery_key(name: str) -> str:
     """Deduplicate names without discarding international product identities."""
+    qualified = _qualified_repo_identity(str(name or ""))
+    if qualified is not None:
+        return "/".join(qualified)
     normalized = unicodedata.normalize("NFKC", str(name or "")).casefold()
     return "".join(character for character in normalized if character.isalnum())
 
@@ -896,6 +899,15 @@ def _document_matches_competitor(name: str, document: dict) -> bool:
     if not raw_name:
         return False
     tail = raw_name.rsplit("/", 1)[-1]
+    if not tail.isascii():
+        # International names need their complete identity in fetched text.
+        # Dropping their non-Latin characters can falsely attribute a page for
+        # the shared ASCII fragment to two different products.
+        identity = unicodedata.normalize("NFKC", tail).casefold()
+        visible = "\n".join(str(document.get(field) or "")
+                            for field in ("title", "content"))
+        visible = unicodedata.normalize("NFKC", visible).casefold()
+        return bool(re.search(rf"(?<!\w){re.escape(identity)}(?!\w)", visible))
     tokens = [token for token in re.findall(r"[a-z0-9]+", tail)
               if token not in _GENERIC_COMPETITOR_TOKENS and len(token) >= 3]
     if not tokens:
