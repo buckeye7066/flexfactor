@@ -255,5 +255,29 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
             'url': 'https://vendor.example/docs', 'title': name, 'content': name + ' documents its features.'}))
 
 
+
+class ScoutGithubDirectoryIdentityTests(unittest.TestCase):
+    def test_github_directories_are_not_repository_identities(self):
+        names = ['AlphaCalc', 'BetaCalc']
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {'competitors': [{'name': name, 'search_query': name} for name in names]}
+            return {'idea_title': 'Numeric input', 'what_it_does': 'Validate numbers',
+                    'why_valuable': 'Clear errors', 'evidence_basis': 'Fetched source',
+                    'purpose_reason': 'Already supported', 'accept': False,
+                    'evidence_refs': ['web-source']}
+        for route in ('topics', 'collections', 'features', 'orgs'):
+            with self.subTest(route=route):
+                url = 'https://github.com/' + route + '/numeric-tools'
+                page = dict(url=url, title='Numeric tools', evidence_id='web-source',
+                            content='AlphaCalc and BetaCalc are distinct numeric tools.', sha256='a'*64)
+                with patch.object(fc, 'web_search', return_value=([page], 'fixture', {})), \
+                     patch.object(fc, 'github_repo_search', return_value=[]), \
+                     patch.object(fc, 'fetch_evidence_document', return_value=page):
+                    result = fc.research_competitors(judge, 'Numeric CLI', 'Compute means',
+                                                    target=2, log=lambda *_: None)
+                self.assertEqual(result['verified'], 2)
+                self.assertEqual({row['name'] for row in result['competitors']}, set(names))
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

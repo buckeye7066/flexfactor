@@ -867,6 +867,11 @@ def _discovery_key(name: str) -> str:
 # Search-engine chrome that is not evidence of anything (DDG's own logo/help
 # links came back as "evidence URLs" in the first live run).
 _NON_EVIDENCE_HOSTS = ("duckduckgo.com", "lite.duckduckgo.com", "html.duckduckgo.com")
+# Site directories and product pages are not owner/repository roots.
+_GITHUB_NON_REPOSITORY_ROUTES = frozenset({
+    "features", "topics", "collections", "marketplace", "orgs", "users",
+    "settings", "sponsors", "search", "enterprise",
+})
 
 # Generic product nouns are not an identity check. A page about some unrelated
 # "software platform" must not become evidence for a competitor whose name
@@ -1483,6 +1488,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                     and parsed.username is None and parsed.password is None
                     and port in (None, 443 if parsed.scheme == "https" else 80)
                     and len(parts) == 2
+                    and parts[0].casefold() not in _GITHUB_NON_REPOSITORY_ROUTES
                     and all(part.isascii() and re.fullmatch(r"[a-zA-Z0-9_.-]+", part)
                             and part not in (".", "..") for part in parts)):
                 owner, repository = (part.casefold() for part in parts)
