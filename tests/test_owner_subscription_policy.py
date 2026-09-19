@@ -28,7 +28,6 @@ class OwnerSubscriptionPolicyTests(unittest.TestCase):
             self.assertIsNotNone(client)
             load.assert_not_called()
 
-if __name__=='__main__': unittest.main()
 
 class OwnerInvocationContractTests(unittest.TestCase):
     def test_subscription_error_cannot_be_returned_as_a_completed_result(self):
@@ -42,3 +41,35 @@ class OwnerInvocationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root,mock.patch.dict(os.environ,{'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY':'1'}):
             rotator=R.Rotator(R.Catalog([route]),R.StateStore(os.path.join(root,'state.json')))
             with self.assertRaises(R.PinUnavailable):rotator.next_route(allow_paid=True,pin='api')
+
+class OwnerWorkerDeliveryTests(unittest.TestCase):
+    def test_managed_session_cannot_launch_nested_owner_inference(self):
+        from providers.owner_subscription import OfficialOwnerSubscription
+        with mock.patch.dict(os.environ,{'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY':'1','FLEXFACTOR_OWNER_CODEX_HOME':tempfile.gettempdir(),'CODEX_THREAD_ID':'managed-fixture'}), mock.patch.object(cp,'_run_process_tree') as run:
+            with self.assertRaises(cp.CliUnavailable):
+                OfficialOwnerSubscription('gpt-6-astra',30).complete('fixture')
+            run.assert_not_called()
+    def test_installed_provider_declares_and_delivers_worker_resources(self):
+        import tomllib
+        import providers.owner_subscription as owner
+        root=Path(__file__).resolve().parents[1]
+        config=tomllib.loads((root/'pyproject.toml').read_text(encoding='utf8'))
+        self.assertIn('owner_ai/*.mjs',config['tool']['setuptools']['package-data'].get('providers',[]))
+        for name in ['run-owner.mjs','officialCli.mjs','codexAppServer.mjs']:
+            self.assertTrue((Path(owner.__file__).resolve().parent/'owner_ai'/name).is_file(),name)
+    def test_planner_observes_owner_worker_output_and_input_limits(self):
+        import flexfactor as ff
+        from providers.owner_subscription import OfficialOwnerSubscription
+        subscription=OfficialOwnerSubscription('gpt-6-astra',30)
+        provider=cp.CliProvider('codex-cli','codex','codex',subscription=subscription)
+        self.assertLessEqual(ff._provider_output_ceiling(provider),32000)
+        self.assertFalse(ff._whole_file_is_plausible(provider,'x'*250000))
+
+class OwnerProtocolTests(unittest.TestCase):
+    def test_actual_model_authentication_and_cancellation_protocol(self):
+        import subprocess
+        root=Path(__file__).resolve().parents[1]
+        result=subprocess.run(['node','--test',str(root/'tests/owner_subscription_protocol.mjs')],capture_output=True,text=True,timeout=20)
+        self.assertEqual(result.returncode,0,result.stdout[-4000:]+result.stderr[-1000:])
+
+if __name__=='__main__': unittest.main()

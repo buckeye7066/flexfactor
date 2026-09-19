@@ -17,11 +17,15 @@ def owner_route_allowed(route: Any) -> bool:
     return getattr(route, 'cost_class', '') != 'subscription' or getattr(route, 'api', '') == 'codex-cli'
 
 class OfficialOwnerSubscription:
+    max_output_tokens = 32000
+    max_input_bytes = 190000
     def __init__(self, model: str, timeout: float):
         self.model = os.environ.get('FLEXFACTOR_OWNER_CODEX_MODEL') or ('gpt-6-astra' if model in ('', 'auto', 'default', 'codex') else model)
         self.timeout = min(120.0, max(1.0, timeout))
     def complete(self, prompt: str, *, system: str | None = None, max_tokens: int = 4096, timeout: float | None = None) -> str:
-        from providers.cli_provider import CliUnavailable, _run_process_tree
+        from providers.cli_provider import CliUnavailable, _run_process_tree, _inside_managed_codex_session
+        if _inside_managed_codex_session():
+            raise CliUnavailable("Owner subscription inference is unavailable inside a managed Codex session")
         home = os.environ.get('FLEXFACTOR_OWNER_CODEX_HOME', '')
         if not owner_subscription_only() or not Path(home).is_absolute():
             raise CliUnavailable('Owner ChatGPT subscription is not enrolled on this installation')
@@ -35,8 +39,13 @@ class OfficialOwnerSubscription:
         budget = min(self.timeout, float(timeout or self.timeout))
         payload = {'providers': ['codex'], 'system': system or '', 'prompt': prompt, 'format': 'text',
                    'maxTokens': max(2, min(32000, int(max_tokens))), 'timeoutMs': int(budget * 1000)}
-        script = Path(__file__).resolve().parents[1] / 'tools' / 'owner-ai' / 'run-owner.mjs'
-        result = _run_process_tree([node, str(script)], input=json.dumps(payload), capture_output=True,
+        serialized = json.dumps(payload, ensure_ascii=False)
+        if len(serialized.encode('utf-8')) > self.max_input_bytes:
+            raise CliUnavailable('Owner subscription input exceeds the declared worker limit')
+        script = Path(__file__).resolve().parent / 'owner_ai' / 'run-owner.mjs'
+        if not script.is_file():
+            raise CliUnavailable('The installed owner worker resource is missing')
+        result = _run_process_tree([node, str(script)], input=serialized, capture_output=True,
             text=True, encoding='utf-8', errors='replace', timeout=budget + 10, env=env, shell=False)
         try:
             data = json.loads(result.stdout or '{}')

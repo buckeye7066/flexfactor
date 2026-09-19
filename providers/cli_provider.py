@@ -480,6 +480,8 @@ class CliProvider:
         self._subscription = (
             build_subscription_client(api, model, binary, self._timeout)
             if subscription is _DEFAULT_SUBSCRIPTION else subscription)
+        self.max_output_tokens = getattr(self._subscription, "max_output_tokens", None)
+        self.max_input_bytes = getattr(self._subscription, "max_input_bytes", None)
 
     def _complete(self, prompt: str, *, system: Optional[str],
                   max_tokens: int, timeout: Optional[float] = None) -> str:

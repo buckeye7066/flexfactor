@@ -15114,6 +15114,9 @@ _WHOLE_FILE_HEADROOM = 0.8   # never plan to use the last fifth of the ceiling
 
 def _provider_output_ceiling(provider) -> int:
     """Max output tokens this provider's AUTHOR model can emit in one response."""
+    declared = getattr(provider, "max_output_tokens", None)
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+        return declared
     model = str(getattr(provider, "model", "") or "")
     if isinstance(provider, OpenAIProvider) or model.startswith(("gpt-", "o3", "o4")):
         return _openai_output_ceiling(model)
@@ -15132,6 +15135,9 @@ def _whole_file_is_plausible(provider, text: str) -> bool:
     False the fix loop STAYS ANCHORED and retries edits, which can still succeed
     at any file size.
     """
+    input_limit = getattr(provider, "max_input_bytes", None)
+    if isinstance(input_limit, int) and len((text or "").encode("utf-8")) >= input_limit // 2:
+        return False
     ceiling = _provider_output_ceiling(provider)
     return (len(text or "") / _CHARS_PER_TOKEN) <= ceiling * _WHOLE_FILE_HEADROOM
 
