@@ -148,6 +148,8 @@ jobs:
                    test_git_hook_safety_regression.py \
                    test_wip_preservation_regression.py \
                    test_release_competitor_gate.py \
+                   test_scout_completion.py \
+                   test_scout_candidate_budget.py \
                    test_release_project_resolution.py \
                    test_flexfactor_release_policy.py \
                    flexfactor_product_invariants_tests.py \
