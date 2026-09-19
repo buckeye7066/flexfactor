@@ -587,6 +587,34 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("void check(CheckCallback callback)", updater)
 
 class MobileFailureDiagnosticTests(unittest.TestCase):
+    def test_mobile_progress_is_visible_while_the_engine_is_still_running(self):
+        import os, queue, subprocess, sys, threading
+        workflow = (ROOT / '.github/workflows/mobile-run.yml').read_text(encoding='utf-8')
+        environment = dict(os.environ)
+        environment.pop('PYTHONUNBUFFERED', None)
+        match = re.search(r'^      PYTHONUNBUFFERED: ["\']?([01])["\']?\s*$', workflow, re.M)
+        if match:
+            environment['PYTHONUNBUFFERED'] = match.group(1)
+        process = subprocess.Popen([sys.executable, '-c',
+            'import time; print("mobile progress ready"); time.sleep(10)'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
+        messages = queue.Queue()
+        reader = threading.Thread(target=lambda: messages.put(process.stdout.readline()), daemon=True)
+        reader.start()
+        try:
+            try:
+                message = messages.get(timeout=3)
+            except queue.Empty:
+                self.fail('Live engine progress was buffered until process exit')
+            self.assertEqual(message.strip(), 'mobile progress ready')
+            self.assertIsNone(process.poll())
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            reader.join(timeout=5)
+            process.stdout.close()
+            process.stderr.close()
+
     def test_mobile_workflow_bounds_and_redacts_failure_diagnostics(self):
         workflow = (ROOT / ".github" / "workflows" / "mobile-run.yml").read_text(
             encoding="utf-8")
