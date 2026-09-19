@@ -23,7 +23,7 @@
     },
     {
       "id": "cb-3",
-      "text": "An explicitly enrolled owner installation uses official ChatGPT-authenticated Codex, then configured free/local routes; metered fallback is disabled. Other installations retain their own subscription/API/free ranking. All cloud, CLI, Cursor and research payloads obey the egress gate.",
+      "text": "Enrolled owners use official ChatGPT Codex then free/local, never metered APIs. Other installs use their own providers. Egress gates cover all cloud, CLI, Cursor and research payloads.",
       "confidence": "verified",
       "evidence_refs": [
         1,
@@ -239,7 +239,7 @@
     "A. Queue 1-30 targets sequentially; never overlap targets.",
     "B. Pass 1 covers the repository; passes 2-6 equal the prior verified delta.",
     "C. Evaluate the configured corroborated-competitor target between passes 1 and 2; the default is 25 and explicit run limits are honored.",
-    "D. Explicitly enrolled owner coding uses the official ChatGPT subscription then free/local, never metered fallback; other installations cannot borrow the owner account.",
+    "D. Enrolled owner: official ChatGPT Codex then free/local; no metered API.",
     "E. Target-controlled commands cross the execution broker.",
     "F. Analyze every relevant file completely or name the blocker.",
     "G. Cite purpose sources, contradictions, unknowns, and confidence before mutation.",
@@ -308,14 +308,14 @@
       "kind": "source",
       "locator": "flexfactor_rotation.py",
       "content_hash": "cab15792a8d6ca881a8c27b311f0cb30a74eb8d6a3e44efea772fd72d0a45627",
-      "observed_at": "2026-09-19T01:43:36.804721+00:00",
+      "observed_at": "2026-09-19T01:44:02.011159+00:00",
       "excerpt": "Subscription-first ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
       "content_hash": "6ce7ec132c4fe36e6f9789d09e00f77fb9602e701657aafdb32624905d4fa18b",
-      "observed_at": "2026-09-19T01:43:36.806351+00:00",
+      "observed_at": "2026-09-19T01:44:02.011159+00:00",
       "excerpt": "Modes, verification, review, publication."
     },
     {
