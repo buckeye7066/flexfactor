@@ -277,14 +277,27 @@ def install():
             if getattr(provider,"_flexfactor_capacity_wrapped",False): return provider
             with _PROVIDER_WRAP_LOCK:
                 if getattr(provider,"_flexfactor_capacity_wrapped",False): return provider
+                # One logical synchronous provider call owns one allowance.
+                # CLI grade() delegates to structured(); wrapping both used to
+                # queue the inner method behind its own still-renewing lease.
+                # Scope reentrancy to this provider AND thread: independent
+                # concurrent callers must still enter the shared admission gate.
+                owned=threading.local()
                 for name in ("complete","structured","grade","ping"):
                     original=getattr(provider,name,None)
                     if not callable(original): continue
                     def make_guard(fn):
+                        @functools.wraps(fn)
                         def guarded(*a,**kw):
-                            app=str(getattr(self,"_purpose","") or getattr(self.rotator,"app","flexfactor")); lease=_MANAGER.acquire(route,app=app)
-                            try: return _renewing_call(_MANAGER,lease,fn,*a,**kw)
-                            finally: _MANAGER.release(lease)
+                            if getattr(owned,"active",False): return fn(*a,**kw)
+                            manager=_MANAGER
+                            app=str(getattr(self,"_purpose","") or getattr(self.rotator,"app","flexfactor"))
+                            lease=manager.acquire(route,app=app)
+                            owned.active=True
+                            try: return _renewing_call(manager,lease,fn,*a,**kw)
+                            finally:
+                                owned.active=False
+                                manager.release(lease)
                         return guarded
                     setattr(provider,name,make_guard(original))
                 setattr(provider,"_flexfactor_capacity_wrapped",True)
