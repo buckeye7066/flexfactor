@@ -23,7 +23,7 @@
     },
     {
       "id": "cb-3",
-      "text": "Owner coding uses subscriptions before metered APIs and then free/local, strongest first per class. All cloud, CLI, Cursor and research payloads obey the egress gate.",
+      "text": "Enrolled owners use official ChatGPT Codex then free/local, never metered APIs. Other installs use their own providers. Egress gates cover all cloud, CLI, Cursor and research payloads.",
       "confidence": "verified",
       "evidence_refs": [
         1,
@@ -239,7 +239,7 @@
     "A. Queue 1-30 targets sequentially; never overlap targets.",
     "B. Pass 1 covers the repository; passes 2-6 equal the prior verified delta.",
     "C. Evaluate the configured corroborated-competitor target between passes 1 and 2; the default is 25 and explicit run limits are honored.",
-    "D. Owner coding uses subscriptions, metered APIs, then free/local.",
+    "D. Enrolled owner: official ChatGPT Codex then free/local; no metered API.",
     "E. Target-controlled commands cross the execution broker.",
     "F. Analyze every relevant file completely or name the blocker.",
     "G. Cite purpose sources, contradictions, unknowns, and confidence before mutation.",
@@ -307,15 +307,15 @@
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "5b2adbd4d8c1e46b0ac9820954985c84dcaddd16507c0066ceb69ecfe7629642",
-      "observed_at": "2026-09-18T21:53:22.653150+00:00",
+      "content_hash": "cab15792a8d6ca881a8c27b311f0cb30a74eb8d6a3e44efea772fd72d0a45627",
+      "observed_at": "2026-09-19T16:27:39.221224+00:00",
       "excerpt": "Subscription-first ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "c9b73764aa9a130a9b0e8c51354abcc44354ab562cafc9a059734b5587d9584f",
-      "observed_at": "2026-09-19T00:42:22.697821+00:00",
+      "content_hash": "df67722e5eb49cc3df18852691d1615729bbc23cc241602dbf8e5ba5061dd195",
+      "observed_at": "2026-09-19T16:33:24.840945+00:00",
       "excerpt": "Modes, verification, review, publication."
     },
     {

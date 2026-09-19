@@ -83,6 +83,7 @@ py-modules = [
 ]
 
 [tool.setuptools.package-data]
+providers = ["owner_ai/*.mjs"]
 flexfactor_assets = ["*.js"]
 competitors = ["*.json"]
 

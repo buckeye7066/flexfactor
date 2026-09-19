@@ -2096,10 +2096,16 @@ def _stream_with_deadline(client, *, deadline_s: float | None = None,
 # errors fire BEFORE any call and are never rescued; refusals are never rescued.
 
 def _fallback_anthropic_key() -> str:
+    from providers.owner_subscription import owner_subscription_only
+    if owner_subscription_only():
+        return ""
     return (os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY") or "").strip()
 
 
 def _fallback_openai_key() -> str:
+    from providers.owner_subscription import owner_subscription_only
+    if owner_subscription_only():
+        return ""
     return (os.environ.get("FLEXFACTOR_FALLBACK_OPENAI_KEY") or "").strip()
 
 
@@ -3994,6 +4000,13 @@ def make_provider(name: str, model: str, meter: CostMeter | None = None,
                   judge_model: str | None = None):
     # judge_model defaults to the provider's cheap tier; pass the author model id
     # (or use --judge-model with that value) to opt out of tiering.
+    from providers.owner_subscription import owner_subscription_only
+    if owner_subscription_only() and name in ("openai", "anthropic"):
+        from providers.cli_provider import CliProvider
+        prov = CliProvider("codex-cli", os.environ.get("FLEXFACTOR_OWNER_CODEX_MODEL") or "gpt-6-astra",
+                           "codex", payload_guard=_egress_gate)
+        prov.meter = meter
+        return prov
     jm = judge_model or JUDGE_MODELS.get(name) or model
     if name == "anthropic":
         prov = AnthropicProvider(model, judge_model=jm)
@@ -4565,6 +4578,10 @@ def _rotation_route_provider(route):
     protection — egress gate, budget guard, output ceilings — applies to
     rotated calls exactly as to fixed-provider calls.
     """
+    from providers.owner_subscription import owner_route_allowed
+    if not owner_route_allowed(route):
+        from providers.cli_provider import CliUnavailable
+        raise CliUnavailable("Route is excluded by the owner subscription-only policy")
     wire = route.wire_model or route.model
     if route.is_free and wire:
         _FREE_ROUTE_MODELS.add(wire)   # $0 pricing; see _price_for
@@ -5166,6 +5183,19 @@ def _builtin_route_catalog(fr):
             capabilities=model_capabilities, capabilities_source="declared",
         ),
     ]
+    from providers.owner_subscription import owner_subscription_only
+    if owner_subscription_only():
+        # A fresh owner install must not need an unrelated AI Time catalog to
+        # discover its explicitly enrolled official subscription transport.
+        owner_model = os.environ.get("FLEXFACTOR_OWNER_CODEX_MODEL") or "gpt-6-astra"
+        routes.insert(0, fr.Route(
+            id="builtin/owner-codex", backend="codex-cli",
+            backend_label="Owner ChatGPT subscription", model=owner_model,
+            wire_model=owner_model, api="codex-cli", base_url="",
+            pool="codex:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.FRONTIER, capabilities=model_capabilities,
+            capabilities_source="declared",
+        ))
     if _provider_free_routed("anthropic"):
         routes.append(fr.Route(
             id="builtin/fcc", backend="anthropic_fcc",
@@ -5314,6 +5344,12 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     # return raw dicts/text, and a malformed one checked only after grade()
     # returned could never be rotated away from (review on #176).
     provider.grade_validator = _normalize_grade
+    from providers.owner_subscription import owner_subscription_only, OfficialOwnerSubscription
+    if owner_subscription_only() and any(route.api == "codex-cli" for route in usable):
+        # Whole-file planning sees this wrapper, not its eventual CLI provider.
+        # Preserve the worker's limits before choosing a route or requesting output.
+        provider.max_output_tokens = OfficialOwnerSubscription.max_output_tokens
+        provider.max_input_bytes = OfficialOwnerSubscription.max_input_bytes
     return provider
 
 
@@ -15104,6 +15140,9 @@ _WHOLE_FILE_HEADROOM = 0.8   # never plan to use the last fifth of the ceiling
 
 def _provider_output_ceiling(provider) -> int:
     """Max output tokens this provider's AUTHOR model can emit in one response."""
+    declared = getattr(provider, "max_output_tokens", None)
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+        return declared
     model = str(getattr(provider, "model", "") or "")
     if isinstance(provider, OpenAIProvider) or model.startswith(("gpt-", "o3", "o4")):
         return _openai_output_ceiling(model)
@@ -15122,6 +15161,9 @@ def _whole_file_is_plausible(provider, text: str) -> bool:
     False the fix loop STAYS ANCHORED and retries edits, which can still succeed
     at any file size.
     """
+    input_limit = getattr(provider, "max_input_bytes", None)
+    if isinstance(input_limit, int) and len((text or "").encode("utf-8")) >= input_limit // 2:
+        return False
     ceiling = _provider_output_ceiling(provider)
     return (len(text or "") / _CHARS_PER_TOKEN) <= ceiling * _WHOLE_FILE_HEADROOM
 

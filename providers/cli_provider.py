@@ -155,7 +155,7 @@ def _argv_for(api: str, binary: str, system: Optional[str],
         # this nested process supplies inference only.
         return [binary, "exec", "--ephemeral", "--ignore-user-config",
                 "--sandbox", "read-only", "--color", "never",
-                "--skip-git-repo-check", "-"]
+                "--skip-git-repo-check", "-c", "forced_login_method=chatgpt", "-"]
     if api == "copilot-cli":
         # Silent programmatic mode reads the prompt from stdin. No tools are
         # allowlisted: FlexFactor needs model inference here, not a second agent
@@ -445,6 +445,9 @@ def build_subscription_client(api: str, model: str, binary: str,
     """
     if str(api or "").lower() != "codex-cli":
         return None
+    from providers.owner_subscription import owner_subscription_only, OfficialOwnerSubscription
+    if owner_subscription_only():
+        return OfficialOwnerSubscription(model, timeout)
     # Lazy import keeps the other CLI adapters dependency-free and preserves
     # their original startup behavior.
     from providers.chatgpt_subscription import (
@@ -463,8 +466,10 @@ class CliProvider:
     def __init__(self, api: str, model: str, binary: str,
                  judge_model: Optional[str] = None,
                  timeout: float = DEFAULT_TIMEOUT_S,
-                 subscription: Any = _DEFAULT_SUBSCRIPTION) -> None:
+                 subscription: Any = _DEFAULT_SUBSCRIPTION,
+                 payload_guard: Any = None) -> None:
         self.api = api
+        self.payload_guard = payload_guard
         self.model = model
         self.judge_model = judge_model or model
         self._binary = binary
@@ -477,9 +482,15 @@ class CliProvider:
         self._subscription = (
             build_subscription_client(api, model, binary, self._timeout)
             if subscription is _DEFAULT_SUBSCRIPTION else subscription)
+        self.max_output_tokens = getattr(self._subscription, "max_output_tokens", None)
+        self.max_input_bytes = getattr(self._subscription, "max_input_bytes", None)
 
     def _complete(self, prompt: str, *, system: Optional[str],
                   max_tokens: int, timeout: Optional[float] = None) -> str:
+        # Fixed-owner calls need the same source policy as outer rotation.
+        # Apply the returned value so redaction, not the original, reaches the wire.
+        if self.payload_guard is not None:
+            prompt = self.payload_guard(prompt)
         if self._subscription is not None:
             from providers.chatgpt_subscription import (
                 SubscriptionAuthenticationError, SubscriptionUnavailable,
