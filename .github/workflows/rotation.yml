@@ -185,5 +185,9 @@ jobs:
       - name: Prove production-purpose inference without target mutation
         env:
           COPILOT_GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          FLEXFACTOR_CLI_TIMEOUT: "45"
+          FLEXFACTOR_OLLAMA_TIMEOUT: "30"
+          PYTHONUNBUFFERED: "1"
           FLEXFACTOR_ROTATION_EXTENSIONS: "1"
         run: python -u .github/scripts/mobile_inference_probe.py
