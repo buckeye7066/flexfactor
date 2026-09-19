@@ -38,6 +38,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from providers.owner_subscription import owner_route_allowed, owner_subscription_only
+
 SCHEMA = 1
 
 # Cost classes, cheapest first. Mirrors aitime.catalog.
@@ -753,6 +755,7 @@ class Rotator:
             permanent_alternatives = [
                 route for route in self.catalog.routes
                 if route.enabled
+                and owner_route_allowed(route)
                 and route.tier in permitted_tiers
                 and (allow_paid or route.is_free)
                 and route_model_family(route) not in excluded
@@ -791,8 +794,9 @@ class Rotator:
             # Owner policy: use every eligible subscription tier before any
             # metered API tier; genuinely free/local capacity remains last.
             # The ordinary rotator keeps its original per-tier behavior.
-            cost_phases = ((True, SUBSCRIPTION), (True, PAID_METERED), (False, None)) \
-                if paid_first and allow_paid else ((None, None),)
+            cost_phases = ((True, SUBSCRIPTION), (False, None)) if owner_subscription_only() else (\
+                ((True, SUBSCRIPTION), (True, PAID_METERED), (False, None)) \
+                if paid_first and allow_paid else ((None, None),))
             for paid_capacity, cost_class in cost_phases:
                 for depth, candidate_tier in enumerate(tiers):
                     selection = self._pick_in_tier(
@@ -873,7 +877,7 @@ class Rotator:
         # the pin can come from the SHARED state file (another app's "global"
         # pin), so honoring it blind here let a $0 call silently go paid and
         # re-selected an exhausted daily allowance on every call.
-        usable = [r for r in matches if r.enabled and r.id not in excluded_route_ids
+        usable = [r for r in matches if r.enabled and owner_route_allowed(r) and r.id not in excluded_route_ids
                   and (allow_paid or r.is_free)
                   and not (intent is not None and intent.avoid_families
                            and route_model_family(r) in (
@@ -933,6 +937,9 @@ class Rotator:
                       excluded_route_ids: frozenset[str] = frozenset()) -> Optional[Selection]:
         candidates: List[Route] = []
         for route in self.catalog.routes:
+            if not owner_route_allowed(route):
+                reasons.setdefault(route.pool, "owner subscription-only policy")
+                continue
             if route.id in excluded_route_ids:
                 continue
             if route.tier != tier:
@@ -943,7 +950,7 @@ class Rotator:
                 reasons.setdefault(route.pool, route.disabled_reason or "disabled")
                 continue
             paid_when_forbidden = (
-                route.uses_paid_capacity if paid_first else not route.is_free
+                route.uses_paid_capacity if paid_first and not owner_subscription_only() else not route.is_free
             )
             if not allow_paid and paid_when_forbidden:
                 reasons.setdefault(route.pool, "paid-metered, and allow_paid is off")

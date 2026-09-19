@@ -3994,6 +3994,12 @@ def make_provider(name: str, model: str, meter: CostMeter | None = None,
                   judge_model: str | None = None):
     # judge_model defaults to the provider's cheap tier; pass the author model id
     # (or use --judge-model with that value) to opt out of tiering.
+    from providers.owner_subscription import owner_subscription_only
+    if owner_subscription_only() and name in ("openai", "anthropic"):
+        from providers.cli_provider import CliProvider
+        prov = CliProvider("codex-cli", os.environ.get("FLEXFACTOR_OWNER_CODEX_MODEL", "gpt-6-astra"), "codex")
+        prov.meter = meter
+        return prov
     jm = judge_model or JUDGE_MODELS.get(name) or model
     if name == "anthropic":
         prov = AnthropicProvider(model, judge_model=jm)
@@ -4561,6 +4567,10 @@ def _rotation_route_provider(route):
     protection — egress gate, budget guard, output ceilings — applies to
     rotated calls exactly as to fixed-provider calls.
     """
+    from providers.owner_subscription import owner_route_allowed
+    if not owner_route_allowed(route):
+        from providers.cli_provider import CliUnavailable
+        raise CliUnavailable("Route is excluded by the owner subscription-only policy")
     wire = route.wire_model or route.model
     if route.is_free and wire:
         _FREE_ROUTE_MODELS.add(wire)   # $0 pricing; see _price_for

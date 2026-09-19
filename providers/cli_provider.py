@@ -155,7 +155,7 @@ def _argv_for(api: str, binary: str, system: Optional[str],
         # this nested process supplies inference only.
         return [binary, "exec", "--ephemeral", "--ignore-user-config",
                 "--sandbox", "read-only", "--color", "never",
-                "--skip-git-repo-check", "-"]
+                "--skip-git-repo-check", "-c", "forced_login_method=chatgpt", "-"]
     if api == "copilot-cli":
         # Silent programmatic mode reads the prompt from stdin. No tools are
         # allowlisted: FlexFactor needs model inference here, not a second agent
@@ -445,6 +445,9 @@ def build_subscription_client(api: str, model: str, binary: str,
     """
     if str(api or "").lower() != "codex-cli":
         return None
+    from providers.owner_subscription import owner_subscription_only, OfficialOwnerSubscription
+    if owner_subscription_only():
+        return OfficialOwnerSubscription(model, timeout)
     # Lazy import keeps the other CLI adapters dependency-free and preserves
     # their original startup behavior.
     from providers.chatgpt_subscription import (
