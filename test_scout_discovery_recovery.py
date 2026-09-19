@@ -96,7 +96,7 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
                     'why_valuable': 'Validate user input', 'evidence_basis': 'Source page',
                     'purpose_reason': 'Already present', 'accept': False, 'evidence_refs': ['web-abc123']}
         with patch.object(fc, 'web_search', side_effect=search), \
-             patch.object(fc, 'github_repo_search', return_value=[]), \
+             patch.object(fc, 'github_repo_search', return_value=[dict(name='tj/commander.js', url='https://github.com/tj/commander.js', license=None)]), \
              patch.object(fc, 'fetch_evidence_document', side_effect=fetch) as fetched:
             result = fc.research_competitors(judge, 'CLI', 'Calculate means', target=2, log=lambda *_: None)
         self.assertEqual(len(result['competitors']), 1)
@@ -123,7 +123,7 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
         rr = lambda query: [{'repo': {'fullName': 'UniqueParser/UniqueParser',
                                       'htmlUrl': unique, 'licenseSpdx': 'MIT', 'stars': 0}}]
         with patch.object(fc, 'web_search', return_value=([{'url': shared}], 'fixture', {})), \
-             patch.object(fc, 'github_repo_search', return_value=[]), \
+             patch.object(fc, 'github_repo_search', return_value=[dict(name='example/shared-parser', url=shared, license=None)]), \
              patch.object(fc, 'fetch_evidence_document', side_effect=fetch):
             result = fc.research_competitors(judge, 'CLI', 'Compute means', target=2,
                                             rr_search=rr, log=lambda *_: None)
@@ -160,7 +160,7 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
         rr = lambda query: [{'repo': {'fullName': 'tj/commander.js', 'htmlUrl': url,
                                       'licenseSpdx': 'MIT', 'stars': 0}}]
         with patch.object(fc, 'web_search', return_value=([page], 'fixture', {})), \
-             patch.object(fc, 'github_repo_search', return_value=[]), \
+             patch.object(fc, 'github_repo_search', return_value=[dict(name='tj/commander.js', url=url, license=None)]), \
              patch.object(fc, 'fetch_evidence_document', return_value=page) as fetched:
             result = fc.research_competitors(judge, 'CLI', 'Parse options', target=1,
                                             rr_search=rr, source_inspector=inspect, log=lambda *_: None)
@@ -266,7 +266,7 @@ class ScoutGithubDirectoryIdentityTests(unittest.TestCase):
                     'why_valuable': 'Clear errors', 'evidence_basis': 'Fetched source',
                     'purpose_reason': 'Already supported', 'accept': False,
                     'evidence_refs': ['web-source']}
-        for route in ('topics', 'collections', 'features', 'orgs'):
+        for route in ('topics', 'collections', 'features', 'orgs', 'apps', 'login', 'future-directory'):
             with self.subTest(route=route):
                 url = 'https://github.com/' + route + '/numeric-tools'
                 page = dict(url=url, title='Numeric tools', evidence_id='web-source',
@@ -278,6 +278,28 @@ class ScoutGithubDirectoryIdentityTests(unittest.TestCase):
                                                     target=2, log=lambda *_: None)
                 self.assertEqual(result['verified'], 2)
                 self.assertEqual({row['name'] for row in result['competitors']}, set(names))
+
+
+    def test_repository_identity_requires_api_name_and_url_to_agree(self):
+        names = ['AlphaCalc', 'BetaCalc']
+        url = 'https://github.com/apps/numeric-tools'
+        page = dict(url=url, title='Numeric tools', evidence_id='web-source',
+                    content='AlphaCalc and BetaCalc are distinct numeric tools.', sha256='a'*64)
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {'competitors': [{'name': name, 'search_query': name} for name in names]}
+            return {'idea_title': 'Numeric input', 'what_it_does': 'Validate numbers',
+                    'why_valuable': 'Clear errors', 'evidence_basis': 'Fetched source',
+                    'purpose_reason': 'Already supported', 'accept': False,
+                    'evidence_refs': ['web-source']}
+        unrelated = dict(name='different/repository', url=url, license=None)
+        with patch.object(fc, 'web_search', return_value=([page], 'fixture', {})), \
+             patch.object(fc, 'github_repo_search', return_value=[unrelated]), \
+             patch.object(fc, 'fetch_evidence_document', return_value=page):
+            result = fc.research_competitors(judge, 'Numeric CLI', 'Compute means',
+                                            target=2, log=lambda *_: None)
+        self.assertEqual(result['verified'], 2)
+        self.assertEqual({row['name'] for row in result['competitors']}, set(names))
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

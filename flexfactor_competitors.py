@@ -867,11 +867,6 @@ def _discovery_key(name: str) -> str:
 # Search-engine chrome that is not evidence of anything (DDG's own logo/help
 # links came back as "evidence URLs" in the first live run).
 _NON_EVIDENCE_HOSTS = ("duckduckgo.com", "lite.duckduckgo.com", "html.duckduckgo.com")
-# Site directories and product pages are not owner/repository roots.
-_GITHUB_NON_REPOSITORY_ROUTES = frozenset({
-    "features", "topics", "collections", "marketplace", "orgs", "users",
-    "settings", "sponsors", "search", "enterprise",
-})
 
 # Generic product nouns are not an identity check. A page about some unrelated
 # "software platform" must not become evidence for a competitor whose name
@@ -960,6 +955,25 @@ def _qualified_repo_identity(value: str) -> tuple[str, str] | None:
     if len(parts) != 2 or not all(parts):
         return None
     return parts[0].casefold(), parts[1].casefold()
+
+
+def _github_root_shape(url: str) -> tuple[str, str] | None:
+    """Parse a potential root; repository existence requires API provenance."""
+    parsed = urllib.parse.urlsplit(str(url or ""))
+    port = parsed.port
+    parts = parsed.path.strip("/").split("/")
+    if (parsed.scheme in ("http", "https")
+            and (parsed.hostname or "").casefold() == "github.com"
+            and parsed.username is None and parsed.password is None
+            and port in (None, 443 if parsed.scheme == "https" else 80)
+            and len(parts) == 2
+            and all(part.isascii() and re.fullmatch(r"[a-zA-Z0-9_.-]+", part)
+                    and part not in (".", "..") for part in parts)):
+        owner, repository = (part.casefold() for part in parts)
+        repository = repository.removesuffix(".git")
+        if repository:
+            return owner, repository
+    return None
 
 
 def _attributable_repo(name: str, repos: list[dict]) -> dict | None:
@@ -1307,6 +1321,9 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
 
     # -- 4b. Corroborate each name from reachable sources --------------------
     merged: dict[str, dict] = {}
+    # Only repository-API metadata can establish a GitHub repository identity.
+    # A two-segment website URL by itself is not that evidence.
+    github_repository_roots: set[tuple[str, str]] = set()
     web_skips: dict[str, str] = dict(scout_web_skips)
     for cand in named[:evidence_candidate_limit]:
         name = (cand.get("name") or "").strip()
@@ -1331,6 +1348,18 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         except Exception as ex:
             research["sources_skipped"].setdefault(
                 "github", f"{type(ex).__name__}: {ex}")
+
+        for repository_metadata in gh:
+            qualified = _qualified_repo_identity(repository_metadata.get("name"))
+            try:
+                root_identity = _github_root_shape(repository_metadata.get("url") or "")
+            except (TypeError, ValueError) as exc:
+                research["sources_skipped"]["github-identity:" + str(
+                    repository_metadata.get("name") or "unnamed")] = (
+                        f"{type(exc).__name__}: {_ascii(exc)}")
+                continue
+            if qualified is not None and root_identity == qualified:
+                github_repository_roots.add(root_identity)
 
         evidence_urls = [h["url"] for h in hits[:3] if _is_evidence_url(h.get("url"))]
         repo = _attributable_repo(name, gh)
@@ -1476,25 +1505,13 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     seen_products: dict[tuple, dict] = {}
     for candidate_index, candidate in enumerate(competitors):
         # A shared homepage/article (including query-selected products) is not
-        # proof that two names identify one product. Only exact repository-root
-        # URLs justify cross-name canonical merging; other entries stay distinct.
+        # proof that two names identify one product. Only roots corroborated by
+        # repository-API metadata justify merging; other entries stay distinct.
         identity = ("candidate", candidate_index)
         try:
-            parsed = urllib.parse.urlsplit(str(candidate.get("url") or ""))
-            port = parsed.port
-            parts = parsed.path.strip("/").split("/")
-            if (parsed.scheme in ("http", "https")
-                    and (parsed.hostname or "").casefold() == "github.com"
-                    and parsed.username is None and parsed.password is None
-                    and port in (None, 443 if parsed.scheme == "https" else 80)
-                    and len(parts) == 2
-                    and parts[0].casefold() not in _GITHUB_NON_REPOSITORY_ROUTES
-                    and all(part.isascii() and re.fullmatch(r"[a-zA-Z0-9_.-]+", part)
-                            and part not in (".", "..") for part in parts)):
-                owner, repository = (part.casefold() for part in parts)
-                repository = repository.removesuffix(".git")
-                if repository:
-                    identity = ("github-repository", owner, repository)
+            root_identity = _github_root_shape(candidate.get("url") or "")
+            if root_identity is not None and root_identity in github_repository_roots:
+                identity = ("github-repository", *root_identity)
         except (TypeError, ValueError) as exc:
             # Retain the candidate as unverified input for the existing bounded
             # fetch/error accounting; a malformed URL cannot abort all research.
