@@ -94,7 +94,7 @@ code-model families so the free fallback can still separate author and reviewer.
 
 ## Managed Android product
 
-Android 3.5.11 is a native phone interface, not a Termux or desktop remote-control
+Android 3.5.13 is a native phone interface, not a Termux or desktop remote-control
 screen. The user taps the icon, signs in with GitHub device authorization, picks
 one of the four modes, and queues up to 30 targets. The queue is committed
 synchronously to private app storage and dispatch uses a persistent UUID, so

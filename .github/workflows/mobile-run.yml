@@ -154,7 +154,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: buckeye7066/flexfactor
-          ref: android-v3.5.11
+          ref: android-v3.5.13
           path: engine
           persist-credentials: false
 
@@ -284,6 +284,9 @@ jobs:
             branch="flexfactor/mobile-${REQUEST_ID%%-*}"
             git -C target switch -c "$branch" || rc=$?
             if [ "$rc" -eq 0 ]; then
+              # The owner-confirmed selected checkout is the only trusted test target.
+              # This command-local setting does not authorize the engine or siblings.
+              FLEXFACTOR_TRUSTED_REPOS="$GITHUB_WORKSPACE/target" \
               python engine/flexfactor.py refactor \
                 --file "$GITHUB_WORKSPACE/target/$TARGET_FILE" \
                 --goal "$TARGET_GOAL" \

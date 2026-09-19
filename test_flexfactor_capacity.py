@@ -269,6 +269,111 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
             allow_paid=False,
         )
 
+    def _nested_provider(self, backing):
+        route = real_route('copilot/gpt-5.6-luna', 'copilot:nested')
+        store = rotation.StateStore(os.path.join(self.tmp.name, 'nested-rotation.json'))
+        return rotation.RotatingProvider(
+            rotation.Rotator(real_catalog(route), store, app='nested-fixture'),
+            lambda _route: backing, tier=rotation.STRONG,
+            judge_tier=rotation.STRONG, allow_paid=True)
+
+    def test_real_cli_grade_reuses_its_outer_provider_lease(self):
+        from unittest import mock
+        from providers.cli_provider import CliProvider
+        os.environ['FLEXFACTOR_PROVIDER_WAIT_MAX_S'] = '0'
+        backing = CliProvider('copilot-cli', 'gpt-5.6-luna', 'not-executed', subscription=None)
+        observed = []
+        def transport(*args, **kwargs):
+            observed.append(cap._MANAGER.snapshot())
+            return json.dumps({'grade': 98, 'meets_goal': True,
+                               'rationale': 'The supplied fixture meets its goal.', 'issues': []})
+        provider = self._nested_provider(backing)
+        with mock.patch('providers.cli_provider._run_cli', side_effect=transport):
+            result = provider.grade('Grade the fixture')
+        self.assertEqual(result['grade'], 98)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(len(observed[0]['leases']), 1)
+        self.assertEqual(observed[0]['waiters'], {})
+        self.assertEqual(cap._MANAGER.snapshot()['leases'], {})
+        self.assertEqual(cap._MANAGER.snapshot()['waiters'], {})
+
+    def test_nested_failure_releases_admission_before_the_next_call(self):
+        os.environ['FLEXFACTOR_PROVIDER_WAIT_MAX_S'] = '0'
+        calls = []
+        class Backing:
+            def grade(inner, *args, **kwargs):
+                return inner.structured(*args, **kwargs)
+            def structured(inner, *args, **kwargs):
+                calls.append(len(cap._MANAGER.snapshot()['leases']))
+                if len(calls) == 1:
+                    raise ValueError('deliberate inner failure')
+                return {'grade': 95}
+        rotated = self._nested_provider(Backing())
+        provider = rotated._provider_for(rotated.rotator.catalog.routes[0])
+        with self.assertRaisesRegex(ValueError, 'deliberate inner failure'):
+            provider.grade('first')
+        self.assertEqual(provider.grade('second'), {'grade': 95})
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(cap._MANAGER.snapshot()['leases'], {})
+
+    def test_same_provider_parallel_nested_calls_still_share_one_slot(self):
+        os.environ['FLEXFACTOR_PROVIDER_WAIT_MAX_S'] = '5'
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+        start = threading.Barrier(3)
+        results, errors = [], []
+        class Backing:
+            def grade(inner, *args, **kwargs):
+                return inner.structured(*args, **kwargs)
+            def structured(inner, *args, **kwargs):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                try:
+                    time.sleep(.025)
+                    return {'grade': 95}
+                finally:
+                    with lock:
+                        active -= 1
+        provider = self._nested_provider(Backing())
+        def work():
+            try:
+                start.wait(timeout=3)
+                results.append(provider.grade('fixture'))
+            except Exception as error:
+                errors.append(error)
+        workers = [threading.Thread(target=work) for _ in range(3)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [{'grade': 95}] * 3)
+        self.assertEqual(peak, 1)
+        self.assertEqual(cap._MANAGER.snapshot()['leases'], {})
+        self.assertEqual(cap._MANAGER.snapshot()['waiters'], {})
+
+    def test_reentrancy_cannot_borrow_another_provider_instances_slot(self):
+        os.environ['FLEXFACTOR_PROVIDER_WAIT_MAX_S'] = '0'
+        class Backing:
+            def structured(inner, *args, **kwargs):
+                return {'grade': 95}
+        second_rotated = self._nested_provider(Backing())
+        second = second_rotated._provider_for(second_rotated.rotator.catalog.routes[0])
+        class Delegating:
+            def grade(inner, *args, **kwargs):
+                return second.structured(*args, **kwargs)
+        first_rotated = self._nested_provider(Delegating())
+        first = first_rotated._provider_for(first_rotated.rotator.catalog.routes[0])
+        with self.assertRaises(cap.CapacityTimeout):
+            first.grade('separate provider requires separate admission')
+        self.assertEqual(cap._MANAGER.snapshot()['leases'], {})
+        self.assertEqual(cap._MANAGER.snapshot()['waiters'], {})
+        self.assertEqual(second.structured('independent call'), {'grade': 95})
+
     def test_capacity_wrapper_preserves_the_rotator_runtime_contract(self):
         """The installed wrapper must remain transparent to runtime probes.
 

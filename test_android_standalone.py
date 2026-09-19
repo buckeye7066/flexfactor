@@ -987,5 +987,44 @@ class MobileModeAcceptanceTests(unittest.TestCase):
             self.assertEqual(saved['verification_step_outcome'], 'failure')
 
 
+
+class MobileRefactorAuthorizationTests(unittest.TestCase):
+    def test_confirmed_refactor_trust_is_scoped_to_its_target_process(self):
+        import os, shutil, subprocess, tempfile, textwrap
+        from unittest import mock
+        import flexfactor_trust as trust
+        source = (ROOT / '.github/workflows/mobile-run.yml').read_text(encoding='utf-8')
+        refactor = source.split('branch="flexfactor/mobile-${REQUEST_ID%%-*}"', 1)[1]
+        refactor = refactor.split('elif [ "$MODE" = scout ]; then', 1)[0]
+        command = textwrap.dedent(refactor.split('if [ "$rc" -eq 0 ]; then\n', 1)[1].rsplit('fi', 1)[0])
+        candidates = [shutil.which('bash')]
+        if os.name == 'nt':
+            candidates.insert(0, str(Path(os.environ.get('ProgramFiles', 'C:/Program Files')) / 'Git/bin/bash.exe'))
+        bash = next((path for path in candidates if path and Path(path).is_file()), None)
+        self.assertIsNotNone(bash, 'The managed Bash workflow needs an executable Bash test harness')
+        with tempfile.TemporaryDirectory(prefix='ff target authorization ') as workspace:
+            target = Path(workspace) / 'target'
+            target.mkdir()
+            script = ('python() { printf "selected=%s\\n" "${FLEXFACTOR_TRUSTED_REPOS-}"; }\n'
+                      + command + '\nprintf "parent=%s\\n" "$FLEXFACTOR_TRUSTED_REPOS"\n')
+            environment = dict(os.environ, GITHUB_WORKSPACE=workspace.replace('\\', '/'),
+                               FLEXFACTOR_TRUSTED_REPOS='prior-owner-setting', TARGET_FILE='stats_utils.py',
+                               TARGET_GOAL='repair the documented functions', MAX_COST='1', THRESHOLD='90', MAX_ITERATIONS='1')
+            result = subprocess.run([bash, '-c', script], cwd=workspace, env=environment,
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+            self.assertEqual(rows['selected'], str(target).replace('\\', '/'))
+            self.assertEqual(rows['parent'], 'prior-owner-setting')
+            with mock.patch.dict(os.environ, {'FLEXFACTOR_TRUSTED_REPOS': rows['selected']}):
+                self.assertTrue(trust.trust_decision(str(target)).allowed)
+                self.assertFalse(trust.trust_decision(str(Path(workspace) / 'engine')).allowed)
+                self.assertFalse(trust.trust_decision(str(Path(workspace) / 'target-other')).allowed)
+                self.assertFalse(trust.trust_decision(workspace).allowed)
+            with mock.patch.dict(os.environ, {'FLEXFACTOR_TRUSTED_REPOS': ''}), mock.patch.object(
+                    trust, 'POLICY_PATH', str(Path(workspace) / 'no-policy.json')):
+                self.assertFalse(trust.trust_decision(str(target)).allowed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
