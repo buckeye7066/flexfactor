@@ -56,6 +56,7 @@ import os
 import re
 import socket
 import ssl
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -854,6 +855,12 @@ def _norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
 
 
+def _discovery_key(name: str) -> str:
+    """Deduplicate names without discarding international product identities."""
+    normalized = unicodedata.normalize("NFKC", str(name or "")).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
 # Search-engine chrome that is not evidence of anything (DDG's own logo/help
 # links came back as "evidence URLs" in the first live run).
 _NON_EVIDENCE_HOSTS = ("duckduckgo.com", "lite.duckduckgo.com", "html.duckduckgo.com")
@@ -1241,7 +1248,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                 if not isinstance(candidate, dict) or not isinstance(candidate.get("name"), str):
                     continue
                 name = candidate["name"].strip()[:200]
-                key = _norm(name)
+                key = _discovery_key(name)
                 query = candidate.get("search_query") or name
                 if not key or key in seen_names or not isinstance(query, str):
                     continue
@@ -1327,7 +1334,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         spdx = (repo or {}).get("license")
         mode, reason = license_reuse_mode(spdx, source_available=source_available,
                                           compatible_fn=None)
-        key = _norm(name) or _norm(query)
+        key = _discovery_key(name) or _discovery_key(query)
         merged[key] = {
             "name": name or (hits[0]["title"] if hits else query),
             # `kind` is inferred, not trusted: a weak judge model routinely omits
@@ -1450,13 +1457,31 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     # can crowd out a lower-ranked candidate with real, attributable evidence.
     # Canonical aliases share one evidence slot and one fetch/clone.
     seen_products: dict[tuple, dict] = {}
-    for candidate in competitors:
-        parsed = urllib.parse.urlsplit(str(candidate.get("url") or ""))
-        path = parsed.path.rstrip("/")
-        host = (parsed.hostname or "").casefold()
-        if host == "github.com":
-            path = path.removesuffix(".git").casefold()
-        identity = (host, path) if host else ("name", _norm(candidate["name"]))
+    for candidate_index, candidate in enumerate(competitors):
+        # A shared homepage/article (including query-selected products) is not
+        # proof that two names identify one product. Only exact repository-root
+        # URLs justify cross-name canonical merging; other entries stay distinct.
+        identity = ("candidate", candidate_index)
+        try:
+            parsed = urllib.parse.urlsplit(str(candidate.get("url") or ""))
+            port = parsed.port
+            parts = parsed.path.strip("/").split("/")
+            if (parsed.scheme in ("http", "https")
+                    and (parsed.hostname or "").casefold() == "github.com"
+                    and parsed.username is None and parsed.password is None
+                    and port in (None, 443 if parsed.scheme == "https" else 80)
+                    and len(parts) == 2
+                    and all(part.isascii() and re.fullmatch(r"[a-zA-Z0-9_.-]+", part)
+                            and part not in (".", "..") for part in parts)):
+                owner, repository = (part.casefold() for part in parts)
+                repository = repository.removesuffix(".git")
+                if repository:
+                    identity = ("github-repository", owner, repository)
+        except (TypeError, ValueError) as exc:
+            # Retain the candidate as unverified input for the existing bounded
+            # fetch/error accounting; a malformed URL cannot abort all research.
+            research["sources_skipped"][f"canonical-url:{candidate['name']}"] = (
+                f"{type(exc).__name__}: {_ascii(exc)}")
         if identity in seen_products:
             previous = seen_products[identity]
             def provenance_strength(row):

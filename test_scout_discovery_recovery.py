@@ -174,5 +174,63 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
         self.assertIn('Commander', row['discovery_aliases'])
 
 
+
+    def research_external_identities(self, names, urls, rewards=()):
+        import hashlib
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {'competitors': names}
+            return {'idea_title': 'Inputs', 'what_it_does': 'Validate numeric inputs',
+                    'why_valuable': 'Clear errors', 'evidence_basis': 'Fetched page',
+                    'purpose_reason': 'Already present', 'accept': False,
+                    'evidence_refs': re.findall(r'EVIDENCE_ID: (web-[a-z0-9]+)', prompt)[:1]}
+        def search(query, **kwargs):
+            return [{'url': urls.get(query, 'https://fallback.example/docs'), 'title': 'Product documentation'}], 'fixture', {}
+        def fetch(url, title, **kwargs):
+            if url == 'https://[':
+                raise ValueError('Invalid IPv6 URL')
+            return {'evidence_id': 'web-' + hashlib.sha256(url.encode()).hexdigest()[:12],
+                    'url': url, 'title': title, 'sha256': 'a'*64,
+                    'content': ' '.join(row['name'] for row in names) + ' document numeric operations.'}
+        with patch.object(fc, 'web_search', side_effect=search) as searched, \
+                patch.object(fc, 'github_repo_search', return_value=[]), \
+                patch.object(fc, 'fetch_evidence_document', side_effect=fetch):
+            result = fc.research_competitors(judge, 'Numeric utility', 'Calculate means',
+                        target=2, rr_search=(lambda query: list(rewards)) if rewards else None,
+                        log=lambda *_: None)
+        return result, [call.args[0] for call in searched.call_args_list]
+
+    def test_shared_web_pages_and_query_selected_products_are_not_automatic_aliases(self):
+        names = [{'name': name, 'search_query': name} for name in ['AlphaTool', 'BetaTool']]
+        pairs = [('https://vendor.example/', 'https://vendor.example/'),
+                 ('https://vendor.example/comparison', 'https://vendor.example/comparison'),
+                 ('https://vendor.example/product?id=alpha', 'https://vendor.example/product?id=beta'),
+                 ('https://github.com/', 'https://github.com/')]
+        for alpha, beta in pairs:
+            with self.subTest(alpha=alpha, beta=beta):
+                result, _ = self.research_external_identities(names, {'AlphaTool': alpha, 'BetaTool': beta})
+                self.assertEqual(result['verified'], 2)
+                self.assertEqual({row['name'] for row in result['competitors']}, {'AlphaTool', 'BetaTool'})
+
+    def test_malformed_reward_url_is_a_named_failure_not_a_gate_crash(self):
+        names = [{'name': 'AlphaTool', 'search_query': 'AlphaTool'}]
+        rewards = [{'repo': {'fullName': 'Malformed/Metadata', 'htmlUrl': 'https://[', 'licenseSpdx': 'MIT'}}]
+        try:
+            result, _ = self.research_external_identities(names, {'AlphaTool': 'https://alpha.example/'}, rewards)
+        except ValueError as exc:
+            self.fail('Malformed external metadata aborted research: ' + str(exc))
+        self.assertEqual(result['verified'], 1)
+        self.assertTrue(any(key.startswith('canonical-url:') and 'ValueError' in str(reason)
+                            for key, reason in result['sources_skipped'].items()))
+        self.assertTrue(any(row['name'] == 'AlphaTool' for row in result['competitors']))
+
+    def test_non_ascii_discovery_names_are_retained_even_with_a_shared_latin_query(self):
+        names = [{'name': name, 'search_query': 'collaboration'} for name in ['\u98de\u4e66', '\u9489\u9489']]
+        result, searches = self.research_external_identities(names, {'collaboration': 'https://vendor.example/docs'})
+        self.assertEqual(searches, ['collaboration', 'collaboration'])
+        self.assertEqual({row['name'] for row in result['competitors']}, {row['name'] for row in names})
+        self.assertEqual(len(result['competitors']), 2)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
