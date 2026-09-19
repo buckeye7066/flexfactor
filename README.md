@@ -94,7 +94,7 @@ code-model families so the free fallback can still separate author and reviewer.
 
 ## Managed Android product
 
-Android 3.5.6 is a native phone interface, not a Termux or desktop remote-control
+Android 3.5.11 is a native phone interface, not a Termux or desktop remote-control
 screen. The user taps the icon, signs in with GitHub device authorization, picks
 one of the four modes, and queues up to 30 targets. The queue is committed
 synchronously to private app storage and dispatch uses a persistent UUID, so
@@ -216,6 +216,14 @@ python source_app_update.py --repo buckeye7066/flexfactor --apply FULL_REVISION
 Git metadata cannot self-update through this source path. This is not a signed
 Windows/macOS/iOS installer or an app-store release. Existing installations
 need this updater installed once before they can notify about future versions.
+
+Android production releases publish a versioned `flexfactor-update-v1` manifest.
+It binds the exact source revision, compatible cloud engine, and Android artifact
+in one active stable-channel record. Direct Android builds verify the signed APK
+and store builds defer to their store. Source checkouts deliberately retain the
+independent clean-main fast-forward rules above; the Android release manifest is
+not advertised as their update authority. An unavailable update service is never
+reported as "up to date."
 
 ## Build target selection
 

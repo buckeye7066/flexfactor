@@ -1,3 +1,4 @@
+import { withMailboxGithub } from "../test_support/mailbox-github.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { dispatch, runArtifact, runStatus, ServiceError } from "../lib/service.js";
@@ -74,7 +75,8 @@ function github({ storedClaim, runs = [], history = runs, hook } = {}) {
     }
     throw new Error(`Unexpected GitHub transport: ${method} ${path}`);
   };
-  return { fetcher, variables, secrets, calls, get dispatches() { return dispatches; } };
+  const wrapped = withMailboxGithub(fetcher, { variables });
+  return { fetcher: wrapped, mailbox: wrapped.mailbox, variables, secrets, calls, get dispatches() { return dispatches; } };
 }
 
 for (const stored of [claim(), claim({ state: "dispatched", run_id: 99 })]) {

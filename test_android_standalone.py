@@ -44,6 +44,18 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
     pin and reusable-workflow pin to the Android release version.
     """
 
+    def test_documented_android_release_matches_apk_version(self):
+        version = _android_version_name()
+        for name, pattern in (
+            ("README.md", r"^Android (\d+\.\d+\.\d+) is a native phone interface"),
+            ("android/README.md", r"^# FlexFactor Mobile (\d+\.\d+\.\d+)$"),
+        ):
+            with self.subTest(document=name):
+                source = (ROOT / name).read_text(encoding="utf-8")
+                match = re.search(pattern, source, re.MULTILINE)
+                self.assertIsNotNone(match, f"{name} has no release identity")
+                self.assertEqual(match.group(1), version)
+
     def test_cloud_engine_ref_is_current_or_explicitly_staged_one_patch(self):
         source = (CLOUD / "lib" / "config.js").read_text(encoding="utf-8")
         match = re.search(r'ENGINE_REF = "(android-v[^"]+)"', source)
@@ -86,6 +98,35 @@ class EngineRefIsOneVersionEverywhere(unittest.TestCase):
         engine = engine[1].split("- name: ", 1)[0]
         self.assertIn("repository: buckeye7066/flexfactor", engine)
         self.assertIn(f"ref: android-v{_android_version_name()}", engine)
+
+    def test_live_journey_reports_the_version_it_actually_exercises(self):
+        proof = (ROOT / ".github" / "scripts" /
+                 "mobile_cloud_live_proof.py").read_text(encoding="utf-8")
+        self.assertIn('Path("android/app/build.gradle.kts")', proof)
+        self.assertIn('releases/latest/download/', proof)
+        self.assertIn("verify_release_identity(", proof)
+        self.assertIn('CLIENT_VERSION != SOURCE_VERSION', proof)
+        self.assertIn('"X-FlexFactor-Client-Version": CLIENT_VERSION', proof)
+        self.assertIn('"client_version": CLIENT_VERSION', proof)
+        self.assertNotRegex(proof, r'Live 3\.\d+\.\d+ acceptance proof')
+
+
+class CloudDeploymentIntegrityTests(unittest.TestCase):
+    def test_promotion_preserves_the_verified_environment_and_build(self):
+        source = (ROOT / ".github/workflows/cloud-production-deploy.yml").read_text(encoding="utf-8")
+        build = source.split("deployment_url=$(vercel deploy", 1)[1].split("| tail -n 1)", 1)[0]
+        self.assertIn("--prod", build)
+        self.assertIn("--skip-domain", build)
+        self.assertIn("FLEXFACTOR_CLOUD_SOURCE_SHA=$cloud_sha", build)
+
+    def test_production_alias_verification_bounds_propagation_retries(self):
+        source = (ROOT / ".github/workflows/cloud-production-deploy.yml").read_text(encoding="utf-8")
+        verify = source.split("- name: Prove the production alias", 1)[1]
+        self.assertIn("for attempt in {1..30}", verify)
+        self.assertIn("sleep 2", verify)
+        self.assertIn("health.source_revision, process.env.CLOUD_SOURCE_SHA", verify)
+        self.assertIn("health.deployment_url, process.env.DEPLOYMENT_URL", verify)
+        self.assertIn("exit 1", verify)
 
 
 class ManagedAndroidInvariants(unittest.TestCase):
@@ -168,7 +209,7 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("contents: write", workflow)
         self.assertIn("secrets.OPENAI_API_KEY", workflow)
         self.assertIn("secrets.ANTHROPIC_API_KEY", workflow)
-        self.assertIn("@github/copilot@1.0.81", workflow)
+        self.assertIn("@github/copilot@1.0.86", workflow)
         self.assertIn("qwen2.5-coder:7b", workflow)
         self.assertIn("deepseek-coder:6.7b", workflow)
         self.assertIn("ollama pull deepseek-coder:6.7b", workflow)
@@ -205,7 +246,8 @@ class ManagedAndroidInvariants(unittest.TestCase):
             '$rollout != "" and .engine_ref == $rollout', control_plane)
         self.assertIn(
             'declared_engine" != "$android_engine', control_plane)
-        self.assertIn("options: [auto]", workflow)
+        self.assertIn('if provider != "auto":', workflow)
+        self.assertIn("options: [auto]", (CLOUD / "lib/workflow.js").read_text(encoding="utf-8"))
         self.assertNotIn('--provider "$PROVIDER"', workflow)
         self.assertIn("publication_complete", workflow)
         self.assertIn("merge-base --is-ancestor", workflow)
@@ -372,6 +414,15 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("record.matches(activeRequest)", polling)
         self.assertIn("record.matches(queue.activeRequest())", polling)
 
+    def test_managed_steering_and_owner_probe_preserve_their_security_boundaries(self):
+        workflow = (ROOT / ".github/workflows/mobile-run.yml").read_text(encoding="utf-8")
+        self.assertNotIn("  workflow_dispatch:", workflow)
+        self.assertIn("  workflow_call:", workflow)
+        self.assertIn("STEERING_PRIVATE_KEY: ${{ secrets.STEERING_PRIVATE_KEY }}", workflow)
+        probe = (ROOT / ".github/workflows/rotation.yml").read_text(encoding="utf-8")
+        self.assertIn("github.triggering_actor == github.repository_owner", probe)
+        self.assertIn("inputs.probe_copilot && 'live-probe' || 'ci'", probe)
+
     def test_active_audits_accept_authenticated_phone_steering(self):
         api = (ANDROID / "java" / "com" / "firer" / "console" /
                "flexfactor" / "GitHubApi.java").read_text(encoding="utf-8")
@@ -382,9 +433,13 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn("Steer this build", activity)
         self.assertIn("submitSteering", api)
         service = (CLOUD / "lib" / "service.js").read_text(encoding="utf-8")
-        self.assertIn("FLEXFACTOR_STEERING_", service)
-        self.assertIn("flexfactor_steering.submit", workflow)
-        self.assertIn('source="android"', workflow)
+        self.assertIn("ownedSteeringMailbox", service)
+        self.assertIn("node engine/.github/scripts/mobile_steering_launch.mjs", workflow)
+        self.assertNotIn("/actions/variables/", workflow)
+        reader = (ROOT / ".github" / "scripts" / "mobile_steering_poll.mjs").read_text(encoding="utf-8")
+        self.assertIn("submit_session_routing", reader)
+        self.assertIn("source='android'", reader)
+        self.assertNotIn("STEERING_PRIVATE_KEY:", workflow.split("- name: Run FlexFactor", 1)[1])
 
     def test_all_modes_support_a_durable_thirty_target_sequential_queue(self):
         activity = (ANDROID / "java" / "com" / "firer" / "console" /
@@ -530,6 +585,406 @@ class ManagedAndroidInvariants(unittest.TestCase):
         self.assertIn('.setNegativeButton("Later",', launch)
         self.assertNotIn("startUpdate();", launch)
         self.assertIn("void check(CheckCallback callback)", updater)
+
+class MobileFailureDiagnosticTests(unittest.TestCase):
+    def test_mobile_progress_is_visible_while_the_engine_is_still_running(self):
+        import os, queue, subprocess, sys, threading
+        workflow = (ROOT / '.github/workflows/mobile-run.yml').read_text(encoding='utf-8')
+        environment = dict(os.environ)
+        environment.pop('PYTHONUNBUFFERED', None)
+        match = re.search(r'^      PYTHONUNBUFFERED: ["\']?([01])["\']?\s*$', workflow, re.M)
+        if match:
+            environment['PYTHONUNBUFFERED'] = match.group(1)
+        process = subprocess.Popen([sys.executable, '-c',
+            'import time; print("mobile progress ready"); time.sleep(10)'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment)
+        messages = queue.Queue()
+        reader = threading.Thread(target=lambda: messages.put(process.stdout.readline()), daemon=True)
+        reader.start()
+        try:
+            try:
+                message = messages.get(timeout=3)
+            except queue.Empty:
+                self.fail('Live engine progress was buffered until process exit')
+            self.assertEqual(message.strip(), 'mobile progress ready')
+            self.assertIsNone(process.poll())
+        finally:
+            process.terminate()
+            process.wait(timeout=5)
+            reader.join(timeout=5)
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_mobile_workflow_bounds_and_redacts_failure_diagnostics(self):
+        workflow = (ROOT / ".github" / "workflows" / "mobile-run.yml").read_text(
+            encoding="utf-8")
+        diagnostic = workflow.split(
+            "- name: Emit bounded redacted failure diagnostics", 1)[1].split(
+                "- name: Write the phone-readable run summary", 1)[0]
+        self.assertIn("if: failure()", diagnostic)
+        self.assertIn("maximum = 64 * 1024", diagnostic)
+        self.assertIn("stream.seek(max(0, stream.tell() - maximum))", diagnostic)
+        self.assertIn("from flexfactor_egress import redact_text", diagnostic)
+        self.assertIn("[-24:]", diagnostic)
+        self.assertIn("publication_reason", diagnostic)
+        self.assertNotIn("read_bytes()", diagnostic)
+
+
+class MobileReleaseIdentityTests(unittest.TestCase):
+    """Exercise source binding with real local git history, not mocked refs."""
+
+    def setUp(self):
+        import importlib.util
+        import subprocess
+        import tempfile
+        self.process = subprocess
+        self.temporary = tempfile.TemporaryDirectory(prefix="ff-release-proof-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        module = ROOT / ".github" / "scripts" / "mobile_release_identity.py"
+        self.assertTrue(module.is_file(), "component-bound release verifier is required")
+        spec = importlib.util.spec_from_file_location("mobile_release_identity", module)
+        self.identity = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.identity)
+        self.git("init", "-q", "-b", "main")
+        self.write("android/app/build.gradle.kts", 'versionName = "3.5.8"\n')
+        self.write("cloud/lib/config.js", 'export const SERVICE_VERSION = "1.1.6";\nexport const ENGINE_REF = "android-v3.5.7";\n')
+        self.write("cloud/ENGINE_ROLLOUT_PENDING", "android-v3.5.8\n")
+        self.write("flexfactor.py", "print('released engine')\n")
+        self.release = self.commit("signed Android source")
+        self.git("tag", "android-v3.5.8")
+        self.write("cloud/lib/config.js", 'export const SERVICE_VERSION = "1.1.7";\nexport const ENGINE_REF = "android-v3.5.8";\n')
+        (self.root / "cloud/ENGINE_ROLLOUT_PENDING").unlink()
+        self.head = self.commit("activate published engine")
+        self.manifest = {"schema": "flexfactor-update-v1", "channel": "stable",
+                         "status": "active", "versionName": "3.5.8",
+                         "sourceRevision": self.release}
+
+    def git(self, *args):
+        return self.process.check_output(
+            ["git", *args], cwd=self.root, text=True, stderr=self.process.STDOUT).strip()
+
+    def write(self, name, text):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def commit(self, message):
+        self.git("add", "--all")
+        self.git("-c", "user.name=Release proof tests", "-c",
+                 "user.email=release-proof@example.invalid", "commit", "-qm", message)
+        return self.git("rev-parse", "HEAD")
+
+    def verify(self, expected=None):
+        return self.identity.verify_release_identity(
+            self.root, expected or self.head, self.manifest, "3.5.8")
+
+    def test_cloud_rollout_keeps_exact_signed_release_binding(self):
+        result = self.verify()
+        self.assertEqual(result["release_source_sha"], self.release)
+        self.assertEqual(result["verification_sha"], self.head)
+        self.assertNotEqual(self.release, self.head)
+        self.assertEqual(result["engine_ref"], "android-v3.5.8")
+        self.assertEqual(result["cloud_version"], "1.1.7")
+
+    def test_whitespace_in_paths_cannot_create_a_cloud_exception(self):
+        self.write(" cloud/unreleased.py", "print('not cloud runtime')\n")
+        self.head = self.commit("unreleased path with leading whitespace")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_unreleased_engine_changes_block_the_proof(self):
+        self.write("flexfactor.py", "print('not released')\n")
+        self.head = self.commit("unreleased engine change")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_renaming_engine_into_cloud_does_not_hide_unreleased_deletion(self):
+        self.git("mv", "flexfactor.py", "cloud/flexfactor.py")
+        self.head = self.commit("rename engine into cloud")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_same_version_cloud_change_requires_its_actual_source_revision(self):
+        old_source = self.head
+        self.write("cloud/new-runtime.js", "export const newBehavior = true;\n")
+        self.head = self.commit("change cloud without bumping display version")
+        expected = self.verify()
+        health = {"ok": True, "oauth_device_configured": True,
+                  "version": "1.1.7", "engine_ref": "android-v3.5.8",
+                  "source_revision": old_source,
+                  "deployment_url": "https://flexfactor-cloud-old-team.vercel.app"}
+        with self.assertRaisesRegex(ValueError, "source"):
+            self.identity.verify_cloud_health(health, expected)
+        health["source_revision"] = self.head
+        self.identity.verify_cloud_health(health, expected)
+
+    def test_proof_only_commit_preserves_the_cloud_source_revision(self):
+        cloud_source = self.head
+        self.write(".github/scripts/mobile_cloud_live_proof.py", "# proof only\n")
+        self.head = self.commit("proof only")
+        self.assertEqual(self.verify()["cloud_source_sha"], cloud_source)
+
+    def test_every_response_must_match_the_initial_cloud_deployment(self):
+        from email.message import Message
+        initial = {"source_revision": self.head,
+                   "deployment_url": "https://flexfactor-cloud-one-team.vercel.app"}
+        headers = Message()
+        headers["x-flexfactor-cloud-source"] = self.head
+        headers["x-flexfactor-deployment"] = initial["deployment_url"]
+        self.identity.verify_cloud_response(headers, initial)
+        for name, changed in (("x-flexfactor-cloud-source", self.release),
+                              ("x-flexfactor-deployment", "https://flexfactor-cloud-two-team.vercel.app")):
+            with self.subTest(header=name):
+                copy = Message()
+                for key, value in headers.items(): copy[key] = changed if key.lower() == name else value
+                with self.assertRaises(ValueError):
+                    self.identity.verify_cloud_response(copy, initial)
+        with self.assertRaises(ValueError):
+            self.identity.verify_cloud_response(Message(), initial)
+
+    def test_live_request_checks_response_identity_before_reading_body(self):
+        import ast
+        import json
+        import types
+        import urllib.error
+        from email.message import Message
+        source = (ROOT / ".github/scripts/mobile_cloud_live_proof.py").read_text(encoding="utf-8")
+        function = next(node for node in ast.parse(source).body
+                        if isinstance(node, ast.FunctionDef) and node.name == "request")
+        initial = {"source_revision": self.head,
+                   "deployment_url": "https://flexfactor-cloud-one-team.vercel.app"}
+        class Response:
+            status = 200
+            reads = 0
+            def __init__(self, url):
+                self.headers = Message()
+                self.headers["X-FlexFactor-Cloud-Source"] = initial["source_revision"]
+                self.headers["X-FlexFactor-Deployment"] = url
+                self.headers["Content-Type"] = "application/json"
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self):
+                self.reads += 1
+                return b"{}"
+        for changed in (False, True):
+            with self.subTest(promoted=changed):
+                response = Response("https://flexfactor-cloud-two-team.vercel.app" if changed
+                                    else initial["deployment_url"])
+                environment = {"json": json, "BASE": "https://flexfactor-cloud.vercel.app",
+                               "HEADERS": {}, "deployed_health": initial,
+                               "verify_cloud_response": self.identity.verify_cloud_response,
+                               "urllib": types.SimpleNamespace(
+                                   error=urllib.error,
+                                   request=types.SimpleNamespace(Request=lambda *a, **k: None,
+                                                                 urlopen=lambda *a, **k: response))}
+                exec(compile(ast.Module(body=[function], type_ignores=[]), "<live-request>", "exec"), environment)
+                if changed:
+                    with self.assertRaises(ValueError): environment["request"]("GET", "/api/configure")
+                    self.assertEqual(response.reads, 0)
+                else:
+                    self.assertEqual(environment["request"]("GET", "/api/configure")[0], 200)
+                    self.assertEqual(response.reads, 1)
+
+    def test_cloud_deploy_and_live_proof_use_the_same_promotion_lock(self):
+        for name in ("cloud-production-deploy.yml", "mobile-cloud-live-proof.yml"):
+            with self.subTest(workflow=name):
+                source = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+                self.assertIn("group: flexfactor-cloud-production", source)
+                self.assertIn("cancel-in-progress: false", source)
+                self.assertIn("fetch-depth: 0", source)
+                self.assertIn('test "$EXPECTED_SHA" = "$live_main"', source)
+
+    def test_unreleased_android_changes_block_the_proof(self):
+        self.write("android/app/src/main/MainActivity.java", "// unreleased\n")
+        self.head = self.commit("unreleased Android change")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_unreleased_runner_changes_block_the_proof(self):
+        self.write(".github/workflows/mobile-run.yml", "name: unreleased\n")
+        self.head = self.commit("unreleased runner change")
+        with self.assertRaisesRegex(ValueError, "unreleased runtime"):
+            self.verify()
+
+    def test_manifest_cannot_name_a_different_source_than_the_tag(self):
+        self.manifest["sourceRevision"] = self.head
+        with self.assertRaisesRegex(ValueError, "release tag"):
+            self.verify()
+
+    def test_checkout_must_be_the_authorized_main_revision(self):
+        with self.assertRaisesRegex(ValueError, "authorized"):
+            self.verify(expected=self.release)
+
+    def test_released_source_must_be_an_ancestor(self):
+        self.git("checkout", "--orphan", "unrelated")
+        self.head = self.commit("unrelated history with identical files")
+        with self.assertRaisesRegex(ValueError, "ancestor"):
+            self.verify()
+
+    def test_cloud_cannot_still_point_to_the_old_engine(self):
+        self.write("cloud/lib/config.js", 'export const SERVICE_VERSION = "1.1.7";\nexport const ENGINE_REF = "android-v3.5.7";\n')
+        self.head = self.commit("stale cloud engine")
+        with self.assertRaisesRegex(ValueError, "engine"):
+            self.verify()
+
+    def test_incomplete_rollout_blocks_live_verification(self):
+        self.write("cloud/ENGINE_ROLLOUT_PENDING", "android-v3.5.8\n")
+        self.head = self.commit("unfinished rollout")
+        with self.assertRaisesRegex(ValueError, "pending"):
+            self.verify()
+
+    def test_proof_maintenance_does_not_relabel_the_signed_release(self):
+        self.write(".github/scripts/mobile_cloud_live_proof.py", "# proof maintenance\n")
+        self.head = self.commit("proof maintenance only")
+        result = self.verify()
+        self.assertEqual(result["release_source_sha"], self.release)
+        self.assertEqual(result["verification_sha"], self.head)
+
+    def test_live_cloud_must_match_the_current_version_and_released_engine(self):
+        expected = self.verify()
+        health = {"ok": True, "oauth_device_configured": True,
+                  "version": "1.1.7", "engine_ref": "android-v3.5.8",
+                  "source_revision": self.head,
+                  "deployment_url": "https://flexfactor-cloud-one-team.vercel.app"}
+        self.identity.verify_cloud_health(health, expected)
+        for key, bad in (("ok", False), ("oauth_device_configured", False),
+                         ("version", "1.1.6"), ("engine_ref", "android-v3.5.7")):
+            with self.subTest(field=key), self.assertRaises(ValueError):
+                self.identity.verify_cloud_health({**health, key: bad}, expected)
+
+
+
+class MobileModeAcceptanceTests(unittest.TestCase):
+    def helpers(self):
+        import ast
+        path = ROOT / '.github/scripts/mobile_cloud_live_proof.py'
+        tree = ast.parse(path.read_text(encoding='utf-8'))
+        names = {'build_live_request', 'validate_live_result', 'record_live_result'}
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        self.assertEqual({node.name for node in functions}, names)
+        namespace = {}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
+        return namespace
+
+    def test_each_live_mode_keeps_its_boundaries(self):
+        build = self.helpers()['build_live_request']
+        for mode in ('refactor', 'scout', 'audit', 'prodready'):
+            request = build('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', mode)
+            self.assertEqual(request['mode'], mode)
+            self.assertEqual(request['max_cost'], 1)
+            self.assertFalse(request['scout_apply'])
+            self.assertEqual(request['file'], 'stats_utils.py' if mode == 'refactor' else '')
+            self.assertEqual(bool(request['goal']), mode == 'refactor')
+            self.assertEqual('do not apply' in request['guidance'], mode == 'scout')
+        for mode, repo in [('unknown', 'buckeye7066/flexfactor-demo-tinystats'), ('audit', 'buckeye7066/GrantFlow')]:
+            with self.assertRaises(ValueError):
+                build('request-1', repo, '3.5.9', mode)
+
+    def test_result_cannot_substitute_another_request_or_unpublished_repair(self):
+        helper = self.helpers()
+        request = helper['build_live_request']('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', 'audit')
+        good = dict(request_id='request-1', mode='audit', target_repository=request['repository'],
+                    target_ref='main', success=True, exit_code=0, publication_required=False,
+                    publication_complete=True, source_before='a'*40, source_after='a'*40,
+                    run_url='https://github.com/' + request['repository'] + '/actions/runs/99')
+        validate = helper['validate_live_result']
+        validate(good, request, 99)
+        invalid = {'request_id': 'request-2', 'mode': 'scout', 'target_repository': 'owner/other',
+                   'target_ref': 'old', 'success': False, 'exit_code': False,
+                   'publication_complete': False, 'source_after': 'b'*40, 'run_url': 'https://github.com/other'}
+        for field, value in invalid.items():
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate(dict(good, **{field: value}), request, 99)
+        for field in good:
+            incomplete = dict(good)
+            del incomplete[field]
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                validate(incomplete, request, 99)
+        validate(dict(good, source_after='b'*40, publication_required=True), request, 99)
+
+
+
+    def test_refactor_requires_an_actual_published_change(self):
+        helper = self.helpers()
+        request = helper['build_live_request']('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', 'refactor')
+        result = dict(request_id='request-1', mode='refactor', target_repository=request['repository'],
+                      target_ref='main', success=True, exit_code=0, publication_required=False,
+                      publication_complete=True, source_before='a'*40, source_after='a'*40,
+                      run_url='https://github.com/' + request['repository'] + '/actions/runs/99')
+        with self.assertRaisesRegex(ValueError, 'source change'):
+            helper['validate_live_result'](result, request, 99)
+        result.update(source_after='b'*40, publication_required=True)
+        helper['validate_live_result'](result, request, 99)
+
+    def test_failed_validation_never_records_successful_proof(self):
+        helper = self.helpers()
+        request = helper['build_live_request']('request-1', 'buckeye7066/flexfactor-demo-tinystats', '3.5.9', 'audit')
+        result = dict(request_id='request-1', mode='audit', target_repository=request['repository'],
+                      target_ref='main', success=True, exit_code=0, publication_required=False,
+                      publication_complete=True, source_before='a'*40, source_after='a'*40,
+                      run_url='https://github.com/' + request['repository'] + '/actions/runs/99')
+        saves = []
+        for changed in ({'run_url': 'wrong'}, {'source_after': 'invalid'}):
+            with self.assertRaises(ValueError):
+                helper['record_live_result'](dict(result, **changed), request, 99, {'conclusion': 'success'}, lambda **kw: saves.append(kw))
+            self.assertEqual(saves[-1]['stage'], 'validation-failed')
+            self.assertFalse(saves[-1]['result_validated'])
+            self.assertNotEqual(saves[-1].get('phone_result_success'), True)
+        helper['record_live_result'](result, request, 99, {'conclusion': 'success'}, lambda **kw: saves.append(kw))
+        self.assertEqual(saves[-1]['stage'], 'artifact-validated')
+        self.assertTrue(saves[-1]['result_validated'])
+        with self.assertRaises(ValueError):
+            helper['record_live_result'](result, request, 99, {'conclusion': 'failure'}, lambda **kw: saves.append(kw))
+        self.assertFalse(saves[-1]['result_validated'])
+
+    def test_remaining_modes_have_serial_independent_job_budgets(self):
+        import re
+        source = (ROOT / '.github/workflows/mobile-cloud-live-proof.yml').read_text(encoding='utf-8')
+        jobs = {match.group(1): match.group(2) for match in re.finditer(
+            r'^  ([a-z-]+):\n(.*?)(?=^  [a-z-]+:|\Z)', source.split('jobs:\n', 1)[1], re.M | re.S)}
+        self.assertTrue({'remaining-refactor', 'remaining-audit', 'remaining-prodready'}.issubset(jobs))
+        shared = jobs['live-proof']
+        self.assertIn('steps: &acceptance_steps', shared)
+        self.assertIn('Authorize the exact main revision and triggering owner', shared)
+        self.assertIn('Upload redacted live proof', shared)
+        self.assertIn('${{ github.job }}', shared)
+        for mode in ('refactor', 'audit', 'prodready'):
+            job = jobs['remaining-' + mode]
+            self.assertIn('timeout-minutes: 360', job)
+            self.assertIn('MODE: ' + mode, job)
+            self.assertIn('environment: Production', job)
+            self.assertIn("if: inputs.mode == 'remaining'", job)
+            self.assertIn('steps: *acceptance_steps', job)
+        self.assertIn('needs: remaining-refactor', jobs['remaining-audit'])
+        self.assertIn('needs: remaining-audit', jobs['remaining-prodready'])
+        self.assertIn('group: flexfactor-cloud-production', source)
+
+
+
+    def test_timeout_preserves_original_request_as_nonvalidated_evidence(self):
+        import json, os, subprocess, sys, tempfile, textwrap
+        from pathlib import Path
+        source = (ROOT / '.github/workflows/mobile-cloud-live-proof.yml').read_text(encoding='utf-8')
+        self.assertIn('timeout-minutes: 300', source)
+        start = source.split('      - name: Preserve incomplete acceptance evidence', 1)[1]
+        step = start.split('      - name: Upload redacted live proof', 1)[0]
+        self.assertIn("steps.exercise.outcome != 'success'", step)
+        code = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'mobile-cloud-live-proof.json'
+            original = {'request_id': 'original-request', 'run_id': 99, 'stage': 'steering-accepted'}
+            path.write_text(json.dumps(original), encoding='utf-8')
+            result = subprocess.run([sys.executable, '-c', code], cwd=directory,
+                                    env=dict(os.environ, STEP_OUTCOME='failure'),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            saved = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(saved['request_id'], original['request_id'])
+            self.assertEqual(saved['run_id'], 99)
+            self.assertFalse(saved['result_validated'])
+            self.assertEqual(saved['stage'], 'observation-incomplete')
+            self.assertEqual(saved['verification_step_outcome'], 'failure')
 
 
 if __name__ == "__main__":

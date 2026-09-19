@@ -410,6 +410,7 @@ class CliProviderBehaviourTests(_RotationExtensionsScope):
             cp._run_process_tree = real
         self.assertIn("-s", seen["argv"])
         self.assertIn("--no-ask-user", seen["argv"])
+        self.assertIn("--available-tools=", seen["argv"])
         self.assertNotIn("--allow-all-tools", seen["argv"])
         self.assertIn("--model", seen["argv"])
         self.assertIn("claude-sonnet-4.6", seen["argv"])
@@ -1077,6 +1078,38 @@ class TheGuardItselfMustFireTests(unittest.TestCase):
                                     subscription=None).complete("x")
         self.assertEqual(answer, "FROM-CLI")
         run.assert_called_once()
+
+
+
+
+class CopilotResolvedIdentityTests(unittest.TestCase):
+    def events(self, model="gpt-5.6-luna"):
+        return "\n".join(json.dumps(row) for row in [
+            {"type":"session.auto_mode_resolved","data":{"chosenModel":model}},
+            {"type":"model.call_start","data":{"turnId":"0","model":model}},
+            {"type":"model.call_finished","data":{"turnId":"0","outcome":"success"}},
+            {"type":"assistant.message","data":{"turnId":"0","model":model,
+              "content":"{\"answer\":\"OK\"}","toolRequests":[],"phase":"final_answer"}},
+            {"type":"result","exitCode":0},
+        ])
+
+    def test_unavailable_explicit_model_accepts_only_same_observed_auto_model(self):
+        calls=[]
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if "auto" not in argv:
+                return subprocess.CompletedProcess(argv,1,"",'Error: Model "gpt-5.6-luna" from --model flag is not available.')
+            return subprocess.CompletedProcess(argv,0,self.events(),"")
+        with unittest.mock.patch.object(cp,"_run_process_tree",side_effect=fake):
+            answer=cp.CliProvider("copilot-cli","gpt-5.6-luna","copilot").complete("test")
+        self.assertEqual(json.loads(answer),{"answer":"OK"})
+        self.assertEqual(len(calls),2)
+        self.assertIn("--output-format",calls[1]);self.assertIn("--available-tools=",calls[1])
+
+    def test_wrong_or_missing_identity_never_becomes_an_authorized_answer(self):
+        for text in (self.events("claude-sonnet-5"), self.events().replace('"model": "gpt-5.6-luna"','"other": "gpt-5.6-luna"'), self.events().rsplit("\n",1)[0]):
+            with self.subTest(events=text), self.assertRaises(cp.CliUnavailable):
+                cp._verified_copilot_answer(text,"gpt-5.6-luna")
 
 
 if __name__ == "__main__":

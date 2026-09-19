@@ -1,4 +1,4 @@
-# FlexFactor Mobile 3.5.6
+# FlexFactor Mobile 3.5.11
 
 FlexFactor Mobile is the native managed interface for all four FlexFactor
 modes. It does not require a PC, a personal access token, Termux, or a local
@@ -96,8 +96,18 @@ The protected `android-release` environment supplies:
 - `ANDROID_KEY_PASSWORD`
 
 Missing signing material fails the release; it never falls back to a debug key.
-The updater checks the fixed release origin, package name, version, SHA-256, and
-signing-certificate lineage before opening Android's installer.
+The release publishes one versioned `flexfactor-update-v1` signal that binds the
+canonical source revision, compatible cloud engine, and Android artifacts.
+The updater accepts only the active stable channel, then checks the fixed release
+origin, package name, version-bound URL, SHA-256, and signing-certificate lineage
+before opening Android's installer. A withdrawn or cross-revision manifest is
+reported as unavailable rather than being treated as an update.
+The compatibility record names the cloud engine actually declared by the
+release source. It may match the Android release or trail by the one patch used
+by the guarded tag-first rollout; other major, minor, or patch drift is refused.
+The manifest temporarily repeats the original Android fields so clients that
+predate this schema can bootstrap into it; schema-aware clients require both
+representations to agree.
 
 ## Boundaries
 

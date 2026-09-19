@@ -72,10 +72,12 @@ jobs:
           declared_engine=$(sed -n \
             's/^export const ENGINE_REF = "\(android-v[^"]*\)";/\1/p' \
             cloud/lib/config.js)
+          declared_service_version=$(node -p "require('./cloud/package.json').version")
           if [ -z "$declared_engine" ]; then
             echo "Could not resolve the managed cloud engine" >&2
             exit 1
           fi
+          test -n "$declared_service_version"
           rollout_engine=""
           if [ -f cloud/ENGINE_ROLLOUT_PENDING ]; then
             # During a tag-first rollout the deployed cloud still advertises
@@ -115,7 +117,9 @@ jobs:
               https://flexfactor-cloud.vercel.app/api/health) || health='{}'
             if jq -e --arg engine "$expected_engine" \
                 --arg rollout "$rollout_engine" \
+                --arg version "$declared_service_version" \
                 '.ok == true and .oauth_device_configured == true
+                 and .version == $version
                  and (.engine_ref == $engine
                       or ($rollout != "" and .engine_ref == $rollout))' \
                 <<<"$health"; then
@@ -475,6 +479,39 @@ jobs:
             --jq '.object.sha')
           test "$live_main" = "$AUTHORIZED_MAIN_SHA" \
             || { echo "main moved before signing authorization" >&2; exit 1; }
+      - name: Verify release source against the live control plane
+        shell: bash
+        run: |
+          declared_engine=$(sed -n \
+            's/^export const ENGINE_REF = "\(android-v[^"]*\)";/\1/p' \
+            cloud/lib/config.js)
+          declared_service_version=$(node -p "require('./cloud/package.json').version")
+          test -n "$declared_engine"
+          test -n "$declared_service_version"
+          rollout_engine=""
+          if [ -f cloud/ENGINE_ROLLOUT_PENDING ]; then
+            rollout_engine=$(tr -d '\r\n' < cloud/ENGINE_ROLLOUT_PENDING)
+            test -n "$rollout_engine"
+          fi
+          for attempt in {1..60}; do
+            health=$(curl --fail --silent --show-error --retry 3 \
+              https://flexfactor-cloud.vercel.app/api/health) || health='{}'
+            if jq -e --arg engine "$declared_engine" \
+                --arg rollout "$rollout_engine" \
+                --arg version "$declared_service_version" \
+                '.ok == true and .oauth_device_configured == true
+                 and .version == $version
+                 and (.engine_ref == $engine
+                      or ($rollout != "" and .engine_ref == $rollout))' \
+                <<<"$health"; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "Release source does not match the live control plane: $health" >&2
+              exit 1
+            fi
+            sleep 10
+          done
       - name: Materialize protected release key
         shell: bash
         env:
@@ -515,7 +552,7 @@ jobs:
             -storepass:env FLEXFACTOR_ANDROID_STORE_PASSWORD "$aab"
           (cd "$aab_dir" && sha256sum app-play.aab > SHA256SUMS)
           printf '%s\n' "$SOURCE_SHA" > "$aab_dir/SOURCE_COMMIT"
-      - name: Create signed update manifest
+      - name: Create versioned cross-platform update manifest
         shell: bash
         run: |
           apk="android/app/build/outputs/apk/release/app-release.apk"
@@ -530,9 +567,30 @@ jobs:
           cp "android/app/build/outputs/bundle/play/app-play.aab" "$release_aab"
           apk_sha=$(sha256sum "$release_apk" | cut -d' ' -f1)
           apk_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/flexfactor-${version_name}.apk"
-          printf '{\n  "packageName": "com.firer.console.flexfactor",\n  "versionCode": %s,\n  "versionName": "%s",\n  "apkUrl": "%s",\n  "sha256": "%s"\n}\n' \
-            "$version_code" "$version_name" "$apk_url" "$apk_sha" \
-            > "$release_dir/android-update.json"
+          cloud_version=$(node -p "require('./cloud/package.json').version")
+          engine_ref=$(sed -n \
+            's/^export const ENGINE_REF = "\(android-v[^"]*\)";/\1/p' \
+            cloud/lib/config.js)
+          test -n "$engine_ref"
+          if [ -f release_update_manifest.py ]; then
+            python release_update_manifest.py \
+              --revision "$SOURCE_SHA" \
+              --version-name "$version_name" \
+              --version-code "$version_code" \
+              --apk-url "$apk_url" \
+              --apk-sha256 "$apk_sha" \
+              --cloud-version "$cloud_version" \
+              --engine-ref "$engine_ref" \
+              --output "$release_dir/android-update.json"
+          else
+            # Tags created before flexfactor-update-v1 do not contain its
+            # generator. Preserve their original flat manifest contract so an
+            # incomplete legacy release can still be repaired byte-for-byte;
+            # never claim that an old tag emitted the new schema.
+            printf '{\n  "packageName": "com.firer.console.flexfactor",\n  "versionCode": %s,\n  "versionName": "%s",\n  "apkUrl": "%s",\n  "sha256": "%s"\n}\n' \
+              "$version_code" "$version_name" "$apk_url" "$apk_sha" \
+              > "$release_dir/android-update.json"
+          fi
       - name: Revalidate live main before publication
         shell: bash
         env:
@@ -676,7 +734,7 @@ jobs:
           ensure_asset \
             "$release_dir/android-update.json" \
             "android-update.json" \
-            "Signed update manifest"
+            "Versioned update manifest"
           ensure_asset \
             "$release_dir/flexfactor-${version_name}.aab" \
             "flexfactor-${version_name}.aab" \

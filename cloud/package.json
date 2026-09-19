@@ -1,6 +1,6 @@
 {
   "name": "flexfactor-cloud",
-  "version": "1.1.5",
+  "version": "1.1.10",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,6 +8,9 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check lib/*.js && node --check api/**/*.js"
+    "check": "node scripts/check-syntax.mjs"
+  },
+  "dependencies": {
+    "libsodium-wrappers": "0.8.4"
   }
 }

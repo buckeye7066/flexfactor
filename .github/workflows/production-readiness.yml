@@ -148,6 +148,8 @@ jobs:
                    test_git_hook_safety_regression.py \
                    test_wip_preservation_regression.py \
                    test_release_competitor_gate.py \
+                   test_scout_completion.py \
+                   test_scout_candidate_budget.py \
                    test_release_project_resolution.py \
                    test_flexfactor_release_policy.py \
                    flexfactor_product_invariants_tests.py \
@@ -205,8 +207,10 @@ jobs:
                    test_ci_skip_policy.py \
                    test_live_cursor_aitime_proof.py \
                    test_stale_runtime_recurrence.py \
+                   test_purpose_evidence_routing.py \
                    test_build_target.py \
                    test_source_app_update.py \
+                   test_release_update_manifest.py \
                    tests/test_cursor_provider.py \
                    tests/test_subscription_cli_env.py \
                    tests/test_subscription_priority.py; do

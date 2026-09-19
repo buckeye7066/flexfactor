@@ -365,3 +365,59 @@ test("details handler returns only an artifact from the supplied matching reques
   assert.equal(calls[0].url, "https://api.github.com/repos/owner/project/actions/runs/77");
   assert.equal(calls.at(-1).options.headers?.Authorization, undefined);
 });
+
+function withDeploymentIdentity(t, source, url) {
+  for (const [key, value] of [["FLEXFACTOR_CLOUD_SOURCE_SHA", source], ["VERCEL_URL", url]]) {
+    const previous = process.env[key];
+    t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+}
+
+test("health and response headers carry the actual deployment source identity", async (t) => {
+  const source = "a".repeat(40);
+  withDeploymentIdentity(t, source, "flexfactor-cloud-build-one-team.vercel.app");
+  const response = await invoke(health, { method: "GET" });
+  assert.equal(response.value.source_revision, source);
+  assert.equal(response.value.deployment_url, "https://flexfactor-cloud-build-one-team.vercel.app");
+  assert.equal(response.headers["x-flexfactor-cloud-source"], source);
+  assert.equal(response.headers["x-flexfactor-deployment"], response.value.deployment_url);
+});
+
+test("all failure responses retain the deployment identity", async (t) => {
+  const source = "b".repeat(40);
+  withDeploymentIdentity(t, source, "flexfactor-cloud-build-two-team.vercel.app");
+  for (const [handler] of routes) {
+    const response = await invoke(handler, { method: "DELETE" });
+    assert.equal(response.statusCode, 405);
+    assert.equal(response.headers["x-flexfactor-cloud-source"], source);
+    assert.equal(response.headers["x-flexfactor-deployment"], "https://flexfactor-cloud-build-two-team.vercel.app");
+  }
+});
+
+test("unconfigured deployment metadata never invents an identity", async (t) => {
+  withDeploymentIdentity(t, undefined, undefined);
+  const response = await invoke(health, { method: "GET" });
+  assert.equal(response.value.source_revision, null);
+  assert.equal(response.value.deployment_url, null);
+  assert.equal(response.headers["x-flexfactor-cloud-source"], undefined);
+  assert.equal(response.headers["x-flexfactor-deployment"], undefined);
+});
+
+test("invalid deployment metadata cannot become HTTP header content", async (t) => {
+  withDeploymentIdentity(t, "invalid\r\nvalue", "untrusted.example/path\r\nX-Injected: yes");
+  const response = await invoke(health, { method: "GET" });
+  assert.equal(response.value.source_revision, null);
+  assert.equal(response.value.deployment_url, null);
+  assert.equal(response.headers["x-flexfactor-cloud-source"], undefined);
+});
+
+test("binary artifact responses retain the verified deployment identity", async (t) => {
+  withDeploymentIdentity(t, "c".repeat(40), "flexfactor-cloud-binary-team.vercel.app");
+  const { endpoint } = await import("../lib/http.js");
+  const handler = endpoint({ methods: ["GET"], binary: true }, async () => Buffer.from("artifact"));
+  const response = await invoke(handler, { method: "GET" });
+  assert.equal(response.headers["x-flexfactor-cloud-source"], "c".repeat(40));
+  assert.equal(response.headers["x-flexfactor-deployment"], "https://flexfactor-cloud-binary-team.vercel.app");
+  assert.equal(response.value.toString(), "artifact");
+});

@@ -39,5 +39,31 @@ public final class UpdatePolicyTest {
         assertThrows(IllegalArgumentException.class, () -> UpdatePolicy.requireSha256("abc"));
         assertTrue(UpdatePolicy.isNewer(20201, 20200));
         assertFalse(UpdatePolicy.isNewer(20200, 20200));
+        assertEquals("a".repeat(40), UpdatePolicy.requireRevision("A".repeat(40)));
+        assertThrows(IllegalArgumentException.class, () -> UpdatePolicy.requireRevision("main"));
+    }
+
+    @Test
+    public void artifactMustMatchTheManifestVersion() {
+        UpdatePolicy.requireVersionedApk(
+                UpdatePolicy.requireReleaseApk(
+                        "https://github.com/buckeye7066/flexfactor/releases/download/android-v3.6.0/flexfactor-3.6.0.apk"),
+                "3.6.0");
+        assertThrows(IllegalArgumentException.class, () -> UpdatePolicy.requireVersionedApk(
+                UpdatePolicy.requireReleaseApk(
+                        "https://github.com/buckeye7066/flexfactor/releases/download/android-v3.5.9/flexfactor-3.5.9.apk"),
+                "3.6.0"));
+    }
+
+    @Test
+    public void cloudEngineMayMatchOrTrailByOnePatchOnly() {
+        assertEquals("android-v3.6.0",
+                UpdatePolicy.requireCompatibleEngineRef("android-v3.6.0", "3.6.0"));
+        assertEquals("android-v3.5.9",
+                UpdatePolicy.requireCompatibleEngineRef("android-v3.5.9", "3.5.10"));
+        for (String engine : new String[]{"android-v3.5.8", "android-v3.6.0", "main", "android-v4.0.0"}) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> UpdatePolicy.requireCompatibleEngineRef(engine, "3.5.10"));
+        }
     }
 }

@@ -1,3 +1,6 @@
+import { withMailboxGithub } from "../test_support/mailbox-github.js";
+import { generateSteeringKeyPair, mailboxMetadata, mailboxTag, openSteering } from "../lib/steering-mailbox.js";
+const pair = await generateSteeringKeyPair();
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
@@ -18,6 +21,7 @@ function githubStore() {
     state: "dispatched",
     run_id: 99,
     ephemeral_secrets: [],
+    steering: {schema:1, phase:"dispatching", release_id:501, author_id:7, public_key:pair.public_key},
     created_at: "2026-09-13T00:00:00.000Z",
   })]]);
   const state = {
@@ -97,6 +101,20 @@ function githubStore() {
     }
     throw new Error(`Unexpected test request: ${method} ${path}`);
   };
+  state.fetch = withMailboxGithub(state.fetch, {variables});
+  state.mailbox = state.fetch.mailbox;
+  state.mailbox.releases.set(501, {id:501, draft:true, prerelease:true, author:{id:7},
+    tag_name:mailboxTag(REQUEST_ID), body:JSON.stringify(mailboxMetadata(REQUEST_ID,REPOSITORY,pair.public_key)),assets:[]});
+  state.mailbox.hook = async (call) => {
+    if (call.method === "POST" && call.path.endsWith("/releases/501/assets")) await state.beforeSteeringWrite?.();
+    if (call.method === "DELETE" && call.path.endsWith("/releases/501") && state.failSteeringDeletes > 0) {
+      state.failSteeringDeletes -= 1; return response(500, {});
+    }
+  };
+  state.mailbox.afterUpload = async () => { await state.afterSteeringWrite?.(); };
+  state.hasSteering = () => (state.mailbox.releases.get(501)?.assets.length || 0) > 0;
+  state.messages = async () => Promise.all((state.mailbox.releases.get(501)?.assets || [])
+    .map((asset) => openSteering(pair.private_key, asset.data, REQUEST_ID, REPOSITORY)));
   return state;
 }
 
@@ -121,8 +139,8 @@ for (const scenario of ["missing claim", "unrecorded run", "terminal run"]) {
       () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "Run the full suite.", github.fetch),
       isInactive,
     );
-    assert.equal(github.variables.has(STEERING_NAME), false);
-    assert.equal(github.calls.some((call) => ["POST", "PUT", "PATCH"].includes(call.method)), false);
+    assert.equal(github.hasSteering(), false);
+    assert.equal(github.mailbox.allCalls.some((call) => ["POST", "PUT", "PATCH"].includes(call.method)), false);
   });
 }
 
@@ -138,22 +156,22 @@ for (const scenario of ["another request", "another run ID"]) {
       () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "Run the full suite.", github.fetch),
       (error) => error instanceof ServiceError && error.code === "run_identity_mismatch",
     );
-    assert.equal(github.calls.some((call) => call.method !== "GET"), false);
+    assert.equal(github.mailbox.allCalls.some((call) => call.method !== "GET"), false);
   });
 }
 
-test("active steering preserves the released request signature and stored comment format", async () => {
+test("active steering preserves the request signature while encrypting stored comments", async () => {
   const github = githubStore();
   assert.deepEqual(
     await submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "Run the full suite.", github.fetch),
     { accepted: true },
   );
-  const comments = JSON.parse(github.variables.get(STEERING_NAME));
+  const comments = (await github.messages());
   assert.equal(comments.length, 1);
   assert.equal(comments[0].comment, "Run the full suite.");
   assert.match(comments[0].id, /^[a-f0-9-]{36}$/i);
   assert.ok(Number.isFinite(Date.parse(comments[0].created_at)));
-  assert.doesNotMatch(github.variables.get(STEERING_NAME), new RegExp(TOKEN));
+  assert.doesNotMatch(JSON.stringify(github.mailbox.releases.get(501)), new RegExp(TOKEN));
 });
 
 test("steering reconnects to a visible active run when dispatch never recorded its run ID", async () => {
@@ -166,9 +184,9 @@ test("steering reconnects to a visible active run when dispatch never recorded i
     await submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "Continue the review.", github.fetch),
     { accepted: true },
   );
-  assert.equal(JSON.parse(github.variables.get(STEERING_NAME))[0].comment, "Continue the review.");
+  assert.equal((await github.messages())[0].comment, "Continue the review.");
   assert.equal(JSON.parse(github.variables.get(CLAIM_NAME)).run_id, 0);
-  assert.equal(github.calls.some((call) =>
+  assert.equal(github.mailbox.allCalls.some((call) =>
     call.method === "PATCH" && call.path.endsWith(`/${CLAIM_NAME}`)), false);
 });
 
@@ -187,10 +205,10 @@ test("late steering cannot recreate a variable after concurrent terminal cleanup
     isInactive,
   );
   assert.equal(github.variables.has(CLAIM_NAME), false);
-  assert.equal(github.variables.has(STEERING_NAME), false);
-  const write = github.calls.findIndex((call) => call.method === "POST");
-  assert.ok(github.calls.slice(write + 1).some((call) =>
-    call.method === "DELETE" && call.path.endsWith(`/${STEERING_NAME}`)));
+  assert.equal(github.hasSteering(), false);
+  const write = github.mailbox.allCalls.findIndex((call) => call.method === "POST");
+  assert.ok(github.mailbox.allCalls.slice(write + 1).some((call) =>
+    call.method === "DELETE" && call.path.endsWith("/releases/501")));
 });
 
 test("a run completing during steering write triggers cleanup before rejecting the instruction", async () => {
@@ -204,7 +222,7 @@ test("a run completing during steering write triggers cleanup before rejecting t
     () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "A late instruction.", github.fetch),
     isInactive,
   );
-  assert.equal(github.variables.has(STEERING_NAME), false);
+  assert.equal(github.hasSteering(), false);
 });
 
 test("failed postwrite steering cleanup remains visible and can be retried by terminal status", async () => {
@@ -219,36 +237,32 @@ test("failed postwrite steering cleanup remains visible and can be retried by te
     () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "A late instruction.", github.fetch),
     (error) => error instanceof ServiceError && error.status >= 500,
   );
-  assert.equal(github.variables.has(STEERING_NAME), true);
+  assert.equal(github.mailbox.releases.size, 1);
+  assert.equal(github.hasSteering(), false, "owned messages drain before parent cleanup is retried");
   assert.equal(github.variables.has(CLAIM_NAME), true);
-  assert.equal(github.calls.some((call) =>
+  assert.equal(github.mailbox.allCalls.some((call) =>
     call.method === "DELETE" && call.path.endsWith(`/${CLAIM_NAME}`)), false);
 
   const result = await runStatus(TOKEN, REPOSITORY, 99, REQUEST_ID, github.fetch);
   assert.equal(result.status, "completed");
-  assert.equal(github.variables.has(STEERING_NAME), false);
+  assert.equal(github.hasSteering(), false);
   assert.equal(github.variables.has(CLAIM_NAME), false);
 });
 
-test("terminal status retries late steering cleanup even after the original claim was removed", async () => {
+test("deleting the parent mailbox makes a late message impossible after claim cleanup", async () => {
   const github = githubStore();
   github.beforeSteeringWrite = async () => {
     github.run.status = "completed";
     github.run.conclusion = "success";
     await runStatus(TOKEN, REPOSITORY, 99, REQUEST_ID, github.fetch);
-    github.failSteeringDeletes = 1;
   };
-
-  await assert.rejects(
-    () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "A late instruction.", github.fetch),
-    (error) => error instanceof ServiceError && error.status >= 500,
-  );
+  await assert.rejects(() => submitSteering(TOKEN, REPOSITORY, REQUEST_ID,
+    "A late instruction.", github.fetch), isInactive);
   assert.equal(github.variables.has(CLAIM_NAME), false);
-  assert.equal(github.variables.has(STEERING_NAME), true);
-
+  assert.equal(github.mailbox.releases.size, 0);
   const result = await runStatus(TOKEN, REPOSITORY, 99, REQUEST_ID, github.fetch);
   assert.equal(result.status, "completed");
-  assert.equal(github.variables.has(STEERING_NAME), false);
+  assert.equal(github.mailbox.releases.size, 0);
 });
 
 test("postwrite inspection failure does not delete steering for a potentially active run", async () => {
@@ -259,9 +273,9 @@ test("postwrite inspection failure does not delete steering for a potentially ac
     () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "Run the full suite.", github.fetch),
     (error) => error instanceof ServiceError && error.status >= 500,
   );
-  assert.equal(github.variables.has(STEERING_NAME), true);
+  assert.equal(github.hasSteering(), true);
   assert.equal(github.variables.has(CLAIM_NAME), true);
-  assert.equal(github.calls.some((call) => call.method === "DELETE"), false);
+  assert.equal(github.mailbox.allCalls.some((call) => call.method === "DELETE"), false);
 });
 
 test("an ambiguous postwrite claim is preserved without deleting potentially active steering", async () => {
@@ -275,9 +289,9 @@ test("an ambiguous postwrite claim is preserved without deleting potentially act
     () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "Run the full suite.", github.fetch),
     isInactive,
   );
-  assert.equal(github.variables.has(STEERING_NAME), true);
+  assert.equal(github.hasSteering(), true);
   assert.equal(github.variables.has(CLAIM_NAME), true);
-  assert.equal(github.calls.some((call) => call.method === "DELETE"), false);
+  assert.equal(github.mailbox.allCalls.some((call) => call.method === "DELETE"), false);
 });
 
 test("a changed postwrite run identity cannot authorize deletion of newer steering", async () => {
@@ -294,6 +308,6 @@ test("a changed postwrite run identity cannot authorize deletion of newer steeri
     () => submitSteering(TOKEN, REPOSITORY, REQUEST_ID, "Run the full suite.", github.fetch),
     (error) => error instanceof ServiceError && error.code === "run_identity_mismatch",
   );
-  assert.equal(github.variables.has(STEERING_NAME), true);
-  assert.equal(github.calls.some((call) => call.method === "DELETE"), false);
+  assert.equal(github.hasSteering(), true);
+  assert.equal(github.mailbox.allCalls.some((call) => call.method === "DELETE"), false);
 });

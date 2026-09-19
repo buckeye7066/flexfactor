@@ -307,15 +307,15 @@
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "1b9695e89126d18b7bb33c4cb5e14a6f02af2585af6f1712494ca0db41614b8e",
-      "observed_at": "2026-09-13T13:06:26.550734+00:00",
+      "content_hash": "5b2adbd4d8c1e46b0ac9820954985c84dcaddd16507c0066ceb69ecfe7629642",
+      "observed_at": "2026-09-18T21:53:22.653150+00:00",
       "excerpt": "Subscription-first ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "ffef0ad25a24c77d237dcd73567895c547f55491eb39b8d36cf3dd852f086bb6",
-      "observed_at": "2026-09-17T04:00:08.125048+00:00",
+      "content_hash": "c9b73764aa9a130a9b0e8c51354abcc44354ab562cafc9a059734b5587d9584f",
+      "observed_at": "2026-09-19T00:42:22.697821+00:00",
       "excerpt": "Modes, verification, review, publication."
     },
     {
@@ -328,8 +328,8 @@
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
-      "content_hash": "f511d557bed2772c83187baeb50d0b64ac1c7875e7b358dc92af956c38f38668",
-      "observed_at": "2026-09-13T13:44:00.227462+00:00",
+      "content_hash": "3e76338c4c2205c75105b199997f2f266705993e8db87c245cd1b9464bacea5b",
+      "observed_at": "2026-09-18T21:30:24.736391+00:00",
       "excerpt": "Dispatch, downgrade guard, and scoped cleanup."
     },
     {

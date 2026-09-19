@@ -1164,12 +1164,17 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                          "fetch a source page before extracting an idea):\n"
                          + _fence("scout-url-results", json.dumps(
                              scout_discovery_hits[:24], ensure_ascii=True)[:14000]))
+    # Discovery must supply the overflow that source verification already
+    # permits. Asking for target+3 names stranded the real run at 17/25 even
+    # though the existing evidence budget could inspect 50 candidates.
+    # This changes no evidence, identity, licence, or reuse approval rule.
+    evidence_candidate_limit = max(target + 3, target * 2, 1)
     base_prompt = (
         f"PROGRAM: {program_name}\nSTACK: {stack_txt}\n\n"
         "This is the program's purpose and the job it must do:\n"
         + _fence("purpose", (purpose_blob or "")[:8000]) + "\n\n"
         + scout_prompt + "\n\n"
-        f"Name up to {target + 3} real competitors, best-known first. "
+        f"Name up to {evidence_candidate_limit} real competitors, best-known first. "
         "Include both commercial products and open-source projects. Prefer "
         "names supported by the Scout URL results when they are relevant.")
     named: list[dict] = []
@@ -1209,7 +1214,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     # -- 4b. Corroborate each name from reachable sources --------------------
     merged: dict[str, dict] = {}
     web_skips: dict[str, str] = dict(scout_web_skips)
-    for cand in named[:target + 3]:
+    for cand in named[:evidence_candidate_limit]:
         name = (cand.get("name") or "").strip()
         query = (cand.get("search_query") or name or "").strip()
         if not query:
@@ -1373,7 +1378,6 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     # Popularity is only a discovery rank. Fetch a bounded overflow set before
     # selecting the reported competitors, otherwise three high-star dead URLs
     # can crowd out a lower-ranked candidate with real, attributable evidence.
-    evidence_candidate_limit = max(target + 3, target * 2, 1)
     competitors = competitors[:evidence_candidate_limit]
 
     # Search is discovery; GLEANING requires the source itself. Fetch bounded
