@@ -12,7 +12,7 @@ import flexfactor_purpose as fp
 class ScoutBenefitRecoveryTests(unittest.TestCase):
     def test_transient_timeout_retries_once_without_fabricating_a_skip(self):
         self.assertTrue(hasattr(ff, '_judge_scout_benefit'))
-        answer = {'benefit_score': 70, 'how_it_helps': 'Typed numeric validation',
+        answer = {'benefit_score': 70, 'verdict': 'consider', 'how_it_helps': 'Typed numeric validation',
                   'integration_note': 'Wrap CLI arguments', 'risks': ['One dependency']}
         with patch.object(ff, '_judge', side_effect=[TimeoutError('timed out'), answer]) as call:
             self.assertEqual(ff._judge_scout_benefit(object(), 'candidate'), answer)
@@ -55,11 +55,11 @@ class ScoutEvaluationReceiptTests(unittest.TestCase):
         self.assertNotIn('## Evaluated but unnecessary', text)
         self.assertIn('timed out', text)
 
-    def exercise_scout(self, *, verified=1, fail=True):
+    def exercise_scout(self, *, verified=1, fail=True, apply=False, qualify=False):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             Path(directory, 'app.py').write_text('print(1)\n', encoding='utf-8')
             args = types.SimpleNamespace(program=directory, repo_rewards_url='https://rr.example',
-                auto_start=False, max_cost=1, apply=False, apply_tier='adopt', competitor_count=1,
+                auto_start=False, max_cost=1, apply=apply, apply_tier='adopt', competitor_count=1,
                 allow_remote_program_context=True)
             contract = fp.PurposeContract(name='calculator', purpose='Calculate means', authored=True)
             profile = {'name': 'calculator', 'summary': 'Calculate arithmetic means', 'stack': ['Python'],
@@ -79,10 +79,14 @@ class ScoutEvaluationReceiptTests(unittest.TestCase):
                 'repo_rewards_search': [row]}
             for name, value in replacements.items():
                 stack.enter_context(patch.object(ff, name, return_value=value))
-            answer = {'benefit_score': 10, 'how_it_helps': 'Not relevant to this numeric CLI',
+            answer = {'benefit_score': 10, 'verdict': 'skip', 'how_it_helps': 'Not relevant to this numeric CLI',
                       'integration_note': 'No adoption needed', 'risks': []}
             calls = stack.enter_context(patch.object(ff, '_judge',
                 side_effect=TimeoutError('timed out') if fail else None, return_value=answer))
+            if qualify:
+                stack.enter_context(patch.object(ff, '_qualifies_for_apply', return_value=True))
+                stack.enter_context(patch.object(ff, '_apply_phase', side_effect=AssertionError(
+                    'incomplete research must not reach apply')))
             output = stack.enter_context(redirect_stdout(io.StringIO()))
             code = ff._run_scout_impl(args)
             self.assertTrue(Path(directory, '_scout_report.json').exists())
@@ -147,6 +151,98 @@ class ScoutCompletionGateTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 ff._judge_scout_benefit(object(), 'candidate')
         self.assertEqual(calls.call_count, 1)
+
+
+class ScoutJudgmentSchemaTests(unittest.TestCase):
+    def test_missing_or_invalid_judgment_cannot_be_counted_as_complete(self):
+        valid = {'benefit_score': 10, 'verdict': 'skip', 'how_it_helps': 'Already implemented',
+                 'integration_note': '', 'risks': []}
+        invalid = [{}, [], dict(valid, benefit_score=True), dict(valid, benefit_score=101),
+                   dict(valid, verdict='unknown'), dict(valid, how_it_helps=''),
+                   dict(valid, risks='none')]
+        for field in valid:
+            row = dict(valid)
+            del row[field]
+            invalid.append(row)
+        for row in invalid:
+            with self.subTest(row=row), patch.object(ff, '_judge', return_value=row):
+                with self.assertRaises(ff.StructuredOutputShapeError):
+                    ff._judge_scout_benefit(object(), 'candidate')
+
+    def test_malformed_judgment_descends_the_existing_ladder_in_one_call(self):
+        import os
+        import flexfactor_rotation as rotation
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            routes = [rotation.Route.from_json({'id': n, 'backend': 'fixture', 'model': n,
+                'pool': n, 'api': 'ollama', 'tier': rotation.LIGHT,
+                'cost_class': rotation.LOCAL_UNLIMITED}) for n in ('bad', 'good')]
+            store = rotation.StateStore(os.path.join(directory, 'routing.json'))
+            store.update(lambda state: state['pools'].update({'good': {'calls': 1, 'last_used_at': 1.0}}))
+            visited = []
+            valid = {'benefit_score': 10, 'verdict': 'skip', 'how_it_helps': 'Already implemented',
+                     'integration_note': '', 'risks': []}
+            def factory(route):
+                backend = Mock()
+                def structured(*args, **kwargs):
+                    visited.append(route.id)
+                    return {} if route.id == 'bad' else dict(valid)
+                backend.structured.side_effect = structured
+                return backend
+            provider = rotation.RotatingProvider(rotation.Rotator(rotation.Catalog(routes), store=store),
+                                                  factory, tier=rotation.LIGHT)
+            with patch.object(provider, 'structured_validated', wraps=provider.structured_validated) as routed:
+                self.assertEqual(ff._judge_scout_benefit(provider, 'candidate'), valid)
+            self.assertEqual(routed.call_count, 1)
+            self.assertEqual(visited, ['bad', 'good'])
+
+
+class ScoutReviewRegressions(unittest.TestCase):
+    def test_runtime_and_sdk_timeouts_receive_the_bounded_retry(self):
+        import httpx, openai, anthropic
+        request = httpx.Request('GET', 'https://fixture.invalid')
+        errors = [ff.StreamDeadlineError('stream timed out'),
+                  openai.APITimeoutError(request=request),
+                  anthropic.APITimeoutError(request=request),
+                  httpx.ReadTimeout('read timeout', request=request)]
+        valid = {'benefit_score': 10, 'verdict': 'skip', 'how_it_helps': 'Already implemented',
+                 'integration_note': '', 'risks': []}
+        for cause in errors:
+            wrapped = RuntimeError('route failed')
+            wrapped.__cause__ = cause
+            with self.subTest(kind=type(cause).__name__), patch.object(
+                    ff, '_judge', side_effect=[wrapped, valid]) as calls:
+                self.assertEqual(ff._judge_scout_benefit(object(), 'candidate'), valid)
+                self.assertEqual(calls.call_count, 2)
+
+    def test_still_running_abandoned_worker_is_not_duplicated(self):
+        error = ff._AbandonedCallTimeout('underlying worker is still running')
+        with patch.object(ff, '_judge', side_effect=error) as calls:
+            with self.assertRaises(ff._AbandonedCallTimeout):
+                ff._judge_scout_benefit(object(), 'candidate')
+        self.assertEqual(calls.call_count, 1)
+
+    def test_incomplete_proposal_never_says_judged_unnecessary(self):
+        row = ScoutEvaluationReceiptTests().failed_evaluation()
+        report = ff._scout_contract.build_scout_structured_report('calculator', {}, [row])
+        self.assertIn('INCOMPLETE', report['recommendations'][0]['rejection_reason'])
+        self.assertIsNone(report['recommendations'][0]['benefit']['score'])
+        self.assertIn('INCOMPLETE', report['proposals'][0]['rejection_reason'])
+        self.assertEqual(report['proposals'][0]['evaluation_status'], 'incomplete')
+
+    def test_truncated_adopt_prefix_cannot_authorize_an_evaluation(self):
+        row = {'benefit_score': 90, 'verdict': 'adopt', 'how_it_helps': 'New numeric validation',
+               'integration_note': 'Import parser', 'risks': []}
+        partial = ff._ff_partial.attach_partial_meta(row, ff._ff_partial.PartialSalvageEvidence())
+        with patch.object(ff, '_judge', return_value=partial):
+            with self.assertRaises(ff.StructuredOutputShapeError):
+                ff._judge_scout_benefit(object(), 'candidate')
+
+    def test_incomplete_research_takes_precedence_over_apply_no_op(self):
+        code, report, _ = ScoutEvaluationReceiptTests().exercise_scout(
+            verified=0, fail=False, apply=True, qualify=True)
+        self.assertEqual(code, 2)
+        self.assertFalse(report['completion']['complete'])
 
 
 if __name__ == '__main__':

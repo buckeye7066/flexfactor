@@ -4423,7 +4423,8 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
                        salvage_truncated=True, **_judge_intent(provider, schema))
     final_review = schema is globals().get("FINAL_REVIEW_SCHEMA")
     validated_call = getattr(provider, "structured_validated", None)
-    if final_review and callable(validated_call):
+    benefit_review = schema is globals().get("BENEFIT_SCHEMA")
+    if (final_review or benefit_review) and callable(validated_call):
         # THE RETRY MUST HAPPEN WHERE THE ROUTES ARE. Raising after
         # provider.structured() returned is too late on a RotatingProvider:
         # its route loop has already finished and reported the route healthy,
@@ -4434,7 +4435,8 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
         # a second route ever being asked. Handing the check to the rotator
         # as its validator descends the SAME call to the next usable route.
         data = validated_call(system, prompt, schema,
-                              validator=_final_review_readable, **call_kwargs)
+                              validator=(_final_review_readable if final_review else _validate_scout_benefit),
+                              **call_kwargs)
     else:
         data = provider.structured(system, prompt, schema, **call_kwargs)
     # PARTIAL OUTPUT IS FIRST-CLASS FAILURE EVIDENCE: a salvaged verdict of
@@ -4462,6 +4464,8 @@ def _judge(provider, system: str, prompt: str, schema: dict, max_tokens: int = 8
     # it raises here and the chunk is blocked with the reason on the record.
     if final_review:
         data = _final_review_readable(data)
+    elif benefit_review:
+        data = _validate_scout_benefit(data)
     return data
 
 
@@ -10887,21 +10891,46 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
     evaluation["verdicts"] = candidate_verdicts(evaluation.get("evidence") or ev)
 
 
+def _validate_scout_benefit(data):
+    """An omitted or truncated verdict is not a completed candidate judgment."""
+    if not isinstance(data, dict) or _ff_partial.is_partial_structured(data):
+        raise StructuredOutputShapeError("Scout benefit output is not a complete object")
+    required = ("benefit_score", "verdict", "how_it_helps", "integration_note", "risks")
+    if any(field not in data for field in required):
+        raise StructuredOutputShapeError("Scout benefit output omitted required judgment fields")
+    if (type(data["benefit_score"]) is not int or not 0 <= data["benefit_score"] <= 100
+            or data["verdict"] not in ("adopt", "consider", "skip")
+            or not isinstance(data["how_it_helps"], str) or not data["how_it_helps"].strip()
+            or not isinstance(data["integration_note"], str)
+            or not isinstance(data["risks"], list)
+            or any(not isinstance(risk, str) for risk in data["risks"])):
+        raise StructuredOutputShapeError("Scout benefit output contains invalid judgment fields")
+    return data
+
+
 def _judge_scout_benefit(provider, prompt: str) -> dict:
     """Retry one transient transport timeout; never retry a spend-policy refusal."""
     for attempt in range(2):
         try:
-            return _judge(provider, BENEFIT_SYSTEM, prompt, BENEFIT_SCHEMA,
-                          max_tokens=2048)
+            return _validate_scout_benefit(_judge(
+                provider, BENEFIT_SYSTEM, prompt, BENEFIT_SCHEMA, max_tokens=2048))
         except Exception as error:
             cause = error
             retryable = False
             for _ in range(8):
-                if isinstance(cause, (BudgetExceededError, PermissionError)) or type(cause).__name__ in (
+                if isinstance(cause, (BudgetExceededError, PermissionError, _AbandonedCallTimeout)) or type(cause).__name__ in (
                         "EgressBlockedError", "ModelRefusalError"):
                     retryable = False
                     break
-                if isinstance(cause, (TimeoutError, ConnectionError)):
+                # SDK transport errors do not consistently inherit Python's
+                # built-in TimeoutError. Match their typed base classes, never
+                # exception prose. Provider adapters own transport recovery;
+                # an abandoned whole-call worker above must not be duplicated.
+                sdk_transport = any(
+                    base.__module__.split(".", 1)[0] in ("openai", "anthropic", "httpx", "requests")
+                    and base.__name__ in ("APITimeoutError", "APIConnectionError", "TimeoutException", "Timeout")
+                    for base in type(cause).__mro__)
+                if isinstance(cause, (TimeoutError, ConnectionError, StreamDeadlineError)) or sdk_transport:
                     retryable = True
                 cause = cause.__cause__
                 if cause is None:
@@ -11259,6 +11288,9 @@ def _run_scout_impl(args) -> int:
     print(f"Integration proposals:   {artifacts['proposals_json']}")
     print("Target mutation requires separate FlexFactor apply approval "
           f"({_scout_contract.FLEXFACTOR_APPLY_APPROVAL_FILE}).")
+    if not profile["scout_completion"]["complete"]:
+        print("error: Scout is INCOMPLETE: " + "; ".join(profile["scout_completion"]["incomplete_reasons"]), file=sys.stderr)
+        return 2
     qualifying = [e for e in evaluations
                   if _qualifies_for_apply(e, args.apply_tier)]
     if (getattr(args, "apply", False)
@@ -11268,9 +11300,6 @@ def _run_scout_impl(args) -> int:
               "was skipped, refused, proposal-only, or failed; zero changes landed.",
               file=sys.stderr)
         return 4
-    if not profile["scout_completion"]["complete"]:
-        print("error: Scout is INCOMPLETE: " + "; ".join(profile["scout_completion"]["incomplete_reasons"]), file=sys.stderr)
-        return 2
     return 0
 
 

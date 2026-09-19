@@ -12543,7 +12543,14 @@ class ScoutBridge94to100Tests(unittest.TestCase):
             saved = {n: getattr(ff, n) for n in
                      ("_server_is_up", "repo_rewards_search", "_judge",
                       "make_provider", "_best_available_provider",
-                      "_ensure_program_understanding", "generate_integration")}
+                      "_ensure_program_understanding", "_competitors_module", "generate_integration")}
+            # Reach the real approval gate with the independent research
+            # prerequisite complete; a coverage failure must not mask it.
+            ff._competitors_module = lambda: types.SimpleNamespace(
+                research_competitors=lambda *a, **kw: {
+                    "verified": 25, "target": 25, "research_complete": True,
+                    "competitors": [], "coverage_note": "offline completed-research fixture"},
+                report_lines=lambda *_: [])
             ff._server_is_up = lambda url, timeout=1.5: True
             ff.repo_rewards_search = lambda *a, **k: [good]
             ff._judge = lambda provider, system, prompt, schema, max_tokens=8000: (
