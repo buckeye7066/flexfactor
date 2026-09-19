@@ -1026,5 +1026,32 @@ class MobileRefactorAuthorizationTests(unittest.TestCase):
                 self.assertFalse(trust.trust_decision(str(target)).allowed)
 
 
+
+class ExplicitUpdatePermissionBoundaryTests(unittest.TestCase):
+    """Pin the actual manual-update wiring reproduced on signed Android3.5.13."""
+
+    def test_permission_decision_follows_version_check_and_precedes_download(self):
+        source = (ANDROID / "java/com/firer/console/flexfactor/AppUpdater.java").read_text(encoding="utf-8")
+        method = source.split("void checkAndInstall(Callback callback) {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("canRequestPackageInstalls()", method,
+                      "only an available update may require installation permission")
+        self.assertLess(method.index("!UpdatePolicy.isNewer("), method.index("canRequestPackageInstalls()"))
+        self.assertLess(method.index("canRequestPackageInstalls()"), method.index("File.createTempFile("))
+        boundary = method.split("canRequestPackageInstalls()", 1)[1].split("File.createTempFile(", 1)[0]
+        self.assertIn("callback.onInstallPermissionRequired()", boundary)
+        self.assertIn("return;", boundary)
+
+    def test_activity_does_not_request_permission_before_manifest_check(self):
+        source = (ANDROID / "java/com/firer/console/flexfactor/MainActivity.java").read_text(encoding="utf-8")
+        method = source.split("private void startUpdate() {", 1)[1].split("private void checkForUpdateOnLaunch()", 1)[0]
+        before_request = method.split(".checkAndInstall(", 1)[0]
+        self.assertNotIn("canRequestPackageInstalls()", before_request,
+                         "current or unreachable releases must not prompt for installation permission")
+        self.assertIn("void onInstallPermissionRequired()", method)
+        callback = method.split("void onInstallPermissionRequired()", 1)[1]
+        self.assertIn("resetUpdateButton()", callback)
+        self.assertIn("Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES", callback)
+        self.assertIn("if (!directUpdatesEnabled()) return;", method)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
