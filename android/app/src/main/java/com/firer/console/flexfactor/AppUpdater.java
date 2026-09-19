@@ -36,6 +36,7 @@ final class AppUpdater {
 
     interface Callback {
         void onUpToDate(String versionName);
+        void onInstallPermissionRequired();
         void onInstallerReady(String versionName);
         void onError(String message);
     }
@@ -88,6 +89,13 @@ final class AppUpdater {
                 if (!UpdatePolicy.isNewer(update.versionCode, versionCode(installed))) {
                     String installedName = installed.versionName == null ? "unknown" : installed.versionName;
                     post(() -> callback.onUpToDate(installedName));
+                    return;
+                }
+                // Checking a current release needs no installation permission.
+                // For a newer release, ask before downloading any APK bytes.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                        && !context.getPackageManager().canRequestPackageInstalls()) {
+                    post(() -> callback.onInstallPermissionRequired());
                     return;
                 }
                 apk = File.createTempFile("flexfactor-update-", ".apk", context.getCacheDir());

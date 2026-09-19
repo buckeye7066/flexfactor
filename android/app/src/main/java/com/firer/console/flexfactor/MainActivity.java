@@ -1387,21 +1387,21 @@ public final class MainActivity extends Activity {
 
     private void startUpdate() {
         if (!directUpdatesEnabled()) return;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                && !getPackageManager().canRequestPackageInstalls()) {
-            new AlertDialog.Builder(this)
-                    .setTitle("Allow FlexFactor updates")
-                    .setMessage("Enable Allow from this source, then tap Update again. Android will still ask you to confirm every signed installation.")
-                    .setNegativeButton("Cancel", null)
-                    .setPositiveButton("Open settings", (dialog, which) -> startActivity(new Intent(
-                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                            Uri.parse("package:" + getPackageName()))))
-                    .show();
-            return;
-        }
         updateButton.setEnabled(false);
         updateButton.setText("Checking…");
         new AppUpdater(this).checkAndInstall(new AppUpdater.Callback() {
+            @Override public void onInstallPermissionRequired() {
+                resetUpdateButton();
+                if (destroyed || isFinishing()) return;
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Allow FlexFactor updates")
+                        .setMessage("Enable Allow from this source, then tap Update again. Android will still ask you to confirm every signed installation.")
+                        .setNegativeButton("Cancel", null)
+                        .setPositiveButton("Open settings", (dialog, which) -> startActivity(new Intent(
+                                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                Uri.parse("package:" + getPackageName()))))
+                        .show();
+            }
             @Override public void onUpToDate(String versionName) {
                 resetUpdateButton();
                 new AlertDialog.Builder(MainActivity.this)
