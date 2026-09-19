@@ -10887,6 +10887,48 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
     evaluation["verdicts"] = candidate_verdicts(evaluation.get("evidence") or ev)
 
 
+def _judge_scout_benefit(provider, prompt: str) -> dict:
+    """Retry one transient transport timeout; never retry a spend-policy refusal."""
+    for attempt in range(2):
+        try:
+            return _judge(provider, BENEFIT_SYSTEM, prompt, BENEFIT_SCHEMA,
+                          max_tokens=2048)
+        except Exception as error:
+            cause = error
+            retryable = False
+            for _ in range(8):
+                if isinstance(cause, (BudgetExceededError, PermissionError)) or type(cause).__name__ in (
+                        "EgressBlockedError", "ModelRefusalError"):
+                    retryable = False
+                    break
+                if isinstance(cause, (TimeoutError, ConnectionError)):
+                    retryable = True
+                cause = cause.__cause__
+                if cause is None:
+                    break
+            if attempt or not retryable or isinstance(error, BudgetExceededError):
+                raise
+
+
+def _scout_completion_status(research: dict, evaluations: list[dict], target: int) -> dict:
+    """Completion requires source-backed coverage and finished evaluations."""
+    verified = research.get("verified", 0)
+    if type(verified) is not int or verified < 0:
+        verified = 0
+    reasons = []
+    if verified < target:
+        reasons.append(f"Only {verified} of {target} competitors passed source verification")
+    if research.get("research_complete") is not True:
+        reasons.append("Competitor research has incomplete source or idea evaluations")
+    pending = [row for row in evaluations if row.get("evaluation_complete") is not True]
+    if pending:
+        reasons.append(f"{len(pending)} repository candidate evaluation(s) remain incomplete")
+    return {"complete": not reasons, "coverage_target": target,
+            "corroborated_competitors": verified,
+            "candidate_evaluations_completed": len(evaluations) - len(pending),
+            "candidate_evaluations_total": len(evaluations), "incomplete_reasons": reasons}
+
+
 def _run_scout_impl(args) -> int:
     requested_url = args.repo_rewards_url.rstrip("/")
 
@@ -11105,17 +11147,23 @@ def _run_scout_impl(args) -> int:
             f"CANDIDATE REPOSITORY:\n{_fence_untrusted('repo', _summarize_repo_for_judge(result))}\n\n"
             "Would adopting this repository benefit the program? Judge fit specifically."
         )
+        evaluation_complete = True
+        evaluation_error = ""
         try:
-            benefit = _judge(provider, BENEFIT_SYSTEM, judge_prompt, BENEFIT_SCHEMA)
+            benefit = _judge_scout_benefit(provider, judge_prompt)
             recommendation = classify_benefit(
                 benefit, result.get("finalScore") or 0, safety_verdict)
         except Exception as ex:  # one bad LLM call must not abort the sweep
             print(f"  [skip] {(repo.get('fullName') or '?')}: benefit judging failed ({ex})")
-            benefit = {"benefit_score": 0, "rationale": f"judging failed: {ex}"}
+            evaluation_complete = False
+            evaluation_error = f"{type(ex).__name__}: {ex}"
+            benefit = {"benefit_score": 0, "how_it_helps": f"judging failed: {ex}"}
             recommendation = "SKIP"
         evaluation = {
             "need": c["need"], "repo": repo, "result": result,
             "benefit": benefit, "recommendation": recommendation,
+            "evaluation_complete": evaluation_complete,
+            "evaluation_error": evaluation_error,
         }
         # Deterministic safety layer: evidence matrix + three verdicts. Computed
         # AFTER (and independently of) the LLM judgment - repo text cannot
@@ -11135,6 +11183,10 @@ def _run_scout_impl(args) -> int:
     tier = {"ADOPT": 0, "CONSIDER": 1, "SKIP": 2}
     evaluations.sort(key=lambda e: (tier[e["recommendation"]],
                                     -(e["benefit"].get("benefit_score") or 0)))
+    profile["scout_completion"] = _scout_completion_status(
+        competitor_research, evaluations,
+        int(getattr(args, "competitor_count", _ff_execution.TOP_COMPETITORS)
+            or _ff_execution.TOP_COMPETITORS))
     _print_scout_report(profile_name, profile, evaluations)
 
     # 5. APPLY: production contract (bridge 97/100) always emits proposals;
@@ -11147,7 +11199,7 @@ def _run_scout_impl(args) -> int:
         proposals.append(
             _scout_contract.build_integration_proposal(e, project_dir=apply_dir))
 
-    if getattr(args, "apply", False):
+    if getattr(args, "apply", False) and profile["scout_completion"]["complete"]:
         if not purpose_mutation_authorized:
             print("\nApply refused: the program purpose is not owner-authored or "
                   "strongly inferred from independent evidence. Recommendations "
@@ -11216,6 +11268,9 @@ def _run_scout_impl(args) -> int:
               "was skipped, refused, proposal-only, or failed; zero changes landed.",
               file=sys.stderr)
         return 4
+    if not profile["scout_completion"]["complete"]:
+        print("error: Scout is INCOMPLETE: " + "; ".join(profile["scout_completion"]["incomplete_reasons"]), file=sys.stderr)
+        return 2
     return 0
 
 
@@ -11584,6 +11639,12 @@ def _print_scout_report(name: str, profile: dict, evaluations: list[dict]) -> No
     print("\n" + "=" * 70)
     print(f"  Scout URL + Repo Rewards repository report for: {name}")
     print("=" * 70)
+    incomplete = [e for e in evaluations if e.get("evaluation_complete") is False]
+    if incomplete:
+        print(f"\nINCOMPLETE: {len(incomplete)} candidate evaluation(s) did not finish.")
+        for row in incomplete:
+            print(f"  {row['repo'].get('fullName')}: {row.get('evaluation_error') or 'unavailable'}")
+    evaluations = [e for e in evaluations if e.get("evaluation_complete") is not False]
     surfaced = [e for e in evaluations if e["recommendation"] != "SKIP"]
     skipped = len(evaluations) - len(surfaced)
     if not surfaced:
@@ -11625,12 +11686,19 @@ def _write_scout_report(program_arg: str, name: str, profile: dict,
     # Keep the historic filename for workflow compatibility; the report title
     # names both distinct discovery systems truthfully.
     report_name = f"{_slugify(name) or 'program'}_repo_rewards_report.md"
+    incomplete = [e for e in evaluations if e.get("evaluation_complete") is False]
+    evaluations = [e for e in evaluations if e.get("evaluation_complete") is not False]
     surfaced = [e for e in evaluations if e["recommendation"] != "SKIP"]
     skipped = [e for e in evaluations if e["recommendation"] == "SKIP"]
     lines = [f"# Scout URL + Repo Rewards repository report — {name}", "",
              f"**Summary:** {profile.get('summary', '')}", "",
              f"**Stack:** {', '.join(profile.get('stack') or [])}", ""]
 
+    if incomplete:
+        lines += ["## Incomplete evaluations", "", "These candidates were not judged unnecessary; their evaluations did not finish.", ""]
+        for row in incomplete:
+            lines.append(f"- {row['repo'].get('fullName')}: {row.get('evaluation_error') or 'unavailable'}")
+        lines.append("")
     purpose = profile.get("purpose_contract") or {}
     if purpose:
         lines += ["## Program understanding", "",

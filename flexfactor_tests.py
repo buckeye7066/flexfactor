@@ -10119,7 +10119,7 @@ class ScoutEndToEndTests(unittest.TestCase):
         saved = {n: getattr(ff, n) for n in
                  ("_server_is_up", "repo_rewards_search", "_judge",
                   "make_provider", "_best_available_provider",
-                  "_ensure_program_understanding",
+                  "_ensure_program_understanding", "_competitors_module",
                   "generate_integration", "_detect_verify",
                   "_independent_final_review", "_run")}
         self.npm_calls: list[list[str]] = []
@@ -10141,6 +10141,14 @@ class ScoutEndToEndTests(unittest.TestCase):
         ff._server_is_up = lambda url, timeout=1.5: True
         ff.repo_rewards_search = lambda base, q, lens=None, attempts=3: \
             [self.GOOD, self.HOSTILE]
+        # This fixture tests real Git/apply publication, not network research.
+        # Supply the completed research prerequisite explicitly; source-backed
+        # discovery/shortfall handling has separate behavioral regressions.
+        ff._competitors_module = lambda: types.SimpleNamespace(
+            research_competitors=lambda *a, **kw: {
+                "verified": 25, "target": 25, "research_complete": True,
+                "competitors": [], "coverage_note": "offline completed-research fixture"},
+            report_lines=lambda *_: [])
         ff._judge = self._stub_judge
         ff.make_provider = lambda *a, **k: types.SimpleNamespace(judge_model="stub")
         ff._best_available_provider = lambda *a, **k: types.SimpleNamespace(
@@ -12634,7 +12642,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                 rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://localhost:3000",
                               "--no-remote-repo-rewards", "--no-auto-start"])
-            self.assertIn(rc, (0, 1))
+            self.assertEqual(rc, 2, "unverified research must not report completion")
             self.assertIsNone(seen["search_url"])
             self.assertFalse([u for u in seen["urls"]
                               if str(u).startswith("https://web-production")
@@ -12694,8 +12702,8 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                               "--repo-rewards-url", "http://localhost:3000",
                               "--allow-remote-repo-rewards",
                               "--no-auto-start"])
-            # No candidates => rc 1 is OK; fallback must have been used.
-            self.assertIn(rc, (0, 1))
+            # An empty research fixture is incomplete, even when endpoint selection worked.
+            self.assertEqual(rc, 2, "unverified research must not report completion")
             self.assertTrue(
                 any(str(u).startswith("https://web-production") for u in seen["urls"]),
                 f"expected production probe, saw {seen['urls']}")
@@ -12764,7 +12772,7 @@ class ScoutBridge94to100Tests(unittest.TestCase):
                 open(os.path.join(tmp, "app.js"), "w", encoding="utf-8").write("x\n")
                 rc = ff.main(["scout", "--allow-remote-program-context", "--program", tmp, "--top", "1",
                               "--repo-rewards-url", "http://127.0.0.1:3000"])
-            self.assertIn(rc, (0, 1))
+            self.assertEqual(rc, 2, "unverified research must not report completion")
             self.assertTrue(seen["started"])
             self.assertEqual(seen["search_url"], "http://127.0.0.1:3000")
         finally:

@@ -689,7 +689,11 @@ def build_scout_structured_report(
         pin_fields_from_evidence(e)
         if "proposal" not in e:
             build_integration_proposal(e)
-        recs.append(recommendation_record(e))
+        record = recommendation_record(e)
+        record["evaluation_status"] = ("incomplete" if e.get("evaluation_complete") is False
+                                       else "complete" if e.get("evaluation_complete") is True else "unknown")
+        record["evaluation_error"] = str(e.get("evaluation_error") or "")
+        recs.append(record)
         if e.get("proposal"):
             props.append(e["proposal"])
     report = {
@@ -726,6 +730,8 @@ def build_scout_structured_report(
             "approval_file": FLEXFACTOR_APPLY_APPROVAL_FILE,
         },
     }
+    if "scout_completion" in (profile or {}):
+        report["completion"] = dict(profile["scout_completion"])
     # Self-check: recommendation narratives must not claim safe-to-install.
     # Policy rules may mention the forbidden phrases (to forbid them); those
     # are excluded from the narrative scan. Boolean denial fields are also OK.
