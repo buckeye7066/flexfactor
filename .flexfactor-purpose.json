@@ -342,8 +342,8 @@
     {
       "kind": "source",
       "locator": "android/app/src/main/java/com/firer/console/flexfactor/MainActivity.java",
-      "content_hash": "d5044ff2aa52d5d60a749ab9f71f29b09d5f11f817ea78a55a24203dc1e77b63",
-      "observed_at": "2026-09-13T13:44:00.228496+00:00",
+      "content_hash": "ba9602893f41cd8ead06f229025a70ab89bd58e27ecebfa723ec6654559dd39a",
+      "observed_at": "2026-09-19T21:23:34.111529+00:00",
       "excerpt": "Android dispatch recovery."
     },
     {
