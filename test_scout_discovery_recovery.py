@@ -12,7 +12,10 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
         def judge(system, prompt, schema):
             if schema is fc.DISCOVERY_SCHEMA:
                 calls.append(prompt)
-                return {'competitors': next(responses, [])}
+                response = next(responses, [])
+                if isinstance(response, BaseException):
+                    raise response
+                return {'competitors': response}
             refs = re.findall(r'EVIDENCE_ID: (web-[a-z0-9]+)', prompt)
             return {'idea_title': 'Numeric input', 'what_it_does': 'Validate numbers',
                     'why_valuable': 'Clear input errors', 'evidence_basis': 'Source page',
@@ -55,6 +58,16 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
         self.assertEqual(result['verified'], 2)
         self.assertIn('SHORTFALL', result['coverage_note'])
 
+    def test_replenishment_failure_cannot_be_hidden_by_earlier_names(self):
+        for failure in (TimeoutError('discovery timed out'), PermissionError('access denied')):
+            with self.subTest(failure=type(failure).__name__):
+                result, calls, searches = self.research([self.names(0, 1), failure])
+                self.assertEqual(result['verified'], 2)
+                self.assertFalse(result['research_complete'])
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(any(type(failure).__name__ in reason
+                                    for reason in result['incomplete_reasons']))
+
     def test_discovery_round_limit_does_not_grow_with_small_answers(self):
         result, calls, searches = self.research([self.names(n) for n in range(100)], target=25)
         self.assertEqual(len(calls), 4)
@@ -84,9 +97,38 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
                     'purpose_reason': 'Already present', 'accept': False, 'evidence_refs': ['web-abc123']}
         with patch.object(fc, 'web_search', side_effect=search), \
              patch.object(fc, 'github_repo_search', return_value=[]), \
-             patch.object(fc, 'fetch_evidence_document', side_effect=fetch):
+             patch.object(fc, 'fetch_evidence_document', side_effect=fetch) as fetched:
             result = fc.research_competitors(judge, 'CLI', 'Calculate means', target=2, log=lambda *_: None)
         self.assertEqual(len(result['competitors']), 1)
+        self.assertEqual(fetched.call_count, 1, 'aliases must not spend the source budget twice')
+
+
+
+    def test_aliases_do_not_crowd_unique_reward_candidates_out_of_fetch_budget(self):
+        aliases = [f'Alias{number}' for number in range(5)]
+        fetched = []
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {'competitors': [{'name': name, 'search_query': name} for name in aliases]}
+            return {'idea_title': 'Inputs', 'what_it_does': 'Validate input',
+                    'why_valuable': 'Clear errors', 'evidence_basis': 'Fetched page',
+                    'purpose_reason': 'Already present', 'accept': False,
+                    'evidence_refs': re.findall(r'EVIDENCE_ID: (web-[a-z0-9]+)', prompt)[:1]}
+        def fetch(url, title, **kwargs):
+            fetched.append(url)
+            return {'evidence_id': 'web-' + str(len(fetched)), 'url': url, 'title': title,
+                    'content': ' '.join(aliases) + ' UniqueParser documents numeric input', 'sha256': 'a'*64}
+        shared = 'https://github.com/example/shared-parser'
+        unique = 'https://github.com/UniqueParser/UniqueParser'
+        rr = lambda query: [{'repo': {'fullName': 'UniqueParser/UniqueParser',
+                                      'htmlUrl': unique, 'licenseSpdx': 'MIT', 'stars': 0}}]
+        with patch.object(fc, 'web_search', return_value=([{'url': shared}], 'fixture', {})), \
+             patch.object(fc, 'github_repo_search', return_value=[]), \
+             patch.object(fc, 'fetch_evidence_document', side_effect=fetch):
+            result = fc.research_competitors(judge, 'CLI', 'Compute means', target=2,
+                                            rr_search=rr, log=lambda *_: None)
+        self.assertEqual(result['verified'], 2)
+        self.assertEqual(sorted(fetched), sorted([shared, unique]))
 
 
 if __name__ == '__main__':

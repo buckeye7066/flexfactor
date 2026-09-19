@@ -1022,6 +1022,26 @@ def _normalize_idea(idea: dict, competitor_name: str, *,
 # --------------------------------------------------------------------------- #
 # 4. The orchestrator.
 # --------------------------------------------------------------------------- #
+def _correctable_idea_error(error: BaseException) -> bool:
+    """Permit a bounded shape correction, never another abandoned/policy call."""
+    malformed = False
+    seen: set[int] = set()
+    for _ in range(8):
+        if error is None:
+            return malformed
+        if id(error) in seen:
+            return False
+        seen.add(id(error))
+        kind = type(error).__name__
+        if isinstance(error, (PermissionError, TimeoutError)) or kind in (
+                "BudgetExceededError", "EgressBlockedError", "ModelRefusalError",
+                "_AbandonedCallTimeout", "AbandonedCallTimeout"):
+            return False
+        malformed = malformed or kind == "StructuredOutputShapeError"
+        error = error.__cause__
+    return False
+
+
 def research_competitors(judge, program_name: str, purpose_blob: str,
                          stack=None, *, rr_search=None, rr_endpoint: str = "",
                          target: int = DEFAULT_TARGET, opener=None,
@@ -1229,8 +1249,6 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
             if round_number or (not isinstance(ex, ValueError)
                                 and type(ex).__name__ != "StructuredOutputShapeError"):
                 break
-    if named:
-        last_err = None
     if last_err is not None or not named:
         why = (f"{type(last_err).__name__}: {_ascii(last_err)}" if last_err
                else "model named no competitors")
@@ -1416,6 +1434,22 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     # Popularity is only a discovery rank. Fetch a bounded overflow set before
     # selecting the reported competitors, otherwise three high-star dead URLs
     # can crowd out a lower-ranked candidate with real, attributable evidence.
+    # Canonical aliases share one evidence slot and one fetch/clone.
+    unique_competitors: list[dict] = []
+    seen_products: dict[tuple, dict] = {}
+    for candidate in competitors:
+        parsed = urllib.parse.urlsplit(str(candidate.get("url") or ""))
+        path = parsed.path.rstrip("/")
+        host = (parsed.hostname or "").casefold()
+        if host == "github.com":
+            path = path.removesuffix(".git").casefold()
+        identity = (host, path) if host else ("name", _norm(candidate["name"]))
+        if identity in seen_products:
+            seen_products[identity].setdefault("discovery_aliases", []).append(candidate["name"])
+            continue
+        seen_products[identity] = candidate
+        unique_competitors.append(candidate)
+    competitors = unique_competitors
     competitors = competitors[:evidence_candidate_limit]
 
     # Search is discovery; GLEANING requires the source itself. Fetch bounded
@@ -1543,21 +1577,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         competitors = [c for c in competitors if c["evidence_status"] == "verified"]
     competitors.sort(key=lambda c: (c["evidence_status"] != "verified",
                                     -(c.get("stars") or 0)))
-    unique_competitors: list[dict] = []
-    seen_products: dict[tuple, dict] = {}
-    for candidate in competitors:
-        parsed = urllib.parse.urlsplit(str(candidate.get("url") or ""))
-        path = parsed.path.rstrip("/")
-        host = (parsed.hostname or "").casefold()
-        if host == "github.com":
-            path = path.removesuffix(".git").casefold()
-        identity = (host, path) if host else ("name", _norm(candidate["name"]))
-        if identity in seen_products:
-            seen_products[identity].setdefault("discovery_aliases", []).append(candidate["name"])
-            continue
-        seen_products[identity] = candidate
-        unique_competitors.append(candidate)
-    competitors = unique_competitors[:target]
+    competitors = competitors[:target]
     research["evidence_documents_fetched"] = fetched_document_count
 
     if not competitors:
@@ -1646,12 +1666,14 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                              "`purpose_reason`. Cite an exact fetched EVIDENCE_ID "
                              "in `evidence_refs`. Keep each under 40 words.")
         last: dict = {}
-        for text in attempts:
+        for attempt, text in enumerate(attempts):
             try:
                 last = (author_validated(IDEA_SYSTEM, text, IDEA_SCHEMA, validator=validate_idea)
                         if author_validated is not None else
                         (author or judge)(IDEA_SYSTEM, text, IDEA_SCHEMA))
             except Exception as ex:
+                if attempt == 0 and author_validated is not None and _correctable_idea_error(ex):
+                    continue
                 return {"error": f"{type(ex).__name__}: {ex}", "accept": False,
                         "idea_title": "(idea extraction failed)",
                         "purpose_reason": f"not judged: {ex}"}
