@@ -19044,10 +19044,12 @@ class CompetitorLiveRunRegressionTests(unittest.TestCase):
         self.assertEqual(c["license"], "UNKNOWN")
         self.assertIn("no repository could be attributed", c["license_source"])
         self.assertEqual(c["kind"], "market")
-        # The unattributable repo is still recorded as evidence, just not as
-        # the licence oracle.
-        self.assertIn("https://github.com/robrawks/LogosBibleSoftwareMCP",
-                      c["evidence_urls"])
+        # Product evidence now also requires an exact identity. An unrelated
+        # wrapper cannot corroborate the product merely by embedding its name;
+        # retain the official product page and all original licence safeguards.
+        self.assertNotIn("https://github.com/robrawks/LogosBibleSoftwareMCP",
+                         c["evidence_urls"])
+        self.assertIn("https://www.logos.com/", c["evidence_urls"])
 
     def test_search_engine_chrome_is_not_recorded_as_evidence(self):
         self.assertFalse(fc._is_evidence_url("https://duckduckgo.com/"))

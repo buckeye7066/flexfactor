@@ -10927,6 +10927,26 @@ def enrich_evidence_from_clone(evaluation: dict, run=None) -> None:
     evaluation["verdicts"] = candidate_verdicts(evaluation.get("evidence") or ev)
 
 
+def _scout_idea_call(provider, system, prompt, schema, *, validator):
+    """Validate actual fetched evidence before a model route counts as healthy."""
+    def validate_on_route(data):
+        if _ff_partial.is_partial_structured(data):
+            raise StructuredOutputShapeError("Scout idea response was truncated")
+        try:
+            return validator(data)
+        except ValueError as error:
+            raise StructuredOutputShapeError(str(error)[:1000]) from error
+
+    validated = getattr(provider, "structured_validated", None)
+    if callable(validated):
+        data = validated(system, prompt, schema, validator=validate_on_route,
+                         max_tokens=8000, salvage_truncated=False)
+    else:
+        data = provider.structured(system, prompt, schema,
+                                   max_tokens=8000, salvage_truncated=False)
+    return validate_on_route(data)
+
+
 def _validate_scout_benefit(data):
     """An omitted or truncated verdict is not a completed candidate judgment."""
     if not isinstance(data, dict) or _ff_partial.is_partial_structured(data):
@@ -11123,6 +11143,8 @@ def _run_scout_impl(args) -> int:
                 author=lambda system, prompt, schema: provider.structured(
                     system, prompt, schema, max_tokens=8000,
                     salvage_truncated=True),
+                author_validated=lambda system, prompt, schema, **kw: _scout_idea_call(
+                    provider, system, prompt, schema, **kw),
                 source_inspector=inspect_public_competitor_source,
                 allow_credentialed_firecrawl=True,
                 log=lambda message: print(f"[scout competitor] {message}"),
@@ -14458,6 +14480,8 @@ def _run_top_competitor_gate(*, args, pfx: str, report, checkpoint,
                 system, prompt, schema, max_tokens=8000,
                 salvage_truncated=True
             ),
+            author_validated=lambda system, prompt, schema, **kw: _scout_idea_call(
+                purpose_reviewer, system, prompt, schema, **kw),
             source_inspector=inspect_public_competitor_source,
             rr_search=rr_fn,
             rr_endpoint=(rr_url or f"unavailable ({rr_note})"),
