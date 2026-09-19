@@ -53,6 +53,7 @@ jobs:
       FLEXFACTOR_OLLAMA_CONCURRENCY: "1"
       FLEXFACTOR_OLLAMA_TIMEOUT: "1800"
       PYTHONUTF8: "1"
+      PYTHONUNBUFFERED: "1"
       FLEXFACTOR_ROTATION_EXTENSIONS: "1"
       FLEXFACTOR_QUEUE_ID: ${{ inputs.request_id }}
 
@@ -153,7 +154,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: buckeye7066/flexfactor
-          ref: android-v3.5.10
+          ref: android-v3.5.11
           path: engine
           persist-credentials: false
 
