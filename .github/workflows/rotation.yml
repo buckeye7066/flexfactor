@@ -182,27 +182,12 @@ jobs:
           python-version: "3.12"
       - name: Install the production adapter dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
-      - name: Prove concrete model access without files or tools
+      - name: Prove production-purpose inference without target mutation
         env:
           COPILOT_GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          FLEXFACTOR_CLI_TIMEOUT: "45"
+          FLEXFACTOR_OLLAMA_TIMEOUT: "30"
+          PYTHONUNBUFFERED: "1"
           FLEXFACTOR_ROTATION_EXTENSIONS: "1"
-        shell: python
-        run: |
-          import json, sys, tempfile
-          from pathlib import Path
-          sys.path.insert(0, str(Path.cwd()))
-          import flexfactor as ff
-          import flexfactor_rotation as rotation
-          from providers.cli_provider import make_cli_provider
-          routes = [route for route in ff._builtin_route_catalog(rotation)
-              if route.api == "copilot-cli" and route.model in {"gpt-5.6-luna","mai-code-1.1-flash"}]
-          with tempfile.TemporaryDirectory() as directory:
-              provider = rotation.RotatingProvider(rotation.Rotator(rotation.Catalog(routes),
-                  store=rotation.StateStore(str(Path(directory)/"rotation.json"))), make_cli_provider, tier=rotation.STRONG, allow_paid=True, paid_first=True)
-              result = provider.structured("Return only the requested JSON.",
-                  "Set answer to OK. Do not use tools.",
-                  {"type":"object","properties":{"answer":{"type":"string"}},
-                   "required":["answer"],"additionalProperties":False})
-              assert result == {"answer":"OK"}, "Actual adapter response did not match"
-              print(json.dumps({"adapter":"copilot-cli","model":provider.model,
-                  "structured_response_verified":True,"explicit_or_identity_checked_auto":True}))
+        run: python -u .github/scripts/mobile_inference_probe.py
