@@ -14,8 +14,8 @@ android {
         applicationId = "com.firer.console.flexfactor"
         minSdk = 26
         targetSdk = 36
-        versionCode = 30513
-        versionName = "3.5.13"
+        versionCode = 30514
+        versionName = "3.5.14"
         buildConfigField(
             "String",
             "FLEXFACTOR_CLOUD_URL",

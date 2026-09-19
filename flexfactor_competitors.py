@@ -953,7 +953,7 @@ def _attributable_repo(name: str, repos: list[dict]) -> dict | None:
         owner = _norm(str(r.get("name") or "").split("/")[0])
         if not owner:
             continue
-        if owner == want or owner in want or want in owner:
+        if owner == want or _norm(str(r.get("name") or "")) == want:
             return r
     return None
 
@@ -966,7 +966,7 @@ def _name_related(name: str, repo: dict) -> bool:
         return False
     full = _norm(str(repo.get("name") or ""))
     tail = _norm(str(repo.get("name") or "").split("/")[-1])
-    return bool(tail) and (want in full or tail in want)
+    return bool(tail) and (want == full or want == tail)
 
 
 _IDEA_REQUIRED_TEXT = ("idea_title", "what_it_does", "why_valuable",
@@ -1030,7 +1030,7 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                          source_inspector=None,
                          allow_credentialed_firecrawl: bool = False,
                          scout_profile=None, scout_attempted: bool = False,
-                         scout_error: str = "") -> dict:
+                         scout_error: str = "", author_validated=None) -> dict:
     """Find competitors, extract one adoptable idea each, judge against purpose.
 
     `judge(system, prompt, schema) -> dict` is injected (flexfactor routes it to
@@ -1178,21 +1178,59 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         "Include both commercial products and open-source projects. Prefer "
         "names supported by the Scout URL results when they are relevant.")
     named: list[dict] = []
+    seen_names: set[str] = set()
     last_err: Exception | None = None
-    for prompt in (base_prompt,
-                   base_prompt + "\n\nReturn a JSON OBJECT whose single key is "
-                                 "`competitors` holding the array - NOT a bare "
-                                 "array. Every item needs `name`, `kind` "
-                                 "(\"market\" or \"oss\") and `search_query`."):
+    research["discovery_rounds"] = 0
+    # A nonempty answer is not a full discovery pass. The real 9/25 run
+    # stopped after eleven names despite room for fifty evidence candidates.
+    # Replenish only the existing allowance, with explicit exclusions and a
+    # fixed call limit; never manufacture names to satisfy the coverage gate.
+    for round_number in range(4):
+        prompt = base_prompt
+        if named:
+            prompt += ("\n\nADDITIONAL DISTINCT COMPETITORS ONLY. Do not repeat "
+                       "these names or aliases of the same product/repository:\n"
+                       + _fence("already-discovered", json.dumps(
+                           [row["name"] for row in named], ensure_ascii=True))
+                       + f"\nUp to {evidence_candidate_limit - len(named)} new candidates remain. "
+                         "Cover other real alternatives for this same purpose, not unrelated popular libraries. "
+                         "Return an empty competitors array when no further real candidates are known.")
+        elif round_number:
+            prompt += "\nReturn a JSON OBJECT with a competitors array; every row needs name, kind, and search_query."
+        research["discovery_rounds"] += 1
         try:
             disc = judge(DISCOVERY_SYSTEM, prompt, DISCOVERY_SCHEMA)
-            named = [c for c in (disc.get("competitors") or []) if c.get("name")]
+            if not isinstance(disc, dict) or not isinstance(disc.get("competitors"), list):
+                raise ValueError("competitor discovery omitted its array")
+            before = len(named)
+            for candidate in disc["competitors"]:
+                if not isinstance(candidate, dict) or not isinstance(candidate.get("name"), str):
+                    continue
+                name = candidate["name"].strip()[:200]
+                key = _norm(name)
+                query = candidate.get("search_query") or name
+                if not key or key in seen_names or not isinstance(query, str):
+                    continue
+                seen_names.add(key)
+                named.append(dict(candidate, name=name, search_query=query.strip()[:600]))
+                if len(named) >= evidence_candidate_limit:
+                    break
+            last_err = None
+            if len(named) >= evidence_candidate_limit:
+                break
+            if len(named) == before and (named or round_number):
+                break
         except Exception as ex:
             last_err = ex
-            continue
-        if named:
-            last_err = None
-            break
+            research["sources_skipped"][f"model-discovery:round-{round_number + 1}"] = (
+                f"{type(ex).__name__}: {_ascii(ex)}")
+            # Retry malformed envelopes once, not abandoned inference workers
+            # or spend/permission failures. Provider routing owns those limits.
+            if round_number or (not isinstance(ex, ValueError)
+                                and type(ex).__name__ != "StructuredOutputShapeError"):
+                break
+    if named:
+        last_err = None
     if last_err is not None or not named:
         why = (f"{type(last_err).__name__}: {_ascii(last_err)}" if last_err
                else "model named no competitors")
@@ -1505,7 +1543,21 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         competitors = [c for c in competitors if c["evidence_status"] == "verified"]
     competitors.sort(key=lambda c: (c["evidence_status"] != "verified",
                                     -(c.get("stars") or 0)))
-    competitors = competitors[:target]
+    unique_competitors: list[dict] = []
+    seen_products: dict[tuple, dict] = {}
+    for candidate in competitors:
+        parsed = urllib.parse.urlsplit(str(candidate.get("url") or ""))
+        path = parsed.path.rstrip("/")
+        host = (parsed.hostname or "").casefold()
+        if host == "github.com":
+            path = path.removesuffix(".git").casefold()
+        identity = (host, path) if host else ("name", _norm(candidate["name"]))
+        if identity in seen_products:
+            seen_products[identity].setdefault("discovery_aliases", []).append(candidate["name"])
+            continue
+        seen_products[identity] = candidate
+        unique_competitors.append(candidate)
+    competitors = unique_competitors[:target]
     research["evidence_documents_fetched"] = fetched_document_count
 
     if not competitors:
@@ -1535,6 +1587,20 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
                 "evidence_refs": [],
                 "purpose_reason": "NOT ACTED ON: search results alone do not establish a capability.",
             }
+        def validate_idea(data):
+            if (not isinstance(data, dict) or type(data.get("accept")) is not bool
+                    or not isinstance(data.get("evidence_refs"), list)
+                    or any(not isinstance(ref, str) for ref in data["evidence_refs"])):
+                raise ValueError("Idea output has invalid decision or evidence fields")
+            normalized, reason = _normalize_idea(
+                data, c["name"], valid_evidence_refs=valid_refs)
+            if reason:
+                raise ValueError(reason)
+            if (c.get("source_inspection_required") and normalized["accept"]
+                    and not any(ref.startswith("code-") for ref in normalized["evidence_refs"])):
+                raise ValueError("Accepted open-source idea must cite inspected source-code evidence")
+            return normalized
+
         document_text = "\n\n".join(
             f"EVIDENCE_ID: {row.get('evidence_id')}\n"
             f"URL: {row.get('url')}\nTITLE: {row.get('title')}\n"
@@ -1558,6 +1624,8 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
             "The audited program's purpose contract (THE AUTHORITY):\n"
             + _fence("purpose", (purpose_blob or "")[:8000]) + "\n\n"
             f"COMPETITOR: {c['name']} ({c['kind']})\n"
+            + "EXACT EVIDENCE IDENTIFIERS (copy verbatim, never invent labels):\n"
+            + json.dumps(sorted(valid_refs), ensure_ascii=True) + "\n\n"
             + _fence("competitor-evidence", ev) + files_hint + "\n\n"
             "Extract the single most valuable idea this competitor has that the "
             "audited program lacks, then decide whether adopting it serves the "
@@ -1580,7 +1648,9 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
         last: dict = {}
         for text in attempts:
             try:
-                last = (author or judge)(IDEA_SYSTEM, text, IDEA_SCHEMA)
+                last = (author_validated(IDEA_SYSTEM, text, IDEA_SCHEMA, validator=validate_idea)
+                        if author_validated is not None else
+                        (author or judge)(IDEA_SYSTEM, text, IDEA_SCHEMA))
             except Exception as ex:
                 return {"error": f"{type(ex).__name__}: {ex}", "accept": False,
                         "idea_title": "(idea extraction failed)",
