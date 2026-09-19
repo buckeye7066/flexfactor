@@ -5344,6 +5344,12 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     # return raw dicts/text, and a malformed one checked only after grade()
     # returned could never be rotated away from (review on #176).
     provider.grade_validator = _normalize_grade
+    from providers.owner_subscription import owner_subscription_only, OfficialOwnerSubscription
+    if owner_subscription_only() and any(route.api == "codex-cli" for route in usable):
+        # Whole-file planning sees this wrapper, not its eventual CLI provider.
+        # Preserve the worker's limits before choosing a route or requesting output.
+        provider.max_output_tokens = OfficialOwnerSubscription.max_output_tokens
+        provider.max_input_bytes = OfficialOwnerSubscription.max_input_bytes
     return provider
 
 

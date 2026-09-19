@@ -88,6 +88,21 @@ class OwnerMergeBlockerTests(unittest.TestCase):
                 rotator = R.Rotator(R.Catalog(routes), R.StateStore(os.path.join(root, 'state.json')))
                 self.assertEqual(rotator.next_route(allow_paid=True, paid_first=True, now=100).route.api, 'codex-cli')
 
+    def test_rotating_owner_planner_preserves_worker_limits(self):
+        import flexfactor as ff
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as root:
+            store = R.StateStore(os.path.join(root, 'state.json'))
+            with mock.patch.dict(os.environ, {'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY': '1'}), \
+                    mock.patch.object(R, 'load_catalog', return_value=None), \
+                    mock.patch.object(R, 'StateStore', return_value=store), \
+                    mock.patch.object(ff, '_provider_free_routed', return_value=False), \
+                    mock.patch.object(ff, '_hydrate_route_credentials', return_value=[]), \
+                    mock.patch.object(ff, '_route_unusable_reason', return_value=''):
+                provider = ff._build_rotating_provider(SimpleNamespace(max_cost=0), None, 'best', quiet=True)
+                self.assertEqual(ff._provider_output_ceiling(provider), 32000)
+                self.assertFalse(ff._whole_file_is_plausible(provider, 'x' * 100000))
+
     def test_unenrolled_fallback_catalog_does_not_add_an_owner_route(self):
         import flexfactor as ff
         with mock.patch.dict(os.environ, {'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY': '0'}), \
