@@ -31,10 +31,10 @@ export function subscriptionAuth(provider, raw) {
     return s.loggedIn === true && s.authMethod === 'claude.ai' && ['pro', 'max'].includes(s.subscriptionType?.toLowerCase()) && !s.apiKeySource
   } catch { return false }
 }
-export function cliArguments(provider, env = process.env) {
+export function cliArguments(provider, env = process.env, features = []) {
   if (provider === 'codex') return ['exec', '--sandbox', 'read-only', '--ephemeral', '--ignore-user-config', '--strict-config', '--skip-git-repo-check', '--json', '--model', codexModel(env),
-    '-c', 'forced_login_method=chatgpt', '-c', 'model_reasoning_effort="low"', '-c', 'web_search="disabled"', '-c', 'agents.enabled=false', '-c', 'mcp_servers={}', '-c', 'tools.update_plan.enabled=false',
-    ...codexDisabledFeatures.flatMap(feature => ['--disable', feature])]
+    '-c', 'forced_login_method=chatgpt', '-c', 'model_reasoning_effort="low"', '-c', 'web_search="disabled"', '-c', 'mcp_servers={}',
+    ...features.flatMap(feature => ['--disable', feature])]
   if (provider !== 'claude') throw new Error('unavailable')
   return ['--print', '--output-format', 'json', '--safe', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--disable-slash-commands', '--no-session-persistence', '--no-chrome', '--permission-mode', 'dontAsk', '--permission-prompts', 'none']
 }
@@ -84,7 +84,7 @@ export function runChild(executable, args, { cwd, env, input = '', signal, captu
     } catch { resolve(null) }
   })
 }
-export async function probeProvider(provider, { signal, env = process.env, run = runChild } = {}) {
+export async function probeProvider(provider, { signal, env = process.env, run = runChild, onCodexFeatures = () => {} } = {}) {
   if (!['codex', 'claude'].includes(provider) || signal?.aborted) return 'unavailable'
   try {
     const clean = childEnvironment(provider, env)
@@ -96,10 +96,15 @@ export async function probeProvider(provider, { signal, env = process.env, run =
       if (!required.every(flag => flags.has(flag)) || signal?.aborted) return 'unavailable'
       const features = await run(providerExecutable('codex'), ['features', 'list'], { env: clean, signal })
       const supported = new Set((features || '').split(/\r?\n/).filter(line => /\s(?:true|false)\s*$/.test(line) && !/\bremoved\b/i.test(line)).map(line => line.trim().split(/\s+/)[0]))
-      if (!codexDisabledFeatures.every(feature => supported.has(feature)) || signal?.aborted) return 'unavailable'
+      // Missing/removed optional features cannot be enabled on this version.
+      // A failed discovery still fails closed; never pass unknown --disable names.
+      if (!supported.size || signal?.aborted) return 'unavailable'
       const auth = await run(providerExecutable('codex'), ['login', 'status'], { env: clean, signal, captureAuthMetadata: true })
       if (signal?.aborted) return 'unavailable'
-      if (auth && subscriptionAuth(provider, auth)) return 'ready'
+      if (auth && subscriptionAuth(provider, auth)) {
+        onCodexFeatures(codexDisabledFeatures.filter(feature => supported.has(feature)))
+        return 'ready'
+      }
       return auth && /^(?:Logged in using (?:an? )?API key.*|Not logged in)\s*$/i.test(auth.trim()) ? 'auth_required' : 'unavailable'
     }
     const help = await run(providerExecutable('claude'), [...cliArguments(provider), '--help'], { env: clean, signal })
@@ -130,11 +135,13 @@ export async function executeJob(job, { signal, env = process.env, run = runChil
       const timer = setTimeout(() => slice.abort(), Math.max(1, Math.floor(remaining - fallbackReserve)))
       const attemptSignal = AbortSignal.any([wholeSignal, slice.signal])
       try {
-        if (await probeProvider(provider, { signal: attemptSignal, env, run }) !== 'ready' || attemptSignal.aborted) continue
+        let supportedFeatures = []
+        if (await probeProvider(provider, { signal: attemptSignal, env, run,
+          onCodexFeatures: features => { supportedFeatures = features } }) !== 'ready' || attemptSignal.aborted) continue
         const clean = childEnvironment(provider, env)
         if (provider === 'claude') clean.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(Math.min(job.maxTokens, 32000))
         if (provider === 'codex') {
-          const result = await session({...job,timeoutMs:Math.max(1,deadline-Date.now())},{env:clean,cwd,model:codexModel(env),features:codexDisabledFeatures,signal:attemptSignal})
+          const result = await session({...job,timeoutMs:Math.max(1,deadline-Date.now())},{env:clean,cwd,model:codexModel(env),features:supportedFeatures,signal:attemptSignal})
           if (result && !attemptSignal.aborted && result.usage.output_tokens < job.maxTokens && (job.format !== 'json' || validJsonObject(result.raw))) return result
           continue
         }

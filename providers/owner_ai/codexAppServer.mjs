@@ -18,7 +18,7 @@ export function runCodexSession(job,{env,cwd,model,features=[],signal,spawnImpl=
   const executable=platform==='win32'?'codex.exe':'codex'
   const args=['app-server','--strict-config','--listen','stdio://',
     '-c','forced_login_method=chatgpt','-c','web_search="disabled"','-c','mcp_servers={}',
-    '-c','tools.update_plan.enabled=false','-c','agents.enabled=false',...features.flatMap(f=>['--disable',f])]
+    ...features.flatMap(f=>['--disable',f])]
   return new Promise(resolve=>{
     let child;let buffer='';let bytes=0;let stopped=false;let closed=false;let response=null
     let threadId=null;let turnId=null;let usage=null;let finalTurn=null;let nextId=1

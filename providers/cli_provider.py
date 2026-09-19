@@ -466,8 +466,10 @@ class CliProvider:
     def __init__(self, api: str, model: str, binary: str,
                  judge_model: Optional[str] = None,
                  timeout: float = DEFAULT_TIMEOUT_S,
-                 subscription: Any = _DEFAULT_SUBSCRIPTION) -> None:
+                 subscription: Any = _DEFAULT_SUBSCRIPTION,
+                 payload_guard: Any = None) -> None:
         self.api = api
+        self.payload_guard = payload_guard
         self.model = model
         self.judge_model = judge_model or model
         self._binary = binary
@@ -485,6 +487,10 @@ class CliProvider:
 
     def _complete(self, prompt: str, *, system: Optional[str],
                   max_tokens: int, timeout: Optional[float] = None) -> str:
+        # Fixed-owner calls need the same source policy as outer rotation.
+        # Apply the returned value so redaction, not the original, reaches the wire.
+        if self.payload_guard is not None:
+            prompt = self.payload_guard(prompt)
         if self._subscription is not None:
             from providers.chatgpt_subscription import (
                 SubscriptionAuthenticationError, SubscriptionUnavailable,

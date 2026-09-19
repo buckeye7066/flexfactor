@@ -5,8 +5,9 @@ import {PassThrough,Writable} from 'node:stream'
 import {runCodexSession} from '../providers/owner_ai/codexAppServer.mjs'
 const base={system:'Trusted scientific-honesty rules.',prompt:'Untrusted task text.',format:'text',maxTokens:10,timeoutMs:1000}
 function protocol({account='chatgpt',model='gpt-6-astra',tool=false,stall=false,reroute=false,reasoning=false}={}) {
-  const requests=[];let child
+  const requests=[];const launches=[];let child
   const spawnImpl=(_exe,args,options)=>{
+    launches.push({args,options})
     child=new EventEmitter();child.pid=undefined;child.stdout=new PassThrough();child.stderr=new PassThrough();child.killed=false
     child.kill=()=>{if(!child.killed){child.killed=true;queueMicrotask(()=>child.emit('close',0,null))}return true}
     const emit=value=>child.stdout.write(JSON.stringify(value)+'\n')
@@ -28,7 +29,7 @@ function protocol({account='chatgpt',model='gpt-6-astra',tool=false,stall=false,
     })}done()},final(done){done();child.kill()}})
     return child
   }
-  return {requests,spawnImpl,get child(){return child}}
+  return {requests,launches,spawnImpl,get child(){return child}}
 }
 const opts=fixture=>({env:{CODEX_HOME:process.cwd()+'/fixture-empty-home',PATH:process.env.PATH},cwd:process.cwd(),model:'gpt-6-astra',features:['shell_tool','unified_exec'],spawnImpl:fixture.spawnImpl,platform:'linux'})
 test('privileged instructions and actual selected model remain separate from user text',async()=>{
@@ -64,3 +65,51 @@ test('reasoning lifecycle is permitted but never included as the completed answe
 
 import {parseResult} from '../providers/owner_ai/officialCli.mjs'
 test('legacy JSONL without execution model metadata is never promoted to a proven model receipt',()=>{const rows=[{type:'thread.started'},{type:'turn.started'},{type:'item.completed',item:{type:'agent_message',text:'answer'}},{type:'turn.completed',usage:{input_tokens:1,cached_input_tokens:0,output_tokens:2}}];assert.equal(parseResult('codex',rows.map(x=>JSON.stringify(x)).join('\n'),'gpt-6-astra'),null)})
+
+import {probeProvider,executeJob} from '../providers/owner_ai/officialCli.mjs'
+const requiredHelp='--sandbox --ephemeral --ignore-user-config --strict-config --skip-git-repo-check --json --model --config --disable'
+const supportedFeatures='shell_tool stable true\nunified_exec stable false\nview_image removed false\n'
+function featureProbe(raw=supportedFeatures) {
+ const calls=[]
+ const run=async(_exe,args)=>{
+  calls.push(args)
+  if(args.includes('--help'))return requiredHelp
+  if(args.join(' ')==='features list')return raw
+  if(args.join(' ')==='login status')return 'Logged in using ChatGPT'
+  throw new Error('Unexpected probe')
+ }
+ return {run,calls}
+}
+const probeEnv={OWNER_AI_CODEX_HOME:process.cwd()+'/fixture-empty-home',HOME:process.cwd()}
+test('missing or removed optional features do not reject an authenticated supported CLI',async()=>{
+ const f=featureProbe()
+ assert.equal(await probeProvider('codex',{env:probeEnv,run:f.run}),'ready')
+ assert.equal(f.calls.some(args=>args.includes('view_image')),false)
+})
+test('execution disables only features reported as supported',async()=>{
+ const f=featureProbe();let admitted
+ const result=await executeJob({...base,providers:['codex'],maxTokens:50},{env:probeEnv,run:f.run,session:async(_job,options)=>{
+  admitted=options.features
+  return {raw:'fixture',usage:{output_tokens:1}}
+ }})
+ assert.equal(result?.raw,'fixture')
+ assert.deepEqual(admitted,['shell_tool','unified_exec'])
+})
+for(const raw of [null,'','not a feature listing']){
+ test('failed or malformed feature discovery remains unavailable: '+String(raw),async()=>{
+  const f=featureProbe(raw)
+  assert.equal(await probeProvider('codex',{env:probeEnv,run:f.run}),'unavailable')
+  assert.equal(f.calls.some(args=>args.join(' ')==='login status'),false)
+ })
+}
+test('strict app-server arguments retain containment without unsupported config fields',async()=>{
+ const f=protocol();const result=await runCodexSession(base,opts(f));assert.ok(result)
+ const args=f.launches[0].args
+ assert.equal(args.includes('tools.update_plan.enabled=false'),false)
+ assert.equal(args.includes('agents.enabled=false'),false)
+ assert.equal(args.includes('--strict-config'),true)
+ assert.equal(args.includes('forced_login_method=chatgpt'),true)
+ assert.equal(args.includes('web_search="disabled"'),true)
+ assert.equal(args.includes('mcp_servers={}'),true)
+ assert.equal(args.includes('shell_tool'),true)
+})

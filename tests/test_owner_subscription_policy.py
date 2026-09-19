@@ -72,4 +72,81 @@ class OwnerProtocolTests(unittest.TestCase):
         result=subprocess.run(['node','--test',str(root/'tests/owner_subscription_protocol.mjs')],capture_output=True,text=True,timeout=20)
         self.assertEqual(result.returncode,0,result.stdout[-4000:]+result.stderr[-1000:])
 
+class OwnerMergeBlockerTests(unittest.TestCase):
+    def test_fallback_catalog_includes_the_enrolled_owner_codex_route(self):
+        import flexfactor as ff
+        with mock.patch.dict(os.environ, {'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY': '1',
+                'FLEXFACTOR_OWNER_CODEX_HOME': tempfile.gettempdir(),
+                'FLEXFACTOR_OWNER_CODEX_MODEL': 'owner-model'}), \
+                mock.patch.object(ff, '_provider_free_routed', return_value=False):
+            routes = ff._builtin_route_catalog(R)
+            owner = [r for r in routes if r.api == 'codex-cli']
+            self.assertEqual(len(owner), 1)
+            self.assertEqual(owner[0].wire_model, 'owner-model')
+            self.assertEqual(owner[0].cost_class, R.SUBSCRIPTION)
+            with tempfile.TemporaryDirectory() as root:
+                rotator = R.Rotator(R.Catalog(routes), R.StateStore(os.path.join(root, 'state.json')))
+                self.assertEqual(rotator.next_route(allow_paid=True, paid_first=True, now=100).route.api, 'codex-cli')
+
+    def test_unenrolled_fallback_catalog_does_not_add_an_owner_route(self):
+        import flexfactor as ff
+        with mock.patch.dict(os.environ, {'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY': '0'}), \
+                mock.patch.object(ff, '_provider_free_routed', return_value=False):
+            self.assertFalse(any(r.api == 'codex-cli' for r in ff._builtin_route_catalog(R)))
+
+    def test_owner_mode_cannot_reuse_paid_rescue_clients_or_keys(self):
+        import flexfactor as ff
+        provider = object.__new__(ff.AnthropicProvider)
+        provider._paid_client_obj = mock.Mock()
+        provider._oai_rescue = mock.Mock()
+        with mock.patch.dict(os.environ, {'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY': '1',
+                'FLEXFACTOR_FALLBACK_ANTHROPIC_KEY': 'fixture-anthropic',
+                'FLEXFACTOR_FALLBACK_OPENAI_KEY': 'fixture-openai'}):
+            self.assertEqual(ff._fallback_anthropic_key(), '')
+            self.assertEqual(ff._fallback_openai_key(), '')
+            self.assertIsNone(provider._paid_client())
+            self.assertIsNone(provider._openai_rescue_provider())
+            original = RuntimeError('free route unavailable')
+            with mock.patch.object(ff, '_stream_with_deadline') as stream:
+                with self.assertRaises(RuntimeError) as raised:
+                    provider._paid_message({}, original)
+                self.assertIs(raised.exception, original)
+                stream.assert_not_called()
+            self.assertEqual(os.environ['FLEXFACTOR_FALLBACK_ANTHROPIC_KEY'], 'fixture-anthropic')
+
+    def test_nonowner_rescue_policy_is_unchanged(self):
+        import flexfactor as ff
+        with mock.patch.dict(os.environ, {'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY': '0',
+                'FLEXFACTOR_FALLBACK_ANTHROPIC_KEY': 'fixture-anthropic',
+                'FLEXFACTOR_FALLBACK_OPENAI_KEY': 'fixture-openai'}):
+            self.assertEqual(ff._fallback_anthropic_key(), 'fixture-anthropic')
+            self.assertEqual(ff._fallback_openai_key(), 'fixture-openai')
+
+    def test_fixed_owner_calls_gate_payloads_before_subscription_execution(self):
+        import flexfactor as ff
+        for provider_name in ('openai', 'anthropic'):
+            for method in ('complete', 'grade', 'structured'):
+                with self.subTest(provider=provider_name, method=method):
+                    subscription = mock.Mock(model='owner-model')
+                    subscription.complete.return_value = '{"score": 90, "summary": "fixture"}'
+                    with mock.patch.dict(os.environ, {'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY': '1'}), \
+                            mock.patch.object(cp, 'build_subscription_client', return_value=subscription), \
+                            mock.patch.object(ff, '_egress_gate', side_effect=RuntimeError('blocked fixture')) as guard:
+                        provider = ff.make_provider(provider_name, 'owner-model')
+                        with self.assertRaisesRegex(RuntimeError, 'blocked fixture'):
+                            getattr(provider, method)('source fixture')
+                        guard.assert_called_once()
+                        subscription.complete.assert_not_called()
+
+    def test_fixed_owner_redaction_is_the_payload_sent_to_subscription(self):
+        import flexfactor as ff
+        subscription = mock.Mock(model='owner-model')
+        subscription.complete.return_value = 'complete fixture'
+        with mock.patch.dict(os.environ, {'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY': '1'}), \
+                mock.patch.object(cp, 'build_subscription_client', return_value=subscription), \
+                mock.patch.object(ff, '_egress_gate', return_value='redacted fixture'):
+            provider = ff.make_provider('openai', 'owner-model')
+            self.assertEqual(provider.complete('source fixture'), 'complete fixture')
+            self.assertEqual(subscription.complete.call_args.args[0], 'redacted fixture')
+
 if __name__=='__main__': unittest.main()

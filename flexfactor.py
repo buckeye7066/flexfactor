@@ -2096,10 +2096,16 @@ def _stream_with_deadline(client, *, deadline_s: float | None = None,
 # errors fire BEFORE any call and are never rescued; refusals are never rescued.
 
 def _fallback_anthropic_key() -> str:
+    from providers.owner_subscription import owner_subscription_only
+    if owner_subscription_only():
+        return ""
     return (os.environ.get("FLEXFACTOR_FALLBACK_ANTHROPIC_KEY") or "").strip()
 
 
 def _fallback_openai_key() -> str:
+    from providers.owner_subscription import owner_subscription_only
+    if owner_subscription_only():
+        return ""
     return (os.environ.get("FLEXFACTOR_FALLBACK_OPENAI_KEY") or "").strip()
 
 
@@ -3997,7 +4003,8 @@ def make_provider(name: str, model: str, meter: CostMeter | None = None,
     from providers.owner_subscription import owner_subscription_only
     if owner_subscription_only() and name in ("openai", "anthropic"):
         from providers.cli_provider import CliProvider
-        prov = CliProvider("codex-cli", os.environ.get("FLEXFACTOR_OWNER_CODEX_MODEL", "gpt-6-astra"), "codex")
+        prov = CliProvider("codex-cli", os.environ.get("FLEXFACTOR_OWNER_CODEX_MODEL") or "gpt-6-astra",
+                           "codex", payload_guard=_egress_gate)
         prov.meter = meter
         return prov
     jm = judge_model or JUDGE_MODELS.get(name) or model
@@ -5176,6 +5183,19 @@ def _builtin_route_catalog(fr):
             capabilities=model_capabilities, capabilities_source="declared",
         ),
     ]
+    from providers.owner_subscription import owner_subscription_only
+    if owner_subscription_only():
+        # A fresh owner install must not need an unrelated AI Time catalog to
+        # discover its explicitly enrolled official subscription transport.
+        owner_model = os.environ.get("FLEXFACTOR_OWNER_CODEX_MODEL") or "gpt-6-astra"
+        routes.insert(0, fr.Route(
+            id="builtin/owner-codex", backend="codex-cli",
+            backend_label="Owner ChatGPT subscription", model=owner_model,
+            wire_model=owner_model, api="codex-cli", base_url="",
+            pool="codex:subscription", cost_class=fr.SUBSCRIPTION,
+            tier=fr.FRONTIER, capabilities=model_capabilities,
+            capabilities_source="declared",
+        ))
     if _provider_free_routed("anthropic"):
         routes.append(fr.Route(
             id="builtin/fcc", backend="anthropic_fcc",
