@@ -930,6 +930,14 @@ def _document_matches_competitor(name: str, document: dict) -> bool:
         rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", combined))
 
 
+def _qualified_repo_identity(value: str) -> tuple[str, str] | None:
+    """Keep the repository boundary and punctuation; GitHub names ignore case."""
+    parts = str(value or "").strip().split("/")
+    if len(parts) != 2 or not all(parts):
+        return None
+    return parts[0].casefold(), parts[1].casefold()
+
+
 def _attributable_repo(name: str, repos: list[dict]) -> dict | None:
     """The GitHub repo that is plausibly THE COMPETITOR'S OWN, or None.
 
@@ -946,6 +954,10 @@ def _attributable_repo(name: str, repos: list[dict]) -> dict | None:
     clean-room-from-documented-behaviour: the honest answer for a product whose
     source we cannot identify.
     """
+    if "/" in str(name or ""):
+        qualified = _qualified_repo_identity(name)
+        return next((row for row in repos or [] if qualified is not None
+                     and _qualified_repo_identity(row.get("name")) == qualified), None)
     want = _norm(name)
     if not want:
         return None
@@ -953,7 +965,7 @@ def _attributable_repo(name: str, repos: list[dict]) -> dict | None:
         owner = _norm(str(r.get("name") or "").split("/")[0])
         if not owner:
             continue
-        if owner == want or _norm(str(r.get("name") or "")) == want:
+        if owner == want:
             return r
     return None
 
@@ -961,12 +973,14 @@ def _attributable_repo(name: str, repos: list[dict]) -> dict | None:
 def _name_related(name: str, repo: dict) -> bool:
     """Is this repo at least NAMED after the competitor? Evidence-grade only -
     the licence oracle is `_attributable_repo`, which is strictly stronger."""
+    if "/" in str(name or ""):
+        qualified = _qualified_repo_identity(name)
+        return qualified is not None and qualified == _qualified_repo_identity(repo.get("name"))
     want = _norm(name)
     if not want:
         return False
-    full = _norm(str(repo.get("name") or ""))
     tail = _norm(str(repo.get("name") or "").split("/")[-1])
-    return bool(tail) and (want == full or want == tail)
+    return bool(tail) and want == tail
 
 
 _IDEA_REQUIRED_TEXT = ("idea_title", "what_it_does", "why_valuable",
@@ -1435,7 +1449,6 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
     # selecting the reported competitors, otherwise three high-star dead URLs
     # can crowd out a lower-ranked candidate with real, attributable evidence.
     # Canonical aliases share one evidence slot and one fetch/clone.
-    unique_competitors: list[dict] = []
     seen_products: dict[tuple, dict] = {}
     for candidate in competitors:
         parsed = urllib.parse.urlsplit(str(candidate.get("url") or ""))
@@ -1445,11 +1458,20 @@ def research_competitors(judge, program_name: str, purpose_blob: str,
             path = path.removesuffix(".git").casefold()
         identity = (host, path) if host else ("name", _norm(candidate["name"]))
         if identity in seen_products:
-            seen_products[identity].setdefault("discovery_aliases", []).append(candidate["name"])
+            previous = seen_products[identity]
+            def provenance_strength(row):
+                return (row.get("kind") == "oss", row.get("license_source") == "github-api")
+            retained, alias = ((candidate, previous)
+                               if provenance_strength(candidate) > provenance_strength(previous)
+                               else (previous, candidate))
+            retained.setdefault("discovery_aliases", []).extend(
+                [alias["name"], *alias.get("discovery_aliases", [])])
+            retained["evidence_urls"] = list(dict.fromkeys(
+                [*retained.get("evidence_urls", []), *alias.get("evidence_urls", [])]))[:8]
+            seen_products[identity] = retained
             continue
         seen_products[identity] = candidate
-        unique_competitors.append(candidate)
-    competitors = unique_competitors
+    competitors = list(seen_products.values())
     competitors = competitors[:evidence_candidate_limit]
 
     # Search is discovery; GLEANING requires the source itself. Fetch bounded

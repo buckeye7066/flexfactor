@@ -131,5 +131,48 @@ class ScoutDiscoveryRecoveryTests(unittest.TestCase):
         self.assertEqual(sorted(fetched), sorted([shared, unique]))
 
 
+
+    def test_qualified_repository_identity_keeps_both_segments_and_punctuation(self):
+        for expected, unrelated in [('foo/bar', 'fo/obar'), ('a-b/c', 'a/b-c'), ('a-b/c', 'ab/c')]:
+            row = {'name': unrelated, 'url': 'https://github.com/' + unrelated, 'license': 'MIT'}
+            with self.subTest(expected=expected, unrelated=unrelated):
+                self.assertIsNone(fc._attributable_repo(expected, [row]))
+                self.assertFalse(fc._name_related(expected, row))
+        row = {'name': 'Foo/Bar', 'license': 'MIT'}
+        self.assertEqual(fc._attributable_repo('foo/bar', [row]), row)
+        self.assertTrue(fc._name_related('FOO/BAR', row))
+
+    def test_canonical_alias_preserves_repository_metadata_and_source_inspection(self):
+        inspected = []
+        url = 'https://github.com/tj/commander.js'
+        def judge(system, prompt, schema):
+            if schema is fc.DISCOVERY_SCHEMA:
+                return {'competitors': [{'name': 'Commander', 'search_query': 'Commander'}]}
+            return {'idea_title': 'Options', 'what_it_does': 'Parse options', 'why_valuable': 'Input errors',
+                    'evidence_basis': 'Source page', 'purpose_reason': 'Already supported', 'accept': False,
+                    'evidence_refs': ['web-fixture']}
+        def inspect(row):
+            inspected.append(row['name'])
+            return {'source_inspection_ok': True, 'license_file_found': True, 'license_families': ['mit'],
+                    'source_documents': [{'evidence_id': 'code-fixture', 'content': 'parse()', 'sha256': 'a'*64}]}
+        page = dict(evidence_id='web-fixture', url=url, title='commander.js',
+                    content='Commander.js parses options.', sha256='a'*64)
+        rr = lambda query: [{'repo': {'fullName': 'tj/commander.js', 'htmlUrl': url,
+                                      'licenseSpdx': 'MIT', 'stars': 0}}]
+        with patch.object(fc, 'web_search', return_value=([page], 'fixture', {})), \
+             patch.object(fc, 'github_repo_search', return_value=[]), \
+             patch.object(fc, 'fetch_evidence_document', return_value=page) as fetched:
+            result = fc.research_competitors(judge, 'CLI', 'Parse options', target=1,
+                                            rr_search=rr, source_inspector=inspect, log=lambda *_: None)
+        self.assertEqual(inspected, ['tj/commander.js'])
+        self.assertEqual(fetched.call_count, 1)
+        row = result['competitors'][0]
+        self.assertEqual(row['kind'], 'oss')
+        self.assertEqual(row['license'], 'MIT')
+        self.assertTrue(row['source_inspection_required'])
+        self.assertEqual(result['verified'], 1)
+        self.assertIn('Commander', row['discovery_aliases'])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
