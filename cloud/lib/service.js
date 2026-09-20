@@ -1,3 +1,4 @@
+import {ServiceError} from "./service-error.js";
 import {
   API_VERSION,
   ENGINE_REF,
@@ -32,14 +33,7 @@ const MAX_IDEMPOTENCY_SCAN_PAGES = 100;
 const DISPATCH_PENDING_MS = 15 * 60 * 1000;
 const REQUEST_VARIABLE_PREFIX = "FLEXFACTOR_RUN_";
 
-export class ServiceError extends Error {
-  constructor(status, code, message) {
-    super(message);
-    this.name = "ServiceError";
-    this.status = status;
-    this.code = code;
-  }
-}
+export {ServiceError} from "./service-error.js";
 
 function cleanSecret(value, label, maximum = 16_384) {
   const clean = typeof value === "string" ? value.trim() : "";

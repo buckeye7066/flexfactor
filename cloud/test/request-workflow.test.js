@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {createHash} from 'node:crypto';
 import {mobileWorkflow} from '../lib/workflow.js';
-import {dispatch, runStatus} from '../lib/service.js';
+import {dispatch, runStatus, ServiceError} from '../lib/service.js';
 import {withMailboxGithub} from '../test_support/mailbox-github.js';
 const ID='4d32c8e5-6f2b-4a98-a7f5-99594c49b2f8';
 const REPO='owner/project';
@@ -130,4 +130,14 @@ test('an existing request tag is rejected before any credential or claim mutatio
  const api=fixture();api.refs.set('refs/tags/'+REF,'f'.repeat(40));
  await assert.rejects(dispatch('fixture-token',REQUEST,{},api.fetch));
  assert.equal(api.fetch.mailbox.allCalls.filter(call=>call.method!=='GET').length,0);
+});
+
+test('request conflicts preserve the public service error type and status',async()=>{
+ const api=fixture();api.refs.set('refs/tags/'+REF,'f'.repeat(40));
+ await assert.rejects(dispatch('fixture-token',REQUEST,{},api.fetch),error=>{
+  assert.ok(error instanceof ServiceError);
+  assert.equal(error.status,409);
+  assert.equal(error.code,'request_workflow_unavailable');
+  return true;
+ });
 });

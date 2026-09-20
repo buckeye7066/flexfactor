@@ -1,10 +1,11 @@
+import {ServiceError} from './service-error.js';
 import {mobileWorkflow} from './workflow.js';
 import {WORKFLOW_PATH} from './config.js';
 
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const SHA = /^[a-f0-9]{40}$/;
 const REPO = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/;
-function failure(message) { return Object.assign(new Error(message), {status: 409, code: 'request_workflow_unavailable'}); }
+function failure(message) { return new ServiceError(409, 'request_workflow_unavailable', message); }
 function body(result) {
   try { return JSON.parse(result.body.toString('utf8')); }
   catch { throw failure('GitHub returned invalid request workflow metadata'); }
