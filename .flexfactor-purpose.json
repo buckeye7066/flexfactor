@@ -328,8 +328,8 @@
     {
       "kind": "source",
       "locator": "cloud/lib/service.js",
-      "content_hash": "3e76338c4c2205c75105b199997f2f266705993e8db87c245cd1b9464bacea5b",
-      "observed_at": "2026-09-18T21:30:24.736391+00:00",
+      "content_hash": "31f4dae786739ffb72335bb0bb184f4fb20cf4bd8e90d4a6cf851d795cc09e95",
+      "observed_at": "2026-09-20T04:12:15.695821+00:00",
       "excerpt": "Dispatch, downgrade guard, and scoped cleanup."
     },
     {
