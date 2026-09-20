@@ -511,6 +511,101 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
         finally:
             manager.release(lease)
 
+    def test_unrelated_capacity_wait_does_not_replay_exhausted_shape_failure(self):
+        """A busy sibling must not turn one malformed answer into a 12h loop."""
+        from dataclasses import replace
+        from unittest import mock
+        os.environ["FLEXFACTOR_PROVIDER_WAIT_MAX_S"] = "30"
+        unrelated = replace(real_route("ollama/sibling", "ollama:sibling"),
+                            backend="ollama", cost_class=rotation.LOCAL_UNLIMITED)
+        held = cap._MANAGER.acquire(unrelated, app="busy-sibling", timeout=0)
+        self.addCleanup(cap._MANAGER.release, held)
+        calls, errors = [], []
+
+        class StructuredOutputShapeError(ValueError):
+            pass
+
+        class Backing:
+            def structured(inner, *args, **kwargs):
+                calls.append(args[1])
+                # Another admission waiter can update this global display state
+                # while the current provider is still running.
+                cap._MANAGER.store.update(lambda state: state.update(runtime={
+                    "state": "waiting-for-provider",
+                    "detail": "busy-sibling queued for shared allowance ollama:local-unlimited",
+                    "updated_at": time.time(),
+                }))
+                return {"accept": True}
+
+        route = real_route("groq/schema", "groq:schema")
+        store = rotation.StateStore(os.path.join(self.tmp.name, "shape-rotation.json"))
+        provider = rotation.RotatingProvider(
+            rotation.Rotator(real_catalog(route), store, app="shape-fixture"),
+            lambda selected: Backing(), tier=rotation.STRONG, allow_paid=False,
+            on_error=lambda selected, error: errors.append(error))
+
+        def validate(data):
+            raise StructuredOutputShapeError("required evidence_refs were omitted")
+
+        with mock.patch("flexfactor_capacity.time.sleep", side_effect=AssertionError(
+                "an exhausted shape failure was restarted for unrelated capacity")):
+            with self.assertRaises(rotation.RotationError) as caught:
+                provider.structured_validated("system", "original prompt", {},
+                                              validator=validate)
+        self.assertIsInstance(caught.exception.__cause__, StructuredOutputShapeError)
+        self.assertEqual(calls, ["original prompt"])
+        self.assertEqual(len(errors), 1)
+        self.assertIs(errors[0], caught.exception.__cause__)
+        self.assertEqual(len(cap._MANAGER.snapshot()["leases"]), 1)
+        self.assertEqual(cap._MANAGER.snapshot()["waiters"], {})
+
+    def test_exhausted_noncapacity_causes_ignore_global_waiting_label(self):
+        cases = [
+            TimeoutError("the transport timed out"),
+            PermissionError("request not authorized"),
+            type("StructuredOutputShapeError", (ValueError,), {})("missing evidence"),
+            type("GradeShapeError", (ValueError,), {})("invalid grade"),
+            type("ModelRefusalError", (RuntimeError,), {})("model refused"),
+            type("EgressBlockedError", (RuntimeError,), {})("payload blocked"),
+            type("BudgetExceededError", (RuntimeError,), {})("cost allowance exceeded"),
+            type("StructuredOutputShapeError", (ValueError,), {})("invalid quota field"),
+        ]
+        runtime = {"state": "waiting-for-provider", "detail": "another call is queued"}
+        for cause in cases:
+            with self.subTest(cause=type(cause).__name__, detail=str(cause)):
+                error = rotation.RotationError("every strong pool failed this call")
+                error.__cause__ = cause
+                self.assertFalse(cap._capacity_should_wait(error, runtime))
+
+    def test_capacity_cause_traversal_is_bounded_and_keeps_real_rate_limits(self):
+        class RateLimited(RuntimeError):
+            status_code = 429
+        runtime = {"state": "waiting-for-provider"}
+        outer = rotation.RotationError("every strong pool failed this call")
+        nested = rotation.RotationError("no strong route available")
+        outer.__cause__ = nested
+        nested.__cause__ = RateLimited("rate limit reached")
+        self.assertTrue(cap._capacity_should_wait(outer, runtime))
+        self.assertFalse(cap._capacity_should_wait(outer, {"state": "running"}))
+        nested.__cause__ = TimeoutError("transport timed out")
+        self.assertFalse(cap._capacity_should_wait(outer, runtime))
+        nested.__cause__ = outer
+        self.assertFalse(cap._capacity_should_wait(outer, runtime))
+        nested.__cause__ = None
+        self.assertTrue(cap._capacity_should_wait(outer, runtime))
+
+    def test_rate_limit_wrapper_cannot_hide_a_nested_policy_boundary(self):
+        class RateLimited(RuntimeError):
+            status_code = 429
+        runtime = {"state": "waiting-for-provider"}
+        for kind in ("BudgetExceededError", "EgressBlockedError", "ModelRefusalError"):
+            with self.subTest(kind=kind):
+                error = rotation.RotationError("every strong pool failed this call")
+                wrapper = RateLimited("rate limit reached")
+                wrapper.__cause__ = type(kind, (RuntimeError,), {})("explicit boundary")
+                error.__cause__ = wrapper
+                self.assertFalse(cap._capacity_should_wait(error, runtime))
+
     def test_retryable_429_recovers_and_still_reaches_the_error_hook(self):
         os.environ["FLEXFACTOR_PROVIDER_WAIT_MAX_S"] = "3"
         errors = []

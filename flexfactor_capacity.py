@@ -253,7 +253,32 @@ def _capacity_should_wait(exc,runtime):
     capacity state explicitly said no lease or allowance was blocking it.
     """
     if not _waitable_rotation_error(exc): return False
-    return str((runtime or {}).get("state") or "") == "waiting-for-provider"
+    if str((runtime or {}).get("state") or "") != "waiting-for-provider":
+        return False
+    # Runtime is a shared display label: another concurrent call can put it
+    # into "waiting" while THIS call exhausts malformed or dead providers.
+    # Preserve the actual cause instead of replaying the entire failed ladder;
+    # Scout owns its one corrected-prompt retry, not this admission wrapper.
+    import flexfactor_rotation as r
+    cause, provider_error, seen = exc, None, set()
+    for _ in range(32):
+        if cause is None:
+            # Selection-only cooldown has no actual failed call to replay.
+            return (provider_error is None or r._classify(provider_error)
+                    in ("rate_limited", "quota_exhausted"))
+        if id(cause) in seen:
+            return False
+        seen.add(id(cause))
+        if (isinstance(cause, (PermissionError, CapacityTimeout))
+                or type(cause).__name__ in ("BudgetExceededError", "_AbandonedCallTimeout")
+                or r.is_malformed_output(cause) or r.is_model_refusal(cause)
+                or r.is_payload_fault(cause)):
+            return False
+        if provider_error is None and not isinstance(cause, r.RotationError):
+            provider_error = cause
+        cause = cause.__cause__
+    return False  # An unresolved/cyclic cause chain cannot authorize a retry.
+
 
 def _renewing_call(manager,lease,fn,*args,**kwargs):
     """Run a provider call while renewing its lease until completion."""
