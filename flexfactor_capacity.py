@@ -244,16 +244,38 @@ def _waitable_rotation_error(exc):
         return False
     text=f"{type(exc).__name__} {exc}".lower(); return any(x in text for x in ("no strong route available","no frontier route available","no light route available","every strong pool failed","every frontier pool failed","every light pool failed","rate limit","quota","allowance","cooling down"))
 
-def _capacity_should_wait(exc,runtime):
-    """Wait only when shared capacity has a known future opening.
+def _capacity_should_wait(exc, runtime):
+    """Use this call's failure/cooldown evidence, never the shared UI label."""
+    if not _waitable_rotation_error(exc):
+        return False
+    import flexfactor_rotation as r
+    evidence = getattr(exc, "capacity_waitable", False) is True
+    failures = getattr(exc, "capacity_failures", ())
+    if not isinstance(failures, (tuple, list)):
+        return False
+    for index, original in enumerate((exc, *failures)):
+        cause, provider_error, seen = original, None, set()
+        for _ in range(32):
+            if cause is None:
+                if provider_error is not None:
+                    evidence = evidence or r._classify(provider_error) in (
+                        "rate_limited", "quota_exhausted")
+                break
+            if not isinstance(cause, BaseException) or id(cause) in seen:
+                return False
+            seen.add(id(cause))
+            if (isinstance(cause, (PermissionError, CapacityTimeout))
+                    or type(cause).__name__ in ("BudgetExceededError", "_AbandonedCallTimeout")
+                    or r.is_model_refusal(cause) or r.is_payload_fault(cause)
+                    or (index == 0 and r.is_malformed_output(cause))):
+                return False
+            if provider_error is None and not isinstance(cause, r.RotationError):
+                provider_error = cause
+            cause = cause.__cause__ or cause.__context__
+        else:
+            return False
+    return evidence
 
-    A transport-dead route is cooled by the rotator, not by the capacity
-    manager.  Its generic ``every ... pool failed`` message used to match the
-    broad text predicate above and spin for up to twelve hours even when the
-    capacity state explicitly said no lease or allowance was blocking it.
-    """
-    if not _waitable_rotation_error(exc): return False
-    return str((runtime or {}).get("state") or "") == "waiting-for-provider"
 
 def _renewing_call(manager,lease,fn,*args,**kwargs):
     """Run a provider call while renewing its lease until completion."""
