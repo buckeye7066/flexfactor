@@ -148,7 +148,7 @@ class InstallationGitHub {
     return pull;
   }
 }
-const attempt = (github) => dispatch("fixture-owner-token", request(), {}, github.fetch, async () => {});
+const attempt = (github) => dispatch("fixture-owner-token", request(), {}, withMailboxGithub(github.fetch), async () => {});
 const pending = (github) => assert.rejects(attempt(github), (error) =>
   error.code === "workflow_installation_pending");
 
