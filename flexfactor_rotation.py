@@ -824,9 +824,49 @@ class Rotator:
 
         selection = outcome.get("selection")
         if selection is None:
-            raise RotationError(
+            failure = RotationError(
                 self._no_route_message(requested, allow_paid, reasons), reasons)
+            failure.capacity_waitable = self.has_waitable_capacity(
+                requested, allow_paid=allow_paid, pin=pin, pin_strict=pin_strict,
+                now=now, intent=intent, paid_first=paid_first,
+                excluded_route_ids=excluded_route_ids)
+            raise failure
         return selection
+
+    def has_waitable_capacity(self, tier: str = FRONTIER, *,
+                              allow_paid: bool = False,
+                              pin: Optional[str] = None, pin_strict: bool = True,
+                              now: Optional[float] = None,
+                              intent: Optional[CallIntent] = None,
+                              paid_first: bool = False,
+                              excluded_route_ids: Optional[frozenset[str]] = None) -> bool:
+        """Probe real cooldown recovery without altering any selection gate."""
+        moment = time.time() if now is None else now
+        state = self.store.read()
+        capacity_keys = {route.pool for route in self.catalog.routes}
+        capacity_keys.update(f"allowance:{allowance_key(route)}"
+                             for route in self.catalog.routes)
+        active = {key for key in capacity_keys if _cooling(state, key, moment)}
+        if not active:
+            return False
+        # Only pool/account waits are removed from this copy. Credential,
+        # route, quality, capability, cost and reviewer restrictions remain.
+        future = dict(state)
+        future["cooldowns"] = {key: value for key, value in
+                               (state.get("cooldowns") or {}).items() if key not in active}
+        resolved_pin = None if paid_first else (
+            pin or os.environ.get("AI_ROTATE_PIN") or state.get("pin", {}).get(self.app)
+            or state.get("pin", {}).get("global"))
+        excluded = frozenset(excluded_route_ids or ())
+        if resolved_pin:
+            if pin_strict:
+                return False
+            return self._resolve_pin(resolved_pin, future, moment, False, tier,
+                allow_paid, {}, intent, excluded) is not None
+        requested = tier if tier in TIER_CHAIN else LIGHT
+        return any(self._pick_in_tier(candidate_tier, allow_paid, future, moment,
+                   {}, intent, paid_first=paid_first, excluded_route_ids=excluded) is not None
+                   for candidate_tier in TIER_CHAIN[TIER_CHAIN.index(requested):])
 
     def has_usable_route(self, tier: str = FRONTIER, *,
                          allow_paid: bool = False,
@@ -1692,6 +1732,7 @@ class RotatingProvider:
             route_bound = min(route_bound, attempt_limit)
         attempts = min(attempts, route_bound)
         last_error: Optional[BaseException] = None
+        attempt_errors: List[BaseException] = []
         shape_failed_routes: List[
             Tuple[Route, Optional[Tuple[float, str]]]] = []
 
@@ -1763,10 +1804,13 @@ class RotatingProvider:
                 # "no route available" here would DISCARD last_error and hand
                 # the caller a confidently wrong diagnosis. Same class so a
                 # PinUnavailable stays fatal for its catchers.
-                raise type(exc)(
+                failure = type(exc)(
                     f"{exc}; last provider error was "
                     f"{type(last_error).__name__}: {last_error}",
-                    getattr(exc, "reasons", None)) from last_error
+                    getattr(exc, "reasons", None))
+                failure.capacity_failures = tuple(attempt_errors)
+                failure.capacity_waitable = getattr(exc, "capacity_waitable", False)
+                raise failure from last_error
             route = selection.route
             if (route.id in refused_route_ids
                     or (refused_families
@@ -1798,6 +1842,7 @@ class RotatingProvider:
                 # shared mutable state (see ROUTE_MODEL_ATTR); the exception
                 # is not.
                 stamp_route_model(exc, getattr(route, "model", ""))
+                attempt_errors.append(exc)
                 # The shared USD meter can refuse a paid route after the call was
                 # selected. That is a policy boundary, not a provider failure.
                 # Continue the SAME call on genuinely free/local capacity when
@@ -1890,9 +1935,11 @@ class RotatingProvider:
                         self._author_families.add(family)
             return result
         restore_corrective_retry_capacity()
-        raise RotationError(
+        failure = RotationError(
             f"every {tier} pool failed this call; last error was "
-            f"{type(last_error).__name__}: {last_error}") from last_error
+            f"{type(last_error).__name__}: {last_error}")
+        failure.capacity_failures = tuple(attempt_errors)
+        raise failure from last_error
 
     def catalog_routes(self, tier: str) -> List[Route]:
         return [r for r in self.rotator.catalog.routes

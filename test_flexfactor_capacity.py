@@ -586,12 +586,14 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
         outer.__cause__ = nested
         nested.__cause__ = RateLimited("rate limit reached")
         self.assertTrue(cap._capacity_should_wait(outer, runtime))
-        self.assertFalse(cap._capacity_should_wait(outer, {"state": "running"}))
+        self.assertTrue(cap._capacity_should_wait(outer, {"state": "running"}))
         nested.__cause__ = TimeoutError("transport timed out")
         self.assertFalse(cap._capacity_should_wait(outer, runtime))
         nested.__cause__ = outer
         self.assertFalse(cap._capacity_should_wait(outer, runtime))
         nested.__cause__ = None
+        self.assertFalse(cap._capacity_should_wait(outer, runtime))
+        outer.capacity_waitable = True
         self.assertTrue(cap._capacity_should_wait(outer, runtime))
 
     def test_rate_limit_wrapper_cannot_hide_a_nested_policy_boundary(self):
@@ -605,6 +607,116 @@ class RotatingProviderCapacityIntegrationTests(unittest.TestCase):
                 wrapper.__cause__ = type(kind, (RuntimeError,), {})("explicit boundary")
                 error.__cause__ = wrapper
                 self.assertFalse(cap._capacity_should_wait(error, runtime))
+
+    def test_policy_only_selection_does_not_wait_for_another_call(self):
+        from dataclasses import replace
+        from unittest import mock
+        route = replace(real_route("paid/only", "paid:only"),
+                        cost_class=rotation.PAID_METERED)
+        rotator = rotation.Rotator(real_catalog(route), rotation.StateStore(
+            os.path.join(self.tmp.name, "policy-only.json")), app="policy-fixture")
+        factory = mock.Mock(side_effect=AssertionError("forbidden provider called"))
+        provider = rotation.RotatingProvider(rotator, factory,
+            tier=rotation.STRONG, allow_paid=False)
+        cap._MANAGER.store.update(lambda state: state.update(runtime={
+            "state": "waiting-for-provider", "detail": "another caller is queued"}))
+        with mock.patch("flexfactor_capacity.time.sleep", side_effect=AssertionError(
+                "a permanent selection policy entered the capacity wait loop")):
+            with self.assertRaises(rotation.RotationError):
+                provider.complete("system", "prompt")
+        factory.assert_not_called()
+
+    def test_implicit_policy_context_blocks_a_rate_labelled_wrapper(self):
+        class RateLimited(RuntimeError):
+            status_code = 429
+        for kind in ("BudgetExceededError", "EgressBlockedError", "ModelRefusalError"):
+            for suppressed in (False, True):
+                with self.subTest(kind=kind, suppressed=suppressed):
+                    error = rotation.RotationError("every strong pool failed this call")
+                    wrapper = RateLimited("rate limit reached")
+                    wrapper.__context__ = type(kind, (RuntimeError,), {})("explicit boundary")
+                    wrapper.__suppress_context__ = suppressed
+                    error.__cause__ = wrapper
+                    self.assertFalse(cap._capacity_should_wait(error, {
+                        "state": "waiting-for-provider"}))
+
+    def test_earlier_rate_limit_recovers_after_final_pool_transport_failure(self):
+        from dataclasses import replace
+        os.environ["FLEXFACTOR_PROVIDER_WAIT_MAX_S"] = "5"
+        held = cap._MANAGER.acquire(replace(
+            real_route("ollama/sibling", "ollama:sibling"), backend="ollama",
+            cost_class=rotation.LOCAL_UNLIMITED), app="busy-sibling", timeout=0)
+        self.addCleanup(cap._MANAGER.release, held)
+        calls, errors = [], []
+        class RateLimited(RuntimeError):
+            status_code = 429
+            headers = {"Retry-After": "0.05"}
+        routes = (real_route("groq/recover", "groq:recover"),
+                  real_route("groq/broken", "groq:broken"))
+        store = rotation.StateStore(os.path.join(self.tmp.name, "mixed-capacity.json"))
+        store.update(lambda state: state["pools"].update({
+            "groq:broken": {"calls": 1, "last_used_at": 1.0}}))
+        class Backing:
+            def __init__(inner, route):
+                inner.route = route
+            def complete(inner, *args, **kwargs):
+                calls.append(inner.route.id)
+                if inner.route.id == "groq/broken":
+                    raise TimeoutError("transport timed out")
+                if calls.count("groq/recover") == 1:
+                    raise RateLimited("rate limit reached")
+                return "recovered"
+        provider = rotation.RotatingProvider(
+            rotation.Rotator(real_catalog(*routes), store, app="mixed-fixture"),
+            Backing, tier=rotation.STRONG, allow_paid=False,
+            on_error=lambda route, error: errors.append(error))
+        self.assertEqual(provider.complete("system", "prompt"), "recovered")
+        self.assertEqual(calls, ["groq/recover", "groq/broken", "groq/recover"])
+        self.assertEqual([type(error).__name__ for error in errors],
+                         ["RateLimited", "TimeoutError"])
+
+    def test_selection_capacity_probe_is_read_only_and_requires_a_real_wait(self):
+        route = real_route("groq/cooling", "groq:cooling")
+        store = rotation.StateStore(os.path.join(self.tmp.name, "cooling-probe.json"))
+        rotator = rotation.Rotator(real_catalog(route), store, app="probe")
+        self.assertFalse(rotator.has_waitable_capacity(rotation.STRONG))
+        rotator.report(route, "rate_limited", retry_after_seconds=30)
+        before = store.read()
+        self.assertTrue(rotator.has_waitable_capacity(rotation.STRONG))
+        self.assertEqual(store.read(), before)
+        with self.assertRaises(rotation.RotationError) as caught:
+            rotator.next_route(rotation.STRONG)
+        self.assertTrue(caught.exception.capacity_waitable)
+        self.assertEqual(store.read(), before)
+        self.assertTrue(cap._capacity_should_wait(caught.exception, {"state": "running"}))
+
+    def test_capacity_probe_retains_cost_capability_credential_and_route_gates(self):
+        from dataclasses import replace
+        route = real_route("groq/blocked", "groq:blocked")
+        for gate in ("paid", "capability", "credential", "route", "disabled"):
+            with self.subTest(gate=gate):
+                selected = route
+                intent = None
+                if gate == "paid":
+                    selected = replace(route, cost_class=rotation.PAID_METERED)
+                elif gate == "capability":
+                    selected = replace(route, capabilities=("text",))
+                    intent = rotation.CallIntent(role="judge", needs=("vision",))
+                elif gate == "disabled":
+                    selected = replace(route, enabled=False)
+                store = rotation.StateStore(os.path.join(self.tmp.name, gate + "-probe.json"))
+                rotator = rotation.Rotator(real_catalog(selected), store, app="probe")
+                rotator.report(selected, "rate_limited", retry_after_seconds=30)
+                if gate == "credential":
+                    rotator.report(selected, "auth_failed")
+                elif gate == "route":
+                    rotator.report(selected, "transport_dead")
+                before = store.read()
+                self.assertFalse(rotator.has_waitable_capacity(rotation.STRONG, intent=intent))
+                self.assertEqual(store.read(), before)
+                with self.assertRaises(rotation.RotationError) as caught:
+                    rotator.next_route(rotation.STRONG, intent=intent)
+                self.assertFalse(caught.exception.capacity_waitable)
 
     def test_retryable_429_recovers_and_still_reaches_the_error_hook(self):
         os.environ["FLEXFACTOR_PROVIDER_WAIT_MAX_S"] = "3"
