@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   API_VERSION,
   ENGINE_REF,
@@ -499,79 +500,135 @@ async function assertTargetRef(token, repository, ref, fetchImpl) {
     "github_request_failed", safeGitHubError(response));
 }
 
-async function installWorkflowThroughPullRequest(token, repository, baseBranch, expected, fetchImpl) {
-  const metadata = await githubJson(token, "GET", `/repos/${repository}`, undefined, fetchImpl);
-  const ownerLogin = typeof metadata?.owner?.login === "string" ? metadata.owner.login : "";
-  const base = await githubJson(token, "GET",
-    `/repos/${repository}/git/ref/heads/${encode(baseBranch)}`, undefined, fetchImpl);
-  const baseSha = typeof base?.object?.sha === "string" ? base.object.sha : "";
-  if (!baseSha) {
-    throw new ServiceError(409, "protected_branch_unresolved",
-      "The protected target branch could not be resolved.");
+function installationPending(message) {
+  return new ServiceError(409, "workflow_installation_pending", message);
+}
+
+async function runnerChangeMatches(token, repository, baseSha, headSha, expected, fetchImpl) {
+  if (!/^[0-9a-f]{40}$/i.test(headSha || "")) return false;
+  const comparison = await githubJson(token, "GET",
+    `/repos/${repository}/compare/${baseSha}...${headSha}`, undefined, fetchImpl);
+  const files = comparison.files;
+  if (!Array.isArray(files) || files.length !== 1 || files[0].filename !== WORKFLOW_PATH
+      || !["added", "modified"].includes(files[0].status)) return false;
+  const content = await githubJson(token, "GET",
+    `/repos/${repository}/contents/${WORKFLOW_PATH}?ref=${headSha}`, undefined, fetchImpl);
+  return typeof content.content === "string" && content.encoding === "base64"
+    && Buffer.from(content.content.replace(/\n/g, ""), "base64").toString("utf8") === expected;
+}
+
+function runnerPullIdentity(pull, repository, baseBranch, branch) {
+  return Number.isSafeInteger(pull?.number) && pull.number > 0 && pull.state === "open"
+    && pull.base?.ref === baseBranch
+    && pull.base?.repo?.full_name?.toLowerCase() === repository.toLowerCase()
+    && pull.head?.repo?.full_name?.toLowerCase() === repository.toLowerCase()
+    && typeof pull.head?.ref === "string"
+    && pull.head.ref.startsWith("flexfactor/mobile-runner-")
+    && (!branch || pull.head.ref === branch);
+}
+
+async function pendingRunnerPull(token, repository, baseBranch, baseSha, expected, fetchImpl, branch = "") {
+  const owner = repository.split("/")[0];
+  const headFilter = branch ? `&head=${encode(`${owner}:${branch}`)}` : "";
+  // Old random-named installs must be recovered too. An incomplete scan cannot
+  // authorize another PR. Never trust a matching title or branch name alone.
+  for (let page = 1; page <= 10; page += 1) {
+    const rows = await githubJson(token, "GET",
+      `/repos/${repository}/pulls?state=open&base=${encode(baseBranch)}${headFilter}&sort=created&direction=asc&per_page=100&page=${page}`,
+      undefined, fetchImpl);
+    if (!Array.isArray(rows)) throw new ServiceError(502, "invalid_upstream_response",
+      "GitHub returned an invalid pending installation list.");
+    for (const pull of rows) {
+      if (runnerPullIdentity(pull, repository, baseBranch, branch)
+          && await runnerChangeMatches(token, repository, baseSha, pull.head.sha, expected, fetchImpl)) return pull;
+    }
+    if (rows.length < 100) return null;
   }
-  // Recheck the exact base commit before creating a branch: the first write
-  // may have raced an engine upgrade on the protected default branch.
+  throw installationPending("The pending installation scan is incomplete; no duplicate was created.");
+}
+
+async function mergeRunnerPull(token, repository, baseBranch, pull, fetchImpl) {
+  const merged = await githubRaw(token, "PUT", `/repos/${repository}/pulls/${pull.number}/merge`, {
+    merge_method: "squash", commit_title: "Install FlexFactor Mobile runner", sha: pull.head.sha,
+  }, fetchImpl);
+  if (merged.status >= 200 && merged.status < 300
+      && parseJson(merged.body, "GitHub").merged === true) return true;
+  throw installationPending(`This repository protects ${baseBranch}. Runner installation is pending in https://github.com/${repository}/pull/${pull.number}. GitHub's configured approvals and checks must complete before its first phone run.`);
+}
+
+async function installWorkflowThroughPullRequest(token, repository, baseBranch, expected, fetchImpl) {
+  await githubJson(token, "GET", `/repos/${repository}`, undefined, fetchImpl);
+  const refPath = `/repos/${repository}/git/ref/heads/`;
+  const base = await githubJson(token, "GET", refPath + encode(baseBranch), undefined, fetchImpl);
+  const baseSha = base?.object?.sha;
+  if (!/^[0-9a-f]{40}$/i.test(baseSha || "")) {
+    throw new ServiceError(409, "protected_branch_unresolved", "The protected target branch could not be resolved.");
+  }
+  // Recheck the captured base revision before changing or recovering an install.
   const contentPath = `/repos/${repository}/contents/${WORKFLOW_PATH}`;
-  const existing = await githubRaw(token, "GET",
-    `${contentPath}?ref=${encode(baseSha)}`, undefined, fetchImpl);
+  const existing = await githubRaw(token, "GET", `${contentPath}?ref=${baseSha}`, undefined, fetchImpl);
   if (existing.status !== 200 && existing.status !== 404) {
     throw new ServiceError(existing.status >= 500 ? 502 : existing.status,
       "github_request_failed", safeGitHubError(existing));
   }
-  if (existing.status === 200) {
-    const current = parseJson(existing.body, "GitHub");
-    if (typeof current.content === "string") {
-      const actual = Buffer.from(current.content.replace(/\n/g, ""), "base64").toString("utf8");
-      if (actual === expected) return false;
-      assertNoEngineDowngrade(actual);
-    }
+  const current = existing.status === 200 ? parseJson(existing.body, "GitHub") : null;
+  if (typeof current?.content === "string") {
+    const actual = Buffer.from(current.content.replace(/\n/g, ""), "base64").toString("utf8");
+    if (actual === expected) return false;
+    assertNoEngineDowngrade(actual);
   }
-  const installBranch = `flexfactor/mobile-runner-${crypto.randomUUID().slice(0, 8)}`;
-  await githubJson(token, "POST", `/repos/${repository}/git/refs`, {
-    ref: `refs/heads/${installBranch}`,
-    sha: baseSha,
+  const prior = await pendingRunnerPull(token, repository, baseBranch, baseSha, expected, fetchImpl);
+  if (prior) return mergeRunnerPull(token, repository, baseBranch, prior, fetchImpl);
+
+  // A content-addressed branch provides a shared reservation across replicas
+  // and distinct phone requests, including crashes before the PR was created.
+  const identity = createHash("sha256").update(JSON.stringify([
+    repository.toLowerCase(), baseBranch, baseSha, expected,
+  ])).digest("hex").slice(0, 24);
+  const installBranch = `flexfactor/mobile-runner-${identity}`;
+  const reserved = await githubRaw(token, "POST", `/repos/${repository}/git/refs`, {
+    ref: `refs/heads/${installBranch}`, sha: baseSha,
   }, fetchImpl);
-  const write = {
-    message: "Install FlexFactor Mobile runner",
-    content: Buffer.from(expected, "utf8").toString("base64"),
-    branch: installBranch,
-  };
-  if (existing.status === 200) {
-    const contentSha = parseJson(existing.body, "GitHub").sha;
-    if (contentSha) write.sha = contentSha;
+  if ((reserved.status < 200 || reserved.status >= 300) && reserved.status !== 422) {
+    throw new ServiceError(reserved.status >= 500 ? 502 : reserved.status,
+      "github_request_failed", safeGitHubError(reserved));
   }
-  await githubJson(token, "PUT", contentPath, write, fetchImpl);
+  const branchPath = refPath + encode(installBranch);
+  let headSha = (await githubJson(token, "GET", branchPath, undefined, fetchImpl)).object?.sha;
+  if (headSha === baseSha) {
+    const write = { message: "Install FlexFactor Mobile runner",
+      content: Buffer.from(expected, "utf8").toString("base64"), branch: installBranch };
+    if (current?.sha) write.sha = current.sha;
+    const written = await githubRaw(token, "PUT", contentPath, write, fetchImpl);
+    // A concurrent writer may already have completed exactly this change.
+    // Re-read and verify it, never overwrite another tree or mask server errors.
+    if ((written.status < 200 || written.status >= 300) && ![409, 422].includes(written.status)) {
+      throw new ServiceError(written.status >= 500 ? 502 : written.status,
+        "github_request_failed", safeGitHubError(written));
+    }
+    headSha = (await githubJson(token, "GET", branchPath, undefined, fetchImpl)).object?.sha;
+  }
+  if (!await runnerChangeMatches(token, repository, baseSha, headSha, expected, fetchImpl)) {
+    throw installationPending("The reserved runner branch has unverified changes; it was not overwritten or merged.");
+  }
   const created = await githubRaw(token, "POST", `/repos/${repository}/pulls`, {
-    title: "Install FlexFactor Mobile runner",
-    head: installBranch,
-    base: baseBranch,
+    title: "Install FlexFactor Mobile runner", head: installBranch, base: baseBranch,
     body: "Installs the pinned FlexFactor Android caller workflow on a protected branch.",
   }, fetchImpl);
   let pull;
   if (created.status >= 200 && created.status < 300) {
     pull = parseJson(created.body, "GitHub");
-  } else if (created.status === 422 && ownerLogin) {
-    const rows = await githubJson(token, "GET",
-      `/repos/${repository}/pulls?state=open&head=${encode(`${ownerLogin}:${installBranch}`)}&base=${encode(baseBranch)}&per_page=10`,
-      undefined, fetchImpl);
-    if (Array.isArray(rows) && rows.length) pull = rows[0];
+    if (!runnerPullIdentity(pull, repository, baseBranch, installBranch) || pull.head.sha !== headSha) {
+      throw installationPending("The installation PR revision changed; no unverified revision was merged.");
+    }
+  } else if (created.status === 422) {
+    pull = await pendingRunnerPull(token, repository, baseBranch, baseSha, expected, fetchImpl, installBranch);
   } else {
     throw new ServiceError(created.status >= 500 ? 502 : created.status,
       "github_request_failed", safeGitHubError(created));
   }
-  if (!pull?.number) {
-    throw new ServiceError(409, "workflow_installation_pending",
-      "The protected branch requires a runner installation pull request, but GitHub did not return it.");
-  }
-  const merged = await githubRaw(token, "PUT",
-    `/repos/${repository}/pulls/${pull.number}/merge`, {
-      merge_method: "squash",
-      commit_title: "Install FlexFactor Mobile runner",
-    }, fetchImpl);
-  if (merged.status >= 200 && merged.status < 300
-      && parseJson(merged.body, "GitHub").merged === true) return true;
-  throw new ServiceError(409, "workflow_installation_pending",
-    `This repository protects ${baseBranch}. FlexFactor opened the runner installation PR${pull.html_url ? `: ${pull.html_url}` : "."} GitHub's configured approvals must complete before its first phone run.`);
+  if (!pull) throw installationPending("GitHub has not returned the reserved installation PR; retry to recover it.");
+  return mergeRunnerPull(token, repository, baseBranch, pull, fetchImpl);
 }
 
 function assertNoEngineDowngrade(workflow) {
