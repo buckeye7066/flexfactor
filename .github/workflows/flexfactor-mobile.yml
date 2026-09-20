@@ -79,6 +79,6 @@ jobs:
       threshold: ${{ inputs.threshold }}
       max_iterations: ${{ inputs.max_iterations }}
     secrets:
-      STEERING_PRIVATE_KEY: ""
-      OPENAI_API_KEY: ""
-      ANTHROPIC_API_KEY: ""
+      STEERING_PRIVATE_KEY: ${{ secrets[inputs.steering_secret_name] }}
+      OPENAI_API_KEY: ${{ secrets[inputs.openai_secret_name] || secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets[inputs.anthropic_secret_name] || secrets.ANTHROPIC_API_KEY }}
