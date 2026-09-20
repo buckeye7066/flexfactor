@@ -40,6 +40,18 @@ on:
       max_iterations:
         required: true
         type: string
+      steering_release_id:
+        required: true
+        type: string
+      steering_secret_name:
+        required: true
+        type: string
+      openai_secret_name:
+        required: false
+        type: string
+      anthropic_secret_name:
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -50,11 +62,11 @@ permissions:
 
 jobs:
   flexfactor:
-    # The deployed 3.5.6 cloud owns this caller during the guarded tag-first
-    # interval. Promotion advances it after the cloud engine is upgraded.
-    uses: buckeye7066/flexfactor/.github/workflows/mobile-run.yml@android-v3.5.6
+    uses: buckeye7066/flexfactor/.github/workflows/mobile-run.yml@android-v3.5.14
     with:
       request_id: ${{ inputs.request_id }}
+      steering_release_id: ${{ inputs.steering_release_id }}
+      steering_secret_name: ${{ inputs.steering_secret_name }}
       mode: ${{ inputs.mode }}
       provider: ${{ inputs.provider }}
       target_repository: ${{ github.repository }}
@@ -67,5 +79,6 @@ jobs:
       threshold: ${{ inputs.threshold }}
       max_iterations: ${{ inputs.max_iterations }}
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      STEERING_PRIVATE_KEY: ${{ secrets[inputs.steering_secret_name] }}
+      OPENAI_API_KEY: ${{ secrets[inputs.openai_secret_name] || secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets[inputs.anthropic_secret_name] || secrets.ANTHROPIC_API_KEY }}
