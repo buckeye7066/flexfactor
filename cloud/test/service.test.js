@@ -113,10 +113,10 @@ function storedClaim(request, overrides = {}) {
 }
 
 test("the reusable workflow is pinned to the release that carries this client", () => {
-  assert.equal(ENGINE_REF, "android-v3.5.14");
+  assert.equal(ENGINE_REF, "android-v3.5.15");
   assert.match(
     mobileWorkflow(),
-    /^[ \t]*uses: buckeye7066\/flexfactor\/\.github\/workflows\/mobile-run\.yml@android-v3\.5\.14$/m,
+    /^[ \t]*uses: buckeye7066\/flexfactor\/\.github\/workflows\/mobile-run\.yml@android-v3\.5\.15$/m,
   );
   for (const mode of ["refactor", "scout", "audit", "prodready"]) {
     assert.match(mobileWorkflow(), new RegExp(mode));
@@ -234,7 +234,7 @@ test("provider public keys are fetched through the managed service", async () =>
   assert.match(fetcher.calls[0].url, /actions\/secrets\/public-key$/);
 });
 
-test("dispatch uses the default-branch caller and GitHub's authoritative run ID", async () => {
+test("dispatch uses the registered caller at its request tag and GitHub's authoritative run ID", async () => {
   const fetcher = queuedFetch([
     missingRequestClaim(),
     { body: { workflow_runs: [] } },
@@ -258,7 +258,7 @@ test("dispatch uses the default-branch caller and GitHub's authoritative run ID"
   assert.match(fetcher.calls[6].url, /flexfactor-mobile\.yml\?ref=main$/);
   assert.match(fetcher.calls[7].url, /flexfactor-mobile\.yml\/dispatches$/);
   const dispatchBody = JSON.parse(fetcher.calls[7].options.body);
-  assert.equal(dispatchBody.ref, "main");
+  assert.equal(dispatchBody.ref, "flexfactor-run-" + validRun().request_id);
   assert.equal(dispatchBody.inputs.target_ref, "feature/release");
   assert.equal(dispatchBody.return_run_details, true);
   assert.doesNotMatch(fetcher.calls[7].options.body, /OPENAI|ANTHROPIC|gho_dispatch_token/);
@@ -659,7 +659,7 @@ test("upstream errors never include the access token", async () => {
   });
 });
 
-for (const newerRef of ["android-v3.5.15", "android-v3.6.0", "android-v4.0.0"]) {
+for (const newerRef of ["android-v3.5.16", "android-v3.6.0", "android-v4.0.0"]) {
   test(`dispatch refuses to downgrade an installed ${newerRef} runner`, async () => {
     const current = installedWorkflow();
     current.body.content = Buffer.from(mobileWorkflow().replace(ENGINE_REF, newerRef)).toString("base64");
@@ -720,5 +720,5 @@ test("protected-branch retry preserves an engine upgraded during the initial wri
 });
 
 test("downgrade protection has a distinct cloud release identity", () => {
-  assert.equal(SERVICE_VERSION, "1.1.14");
+  assert.equal(SERVICE_VERSION, "1.1.16");
 });

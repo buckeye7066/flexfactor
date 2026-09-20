@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import sodium from 'libsodium-wrappers';
 await sodium.ready;
 export const githubKey = sodium.crypto_box_keypair();
@@ -8,7 +9,7 @@ const reply = (status, value) => new Response(status === 204 ? null : JSON.strin
 // remain in the original fixture's control. allCalls records both surfaces.
 export function withMailboxGithub(fallback, options = {}) {
   const state = { releases: new Map(), secrets: new Map(), mailboxCalls: [], allCalls: [],
-    active: false, nextRelease: 400, nextAsset: 800, hook: null };
+    active: false, nextRelease: 400, nextAsset: 800, hook: null, workflowRefs: new Map(), workflowTrees: new Map(), workflowCommits: new Map() };
   const fetcher = async (url, request = {}) => {
     const parsed = new URL(url), path = parsed.pathname, method = request.method || 'GET';
     let body;
@@ -17,6 +18,30 @@ export function withMailboxGithub(fallback, options = {}) {
     state.allCalls.push(call);
     const overridden = await state.hook?.(call);
     if (overridden) return overridden;
+    // The authenticated service creates an immutable caller-only ref. Keep this
+    // synthetic Git surface outside the original ordered HTTP fixtures.
+    if (options.requestWorkflows !== false) {
+      const relative = path.replace(/^\/repos\/[^/]+\/[^/]+/, '');
+      const hash = value => createHash('sha1').update(JSON.stringify(value)).digest('hex');
+      if (relative === '/git/trees' && method === 'POST') {
+        const sha = hash(body); state.workflowTrees.set(sha, body); return reply(201, {sha});
+      }
+      if (relative === '/git/commits' && method === 'POST') {
+        const sha = hash(body); state.workflowCommits.set(sha, body);
+        return reply(201, {sha, tree: {sha: body.tree}, parents: body.parents});
+      }
+      if (relative === '/git/refs' && method === 'POST' && body.ref?.startsWith('refs/tags/flexfactor-run-')) {
+        if (state.workflowRefs.has(body.ref)) return reply(422, {});
+        state.workflowRefs.set(body.ref, body.sha); return reply(201, {ref: body.ref, object: {sha: body.sha}});
+      }
+      if (relative.startsWith('/git/ref/tags/flexfactor-run-') && method === 'GET') {
+        const ref = 'refs/tags/' + relative.slice('/git/ref/tags/'.length);
+        return reply(state.workflowRefs.has(ref) ? 200 : 404, {ref, object: {sha: state.workflowRefs.get(ref)}});
+      }
+      if (relative.startsWith('/git/refs/tags/flexfactor-run-') && method === 'DELETE') {
+        state.workflowRefs.delete('refs/tags/' + relative.slice('/git/refs/tags/'.length)); return reply(204);
+      }
+    }
     const internalSecret = /\/actions\/secrets\/FLEXFACTOR_[A-F0-9]{32}_STEERING_KEY$/.test(path);
     const mailboxPath = /\/releases(?:\/|$)/.test(path);
     const internalClaim = method === 'PATCH' && body?.value
