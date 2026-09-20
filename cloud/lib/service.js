@@ -1,3 +1,4 @@
+import {ServiceError} from "./service-error.js";
 import {
   API_VERSION,
   ENGINE_REF,
@@ -7,6 +8,7 @@ import {
   WORKFLOW_PATH,
 } from "./config.js";
 import { mobileWorkflow } from "./workflow.js";
+import {assertRequestWorkflowAbsent, createRequestWorkflow, deleteRequestWorkflow, normalizeWorkflowClaim} from "./request-workflow.js";
 import { generateSteeringKeyPair, sealPrivateKeyForGitHub, steeringSecretName,
   validateMailboxClaim, mailboxIdentity, mailboxTag, draftMailboxPayload,
   assertMailbox, assertMailboxAsset, sealSteering, MAX_ENVELOPE_BYTES,
@@ -31,14 +33,7 @@ const MAX_IDEMPOTENCY_SCAN_PAGES = 100;
 const DISPATCH_PENDING_MS = 15 * 60 * 1000;
 const REQUEST_VARIABLE_PREFIX = "FLEXFACTOR_RUN_";
 
-export class ServiceError extends Error {
-  constructor(status, code, message) {
-    super(message);
-    this.name = "ServiceError";
-    this.status = status;
-    this.code = code;
-  }
-}
+export {ServiceError} from "./service-error.js";
 
 function cleanSecret(value, label, maximum = 16_384) {
   const clean = typeof value === "string" ? value.trim() : "";
@@ -676,6 +671,7 @@ function normalizeRequestClaim(value, request, label = "GitHub request claim") {
     ephemeral_secrets: [...new Set(names)],
     created_at: typeof claim.created_at === "string" ? claim.created_at : "",
     ...(claim.steering ? { steering: validateMailboxClaim(claim.steering, request.request_id, request.repository) } : {}),
+    ...(claim.workflow ? { workflow: normalizeWorkflowClaim(claim.workflow, request.request_id) } : {}),
   };
 }
 
@@ -761,6 +757,7 @@ async function deleteSteering(token, request, fetchImpl, steering = null) {
 async function deleteClaimResources(token, request, claim, fetchImpl) {
   // Keep the cleanup manifest until every dependent resource is gone. Each
   // delete accepts 404, so a partial failure is safe to retry on the next poll.
+  await deleteRequestWorkflow((method, path, value) => githubRaw(token, method, path, value, fetchImpl), request, claim?.workflow);
   await deleteSteering(token, request, fetchImpl, claim?.steering);
   if (!claim) return false;
   for (const name of claim.ephemeral_secrets) {
@@ -966,25 +963,32 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
   const suppliedWrites = await prepareProviderSecrets(encryptedSecrets);
   const providerSecretWrites = ephemeralProviderWrites(run, suppliedWrites);
   const ephemeralNames = [...providerSecretWrites.map((item) => item.name), steeringSecretName(run.request_id)];
+  await assertRequestWorkflowAbsent((method, path, value) => githubRaw(token, method, path, value, fetchImpl), run);
   const ownership = await claimRequest(token, run, ephemeralNames, fetchImpl);
   if (!ownership.owned) {
     return recoverClaimedRequest(token, run, ownership.claim, fetchImpl);
   }
   let dispatchAttempted = false;
   try {
-    const workflowChanged = await ensureTargetWorkflow(
+    await ensureTargetWorkflow(
       token, run.repository, workflowRef, fetchImpl);
     await initializeSteeringMailbox(token, run, ownership.claim, fetchImpl);
     await applyProviderSecrets(token, run, providerSecretWrites, fetchImpl);
+    const caller = await createRequestWorkflow(
+      (method, path, value) => githubRaw(token, method, path, value, fetchImpl), run,
+      async (workflow) => {
+        ownership.claim.workflow = workflow;
+        await persistRequestClaim(token, run, ownership.claim, fetchImpl);
+      });
     ownership.claim.steering.phase = 'dispatching';
     await persistRequestClaim(token, run, ownership.claim, fetchImpl);
     const submittedAt = Date.now();
     const path = `/repos/${run.repository}/actions/workflows/${WORKFLOW_FILE}/dispatches`;
     let result;
-    for (let attempt = 0; attempt < (workflowChanged ? 15 : 1); attempt += 1) {
+    for (let attempt = 0; attempt < 15; attempt += 1) {
       dispatchAttempted = true;
       result = await githubRaw(token, "POST", path, {
-        ref: workflowRef,
+        ref: caller.ref,
         inputs: workflowInputs(run, providerSecretWrites, ownership.claim.steering),
         return_run_details: true,
       }, fetchImpl);
@@ -992,7 +996,7 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
       // A server/proxy error can arrive after GitHub accepted the POST. Only
       // an explicit client rejection permits the owner to roll back its claim.
       dispatchAttempted = ![400, 401, 403, 404, 422].includes(result.status);
-      if (!workflowChanged || ![404, 422].includes(result.status)) {
+      if (![404, 422].includes(result.status)) {
         throw new ServiceError(result.status >= 500 ? 502 : result.status,
           "github_request_failed", safeGitHubError(result));
       }
@@ -1026,7 +1030,7 @@ export async function dispatch(token, source, encryptedSecrets = {}, fetchImpl =
       // Compatibility only. The request remains claimed throughout correlation,
       // so an eventual-consistency gap can strand safely but cannot duplicate.
       state = await locateDispatchedRun(
-        token, run, workflowRef, submittedAt, fetchImpl, sleepImpl);
+        token, run, caller.ref, submittedAt, fetchImpl, sleepImpl);
     } else {
       throw new ServiceError(502, "invalid_dispatch_response",
         "GitHub accepted the workflow request without a run identifier.");

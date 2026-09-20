@@ -166,7 +166,7 @@ test("omitted phone credentials preserve the caller's canonical fallback", async
 });
 
 test("generated caller maps scoped inputs to the pinned engine's existing secret interface", () => {
-  const workflow = mobileWorkflow();
+  const workflow = mobileWorkflow(firstId);
   const engine = readFileSync(new URL("../../.github/workflows/mobile-run.yml", import.meta.url), "utf8");
   const declarations = engine.split("  workflow_call:")[1].split("permissions:")[0]
     .split("    secrets:")[1];
@@ -174,7 +174,7 @@ test("generated caller maps scoped inputs to the pinned engine's existing secret
   assert.deepEqual(names, ["STEERING_PRIVATE_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
   for (const [input, name] of [["openai_secret_name", "OPENAI_API_KEY"], ["anthropic_secret_name", "ANTHROPIC_API_KEY"]]) {
     assert.match(workflow, new RegExp(`      ${input}:\\n        required: false\\n        type: string`));
-    assert.ok(workflow.includes(name + ": " + "${{ secrets[inputs." + input + "] || secrets." + name + " }}"));
+    assert.ok(workflow.includes(name + ": " + "${{ secrets." + scopedName(firstId, name) + " || secrets." + name + " }}"));
     assert.equal(workflow.split("    with:")[1].split("    secrets:")[0].includes(`${input}:`), false);
   }
   assert.equal(workflow.includes("secrets: inherit"), false);

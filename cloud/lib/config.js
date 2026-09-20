@@ -1,5 +1,5 @@
 export const SERVICE_NAME = "flexfactor-cloud";
-export const SERVICE_VERSION = "1.1.15";
+export const SERVICE_VERSION = "1.1.16";
 export const API_VERSION = "2026-03-10";
 export const OAUTH_CLIENT_ID = (process.env.GITHUB_OAUTH_CLIENT_ID
   || "Ov23li0JXVXULhuCRr1g").trim();

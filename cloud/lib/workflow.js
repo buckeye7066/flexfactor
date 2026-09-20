@@ -1,6 +1,18 @@
 import { ENGINE_REF } from "./config.js";
 
-export function mobileWorkflow() {
+export function mobileWorkflow(requestId) {
+  let names = null;
+  if (requestId !== undefined) {
+    if (typeof requestId !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(requestId)) {
+      throw new Error('A valid request UUID is required for a scoped caller');
+    }
+    const prefix = 'FLEXFACTOR_' + requestId.replaceAll('-', '').toUpperCase() + '_';
+    names = {steering: prefix + 'STEERING_KEY', openai: prefix + 'OPENAI_API_KEY', anthropic: prefix + 'ANTHROPIC_API_KEY'};
+  }
+  // The default-branch file registers workflow_dispatch. Actual app requests
+  // execute a verified, request-specific tag with only literal secret names.
+  // A manual run of the registration file has no steering credential and fails.
+  const binding = (name, fallback) => !name ? '""' : '${{ secrets.' + name + (fallback ? ' || secrets.' + fallback : '') + ' }}';
   return [
     "name: FlexFactor Mobile",
     "",
@@ -83,9 +95,9 @@ export function mobileWorkflow() {
     "      threshold: ${{ inputs.threshold }}",
     "      max_iterations: ${{ inputs.max_iterations }}",
     "    secrets:",
-    "      STEERING_PRIVATE_KEY: ${{ secrets[inputs.steering_secret_name] }}",
-    "      OPENAI_API_KEY: ${{ secrets[inputs.openai_secret_name] || secrets.OPENAI_API_KEY }}",
-    "      ANTHROPIC_API_KEY: ${{ secrets[inputs.anthropic_secret_name] || secrets.ANTHROPIC_API_KEY }}",
+    `      STEERING_PRIVATE_KEY: ${binding(names?.steering)}`,
+    `      OPENAI_API_KEY: ${binding(names?.openai, "OPENAI_API_KEY")}`,
+    `      ANTHROPIC_API_KEY: ${binding(names?.anthropic, "ANTHROPIC_API_KEY")}`,
     "",
   ].join("\n");
 }
