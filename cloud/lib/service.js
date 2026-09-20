@@ -29,6 +29,7 @@ const ALLOWED_SECRETS = new Set(["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]);
 const REPOSITORY_PAGE_SIZE = 100;
 const MAX_REPOSITORY_PAGES = 100;
 const MAX_IDEMPOTENCY_SCAN_PAGES = 100;
+const MAX_INSTALLATION_SCAN_PAGES = 100;
 const DISPATCH_PENDING_MS = 15 * 60 * 1000;
 const REQUEST_VARIABLE_PREFIX = "FLEXFACTOR_RUN_";
 
@@ -530,11 +531,11 @@ function runnerPullIdentity(pull, repository, baseBranch, branch) {
 async function pendingRunnerPull(token, repository, baseBranch, baseSha, expected, fetchImpl, branch = "") {
   const owner = repository.split("/")[0];
   const headFilter = branch ? `&head=${encode(`${owner}:${branch}`)}` : "";
-  // Old random-named installs must be recovered too. An incomplete scan cannot
-  // authorize another PR. Never trust a matching title or branch name alone.
-  for (let page = 1; page <= 10; page += 1) {
+  // Creation-ordered all-state history does not shift when earlier PRs close.
+  // Match only open, verified installs; an incomplete scan cannot create work.
+  for (let page = 1; page <= MAX_INSTALLATION_SCAN_PAGES; page += 1) {
     const rows = await githubJson(token, "GET",
-      `/repos/${repository}/pulls?state=open&base=${encode(baseBranch)}${headFilter}&sort=created&direction=asc&per_page=100&page=${page}`,
+      `/repos/${repository}/pulls?state=all&base=${encode(baseBranch)}${headFilter}&sort=created&direction=asc&per_page=100&page=${page}`,
       undefined, fetchImpl);
     if (!Array.isArray(rows)) throw new ServiceError(502, "invalid_upstream_response",
       "GitHub returned an invalid pending installation list.");
@@ -547,12 +548,24 @@ async function pendingRunnerPull(token, repository, baseBranch, baseSha, expecte
   throw installationPending("The pending installation scan is incomplete; no duplicate was created.");
 }
 
-async function mergeRunnerPull(token, repository, baseBranch, pull, fetchImpl) {
+async function mergeRunnerPull(token, repository, baseBranch, pull, expected, fetchImpl) {
   const merged = await githubRaw(token, "PUT", `/repos/${repository}/pulls/${pull.number}/merge`, {
     merge_method: "squash", commit_title: "Install FlexFactor Mobile runner", sha: pull.head.sha,
   }, fetchImpl);
   if (merged.status >= 200 && merged.status < 300
       && parseJson(merged.body, "GitHub").merged === true) return true;
+  // Another caller may already have merged this same verified PR. Reconcile
+  // the actual base workflow before reporting an approval failure.
+  const installed = await githubRaw(token, "GET",
+    `/repos/${repository}/contents/${WORKFLOW_PATH}?ref=${encode(baseBranch)}`, undefined, fetchImpl);
+  if (installed.status === 200) {
+    const content = parseJson(installed.body, "GitHub");
+    if (typeof content.content === "string" && content.encoding === "base64"
+        && Buffer.from(content.content.replace(/\n/g, ""), "base64").toString("utf8") === expected) return true;
+  } else if (installed.status !== 404) {
+    throw new ServiceError(installed.status >= 500 ? 502 : installed.status,
+      "github_request_failed", safeGitHubError(installed));
+  }
   throw installationPending(`This repository protects ${baseBranch}. Runner installation is pending in https://github.com/${repository}/pull/${pull.number}. GitHub's configured approvals and checks must complete before its first phone run.`);
 }
 
@@ -578,12 +591,12 @@ async function installWorkflowThroughPullRequest(token, repository, baseBranch, 
     assertNoEngineDowngrade(actual);
   }
   const prior = await pendingRunnerPull(token, repository, baseBranch, baseSha, expected, fetchImpl);
-  if (prior) return mergeRunnerPull(token, repository, baseBranch, prior, fetchImpl);
+  if (prior) return mergeRunnerPull(token, repository, baseBranch, prior, expected, fetchImpl);
 
   // A content-addressed branch provides a shared reservation across replicas
   // and distinct phone requests, including crashes before the PR was created.
   const identity = createHash("sha256").update(JSON.stringify([
-    repository.toLowerCase(), baseBranch, baseSha, expected,
+    repository.toLowerCase(), baseBranch, expected,
   ])).digest("hex").slice(0, 24);
   const installBranch = `flexfactor/mobile-runner-${identity}`;
   const reserved = await githubRaw(token, "POST", `/repos/${repository}/git/refs`, {
@@ -595,6 +608,25 @@ async function installWorkflowThroughPullRequest(token, repository, baseBranch, 
   }
   const branchPath = refPath + encode(installBranch);
   let headSha = (await githubJson(token, "GET", branchPath, undefined, fetchImpl)).object?.sha;
+  if (headSha !== baseSha) {
+    if (typeof headSha !== "string" || !/^[0-9a-f]{40}$/i.test(headSha)) {
+      throw installationPending("The reserved runner branch revision is unavailable.");
+    }
+    const ancestry = await githubJson(token, "GET",
+      `/repos/${repository}/compare/${headSha}...${baseSha}`, undefined, fetchImpl);
+    if (ancestry.status === "ahead" && ancestry.merge_base_commit?.sha === headSha) {
+      // Recover a reservation made before main advanced. Only a normal
+      // fast-forward is allowed; concurrent unique work cannot be discarded.
+      const advanced = await githubRaw(token, "PATCH",
+        `/repos/${repository}/git/refs/heads/${encode(installBranch)}`,
+        { sha: baseSha, force: false }, fetchImpl);
+      if ((advanced.status < 200 || advanced.status >= 300) && ![409, 422].includes(advanced.status)) {
+        throw new ServiceError(advanced.status >= 500 ? 502 : advanced.status,
+          "github_request_failed", safeGitHubError(advanced));
+      }
+      headSha = (await githubJson(token, "GET", branchPath, undefined, fetchImpl)).object?.sha;
+    }
+  }
   if (headSha === baseSha) {
     const write = { message: "Install FlexFactor Mobile runner",
       content: Buffer.from(expected, "utf8").toString("base64"), branch: installBranch };
@@ -628,7 +660,7 @@ async function installWorkflowThroughPullRequest(token, repository, baseBranch, 
       "github_request_failed", safeGitHubError(created));
   }
   if (!pull) throw installationPending("GitHub has not returned the reserved installation PR; retry to recover it.");
-  return mergeRunnerPull(token, repository, baseBranch, pull, fetchImpl);
+  return mergeRunnerPull(token, repository, baseBranch, pull, expected, fetchImpl);
 }
 
 function assertNoEngineDowngrade(workflow) {
