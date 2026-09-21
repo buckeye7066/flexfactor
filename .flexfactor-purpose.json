@@ -314,9 +314,9 @@
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "9bd9669ce713a5c1e963ebe99e72af231a3bd25cb1b3a388a223f8284ace8ea9",
-      "observed_at": "2026-09-19T21:06:22.128766+00:00",
-      "excerpt": "Modes, verification, review, publication."
+      "content_hash": "b8a03c8f769a3bae9d0b533c07b806d78d6f6daa93665b09acd8b7b737f40d77",
+      "observed_at": "2026-09-21T20:24:39.435495+00:00",
+      "excerpt": "Modes, verification, review and publication."
     },
     {
       "kind": "source",
