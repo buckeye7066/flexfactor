@@ -95,6 +95,13 @@ cgroup controls remain read-only inside the sandbox. No .NET heap settings
 are changed. Other hosts retain the address-space limit, with the actual
 mechanism and any fallback reason recorded in containment evidence.
 
+On managed Ubuntu runners, sandbox provisioning probes Bubblewrap as the
+ordinary job user. When AppArmor blocks namespace setup, provisioning may load
+only Ubuntu's packaged `bwrap-userns-restrict` profile from `apparmor-profiles`.
+Existing profile conflicts fail provisioning. The profile restricts executed
+children; the engine still runs unprivileged, and target tests verify no retained
+capabilities. Global namespace and AppArmor settings are not changed.
+
 This distinction matters for PowerShell: the matching 7.6.5 runtime failed
 under a 2 GiB virtual-address limit while starting successfully under the same
 physical-memory budget. The kernel also killed a diagnostic allocation that

@@ -137,6 +137,8 @@ class ManagedMemoryWorkflowTests(unittest.TestCase):
             source = (ROOT / ".github/workflows" / file).read_text(encoding="utf-8")
             with self.subTest(file=file):
                 self.assertIn("apt-get install --yes bubblewrap", source)
+                self.assertIn("managed_bwrap_profile.py ensure", source)
+                self.assertLess(source.index("managed_bwrap_profile.py ensure"), source.index("managed_memory.py setup"))
                 self.assertIn("managed_memory.py setup", source)
                 self.assertIn("managed_memory.py probe", source)
                 self.assertIn("FLEXFACTOR_MEMORY_CGROUP_ROOT", source)
@@ -150,6 +152,92 @@ class ManagedMemoryWorkflowTests(unittest.TestCase):
         release = (ROOT / ".github/workflows/production-readiness.yml").read_text(encoding="utf-8")
         self.assertIn("FLEXFACTOR_TEST_PWSH", release)
         self.assertIn("test_managed_memory_workflow.py", release)
+
+
+class ManagedBubblewrapProfileTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("managed_bwrap_test", ROOT / ".github/scripts/managed_bwrap_profile.py")
+        self.helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.helper)
+        self.ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        self.bad = SimpleNamespace(returncode=1, stdout="", stderr="operation not permitted")
+
+    def test_successful_probe_never_invokes_sudo_or_installs_policy(self):
+        h = self.helper
+        with mock.patch.object(h.os, "geteuid", return_value=1000, create=True), \
+             mock.patch.object(h, "run", return_value=self.ok) as run, \
+             mock.patch.object(h, "apparmor_active") as active:
+            h.ensure()
+        run.assert_called_once_with(h.PROBE)
+        active.assert_not_called()
+
+    def test_failed_probe_without_apparmor_refuses_changes(self):
+        h = self.helper
+        with mock.patch.object(h.os, "geteuid", return_value=1000, create=True), \
+             mock.patch.object(h, "run", return_value=self.bad) as run, \
+             mock.patch.object(h, "apparmor_active", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "without active AppArmor"):
+                h.ensure()
+        run.assert_called_once_with(h.PROBE)
+
+    def test_existing_loaded_profile_is_not_replaced(self):
+        h = self.helper
+        with mock.patch.object(h, "loaded_profiles", return_value={"bwrap": "enforce)"}), \
+             mock.patch.object(h, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "refusing to replace"):
+                h.reject_conflicts()
+        run.assert_not_called()
+
+    def test_existing_vendor_definition_is_not_replaced(self):
+        h = self.helper
+        names = SimpleNamespace(returncode=0, stdout="unpriv_bwrap\n", stderr="")
+        with mock.patch.object(h, "loaded_profiles", return_value={}), \
+             mock.patch.object(Path, "iterdir", return_value=[Path("/etc/apparmor.d/vendor")]), \
+             mock.patch.object(Path, "is_file", return_value=True), \
+             mock.patch.object(h, "run", return_value=names) as run:
+            with self.assertRaisesRegex(RuntimeError, "existing bubblewrap policy"):
+                h.reject_conflicts()
+        self.assertEqual(run.call_args.args[0][1], "--names")
+
+    def test_install_adds_only_packaged_profile_and_checks_enforcement(self):
+        h = self.helper
+        names = SimpleNamespace(returncode=0, stdout="bwrap\nunpriv_bwrap\n", stderr="")
+        with mock.patch.object(h.os, "geteuid", return_value=0, create=True), \
+             mock.patch.object(h, "apparmor_active", return_value=True), \
+             mock.patch.object(h, "reject_conflicts") as conflicts, \
+             mock.patch.object(h, "run", side_effect=[self.bad, self.ok, names, self.ok]) as run, \
+             mock.patch.object(Path, "stat", return_value=SimpleNamespace(st_uid=0, st_mode=0o100644)), \
+             mock.patch.object(Path, "is_symlink", return_value=False), \
+             mock.patch.object(h, "loaded_profiles", return_value={"bwrap": "enforce)", "unpriv_bwrap": "enforce)"}):
+            h.install(1000, 1000)
+        self.assertEqual(conflicts.call_count, 2)
+        self.assertEqual(run.call_args_list[0], mock.call(h.PROBE, user=1000, group=1000, extra_groups=[]))
+        self.assertEqual(run.call_args_list[-1], mock.call([h.PARSER, "--add", str(h.PROFILE)]))
+
+    def test_loaded_profiles_must_both_be_enforced(self):
+        h = self.helper
+        names = SimpleNamespace(returncode=0, stdout="bwrap\nunpriv_bwrap\n", stderr="")
+        with mock.patch.object(h.os, "geteuid", return_value=0, create=True), \
+             mock.patch.object(h, "apparmor_active", return_value=True), \
+             mock.patch.object(h, "reject_conflicts"), \
+             mock.patch.object(h, "run", side_effect=[self.bad, self.ok, names, self.ok]), \
+             mock.patch.object(Path, "stat", return_value=SimpleNamespace(st_uid=0, st_mode=0o100644)), \
+             mock.patch.object(Path, "is_symlink", return_value=False), \
+             mock.patch.object(h, "loaded_profiles", return_value={"bwrap": "enforce)", "unpriv_bwrap": "complain)"}):
+            with self.assertRaisesRegex(RuntimeError, "both load in enforce"):
+                h.install(1000, 1000)
+
+    def test_ordinary_user_probe_must_pass_after_installation(self):
+        h = self.helper
+        with mock.patch.object(h.os, "geteuid", return_value=1000, create=True), \
+             mock.patch.object(h.os, "getuid", return_value=1000, create=True), \
+             mock.patch.object(h.os, "getgid", return_value=1000, create=True), \
+             mock.patch.object(h, "apparmor_active", return_value=True), \
+             mock.patch.object(h, "run", side_effect=[self.bad, self.ok, self.bad]) as run:
+            with self.assertRaisesRegex(RuntimeError, "still fails"):
+                h.ensure()
+        self.assertEqual(run.call_args_list[-1], mock.call(h.PROBE))
+        self.assertEqual(run.call_args_list[1].args[0][0], "sudo")
 
 
 if __name__ == "__main__":

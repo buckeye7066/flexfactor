@@ -188,6 +188,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
+          python engine/.github/scripts/managed_bwrap_profile.py ensure
           receipt="$RUNNER_TEMP/flexfactor-memory-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB.json"
           root="$(sudo "$(command -v python)" engine/.github/scripts/managed_memory.py setup \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --job "$GITHUB_JOB" \

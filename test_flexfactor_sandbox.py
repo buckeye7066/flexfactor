@@ -324,6 +324,8 @@ class LinuxMemoryCgroupTests(unittest.TestCase):
                   "\nassert not os.path.exists(sys.argv[2]), 'host supervisor root exposed'"
                   "\nstatus=open('/proc/self/status').read()"
                   "\nassert any(line.split()==['NoNewPrivs:', '1'] for line in status.splitlines()), 'privilege elevation permitted'"
+                  "\nfor line in status.splitlines():"
+                  "\n if line.startswith(('CapEff:', 'CapPrm:', 'CapAmb:')): assert int(line.split()[1], 16)==0, 'target retained capabilities'"
                   "\nfor fd in os.listdir('/proc/self/fd'):"
                   "\n try: target=os.readlink('/proc/self/fd/'+fd)"
                   "\n except FileNotFoundError: continue"
