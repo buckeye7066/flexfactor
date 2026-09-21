@@ -19979,6 +19979,59 @@ class SemanticBatchAndPurposeRetrievalTests(unittest.TestCase):
         self.assertIn("tests/duplicateHandling.test.js", selected)
 
 
+class NumberedReviewEvidenceTests(unittest.TestCase):
+    SOURCE = "def mean(values):\n    total = sum(values)\n    return total / (len(values) - 1)\n"
+
+    def review(self, excerpt, line=3, source=None):
+        finding = {"line": line, "severity": "high", "category": "correctness",
+                   "evidence_source": "code", "title": "Incorrect mean divisor",
+                   "problem": "The divisor is one less than the number of values",
+                   "fix": "Divide by len(values)", "source_excerpt": excerpt,
+                   "trigger": "mean([2, 4, 6])", "observable_failure": "Returns 6 instead of 4"}
+        with _patched(ff, "_read_text_and_sha", lambda *a, **kw: (source or self.SOURCE, "sha")):
+            return ff._postprocess_review_findings([finding], "stats_utils.py", "/fixture")
+
+    def test_exact_harness_numbered_excerpt_is_grounded_in_real_source(self):
+        found = self.review("3:     return total / (len(values) - 1)")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["source_excerpt"], "    return total / (len(values) - 1)")
+
+    def test_multiline_harness_excerpt_requires_contiguous_exact_source(self):
+        found = self.review("2:     total = sum(values)\n3:     return total / (len(values) - 1)")
+        self.assertEqual(found[0]["source_excerpt"],
+                         "    total = sum(values)\n    return total / (len(values) - 1)")
+
+    def test_exact_numbered_source_retains_trailing_whitespace(self):
+        found = self.review("1: return total  ", line=1, source="return total  \n")
+        self.assertEqual(found[0]["source_excerpt"], "return total  ")
+
+    def test_oversized_line_number_is_rejected_as_unverified_evidence(self):
+        with self.assertRaises(RuntimeError):
+            self.review("9" * 4500 + ":     return total / (len(values) - 1)")
+
+    def test_numbered_whitespace_only_source_is_not_evidence(self):
+        with self.assertRaises(RuntimeError):
+            self.review("1:    ", line=1, source="   \n")
+
+    def test_unverifiable_numbered_excerpts_remain_incomplete(self):
+        for excerpt in ("2:     return total / (len(values) - 1)",
+                        "3:     return total / len(values)",
+                        "999:     return total / (len(values) - 1)",
+                        "3:     return total / (len(values) - 1)\n2:     total = sum(values)",
+                        "3:     return total / (len(values) - 1)\nmade up text"):
+            with self.subTest(excerpt=excerpt), self.assertRaises(RuntimeError):
+                self.review(excerpt)
+
+    def test_valid_source_elsewhere_does_not_repair_a_bad_citation(self):
+        source = "\n" * 20 + self.SOURCE
+        with self.assertRaises(RuntimeError):
+            self.review("23:     return total / (len(values) - 1)", line=3, source=source)
+
+    def test_verbatim_source_is_not_stripped_even_if_it_looks_numbered(self):
+        found = self.review("1: original text", line=1, source="1: original text\n")
+        self.assertEqual(found[0]["source_excerpt"], "1: original text")
+
+
 class NativeImportCoverageTests(unittest.TestCase):
     def test_green_native_suite_proves_transitive_product_module_loading(self):
         import flexfactor_evidence as ev
