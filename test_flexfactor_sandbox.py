@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import os
 import json
+import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 import flexfactor_sandbox as sb
 from flexfactor_sandbox import Limits, ContainmentUnavailable
@@ -204,6 +206,156 @@ class PrepareTests(unittest.TestCase):
         self.assertNotIn("HTTP_PROXY", c.env)
         self.assertEqual(c.level["network_isolation"], "off")
         c.cleanup()
+
+
+class MemoryCgroupPreparationTests(unittest.TestCase):
+    def _prepare(self, mechanism="bwrap"):
+        level = {}
+        contained = sb._prepare_posix([PY, "-c", "pass"],
+            {"FLEXFACTOR_MEMORY_CGROUP_ROOT": "/sys/fs/cgroup/delegated"},
+            TMP, Limits(), level, {"strongest": mechanism}, None)
+        self.addCleanup(contained.cleanup)
+        return contained
+
+    def test_unavailable_delegation_preserves_address_space_limit_and_reason(self):
+        with mock.patch.object(sb.sys, "platform", "linux"), \
+             mock.patch.object(sb, "_MemoryCgroup", side_effect=PermissionError("no delegation")):
+            contained = self._prepare()
+        self.assertEqual(contained.level["memory_mechanism"], "rlimit-as")
+        self.assertIn("no delegation", contained.level["memory_fallback_reason"])
+        self.assertNotIn("FLEXFACTOR_MEMORY_CGROUP_ROOT", contained.env)
+        resource = mock.Mock(RLIMIT_AS=9, RLIMIT_NPROC=6)
+        with mock.patch.dict(sys.modules, {"resource": resource}):
+            contained.popen_kwargs["preexec_fn"]()
+        resource.setrlimit.assert_any_call(9, (2 * 1024 ** 3, 2 * 1024 ** 3))
+
+    def test_weaker_backend_cannot_expose_writable_controls(self):
+        with mock.patch.object(sb.sys, "platform", "linux"), \
+             mock.patch.object(sb, "_MemoryCgroup") as factory:
+            contained = self._prepare("process-group")
+        factory.assert_not_called()
+        self.assertEqual(contained.level["memory_mechanism"], "rlimit-as")
+        self.assertIn("read-only", contained.level["memory_fallback_reason"])
+
+    def test_join_precedes_exec_and_failure_is_not_swallowed(self):
+        guard = mock.Mock(path="/sys/fs/cgroup/delegated/flexfactor-test", swap="disabled")
+        guard.cleanup.return_value = None
+        with mock.patch.object(sb.sys, "platform", "linux"), \
+             mock.patch.object(sb, "_MemoryCgroup", return_value=guard):
+            contained = self._prepare()
+        resource = mock.Mock(RLIMIT_AS=9, RLIMIT_NPROC=6)
+        with mock.patch.dict(sys.modules, {"resource": resource}):
+            contained.popen_kwargs["preexec_fn"]()
+        guard.join.assert_called_once()
+        self.assertNotIn(mock.call(9, (2 * 1024 ** 3, 2 * 1024 ** 3)), resource.setrlimit.call_args_list)
+        self.assertEqual(contained.level["memory_mechanism"], "cgroup-v2")
+        ro = ["--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup", "--cap-drop", "ALL"]
+        start = contained.argv.index("--cap-drop") - 3
+        self.assertEqual(contained.argv[start:start + 5], ro)
+        guard.join.side_effect = PermissionError("join refused")
+        with mock.patch.dict(sys.modules, {"resource": resource}), self.assertRaises(PermissionError):
+            contained.popen_kwargs["preexec_fn"]()
+        contained.cleanup()
+        self.assertEqual(contained.level["memory_cgroup_cleanup"], "removed")
+
+    def test_non_cgroup_filesystem_is_rejected_before_creating_anything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                sb._MemoryCgroup(directory, 64 * 1024 ** 2)
+            self.assertEqual(os.listdir(directory), [])
+
+    def test_failed_cleanup_is_idempotent_and_never_removes_relative_to_cwd(self):
+        guard = sb._MemoryCgroup.__new__(sb._MemoryCgroup)
+        guard.parent_fd, guard.fd = 61, 62
+        guard.name, guard.created, guard.cleanup_error = "flexfactor-fixture", True, None
+        guard.kill = mock.Mock()
+        inode = mock.Mock(st_ino=123)
+        with mock.patch.object(sb.os, "stat", return_value=inode), \
+             mock.patch.object(sb.os, "fstat", return_value=inode), \
+             mock.patch.object(sb.os, "rmdir", side_effect=OSError("busy")) as remove, \
+             mock.patch.object(sb.os, "close"), mock.patch.object(sb.time, "sleep"):
+            first = guard.cleanup()
+            attempts = remove.call_count
+            self.assertIn("busy", first)
+            self.assertEqual(guard.cleanup(), first)
+            self.assertEqual(remove.call_count, attempts)
+            self.assertTrue(all(call.kwargs["dir_fd"] == 61 for call in remove.call_args_list))
+        self.assertIsNone(guard.parent_fd)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "BLOCKED: Linux cgroup-v2 tests")
+class LinuxMemoryCgroupTests(unittest.TestCase):
+    def setUp(self):
+        self.root = os.environ.get("FLEXFACTOR_MEMORY_CGROUP_ROOT")
+        if not self.root or REP["strongest"] != "bwrap":
+            self.skipTest("BLOCKED: opt-in delegated cgroup root and bwrap required")
+
+    def run_guarded(self, command, memory=64 * 1024 ** 2, extra_env=None, timeout=30):
+        env = dict(os.environ)
+        env.update(extra_env or {})
+        cp = sb.run_contained(command, TMP, env=env,
+                              limits=Limits(timeout_s=timeout, memory_bytes=memory))
+        level = cp.flexfactor_containment["level"]
+        self.assertEqual(level.get("memory_mechanism"), "cgroup-v2", level)
+        self.assertEqual(level.get("memory_cgroup_cleanup"), "removed", level)
+        self.assertFalse(os.path.exists(level["memory_cgroup"]))
+        return cp
+
+    def test_physical_budget_kills_oversized_allocation(self):
+        cp = self.run_guarded([PY, "-c", "x=bytearray(128*1024**2); print('UNBOUNDED')"])
+        self.assertIn(cp.returncode, (-9, 137), cp.stderr)
+        self.assertNotIn("UNBOUNDED", cp.stdout)
+
+    def test_virtual_reservation_fits_without_raising_physical_budget(self):
+        script = ("import mmap,os; x=mmap.mmap(-1,4*1024**3); x[0]=1; "
+                  "assert 'FLEXFACTOR_MEMORY_CGROUP_ROOT' not in os.environ; "
+                  "assert os.environ['FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY']=='1'; print('RESERVED')")
+        cp = self.run_guarded([PY, "-c", script], extra_env={"FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY": "1"})
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertIn("RESERVED", cp.stdout)
+        self.assertEqual(os.environ["FLEXFACTOR_MEMORY_CGROUP_ROOT"], self.root)
+
+    def test_timeout_cleans_the_task_group(self):
+        cp = self.run_guarded([PY, "-c", "import time; time.sleep(20)"], timeout=1)
+        self.assertEqual(cp.returncode, 124, cp.stderr)
+
+    def test_target_cannot_raise_limit_or_access_host_proc_with_writable_mounts(self):
+        script = ("import os,sys; p=sys.argv[1]+'/memory.max'; "
+                  "\nassert not os.path.exists(sys.argv[2]), 'host supervisor root exposed'"
+                  "\nstatus=open('/proc/self/status').read()"
+                  "\nassert any(line.split()==['NoNewPrivs:', '1'] for line in status.splitlines()), 'privilege elevation permitted'"
+                  "\nfor fd in os.listdir('/proc/self/fd'):"
+                  "\n try: target=os.readlink('/proc/self/fd/'+fd)"
+                  "\n except FileNotFoundError: continue"
+                  "\n assert not target.startswith('/sys/fs/cgroup'), 'supervisor cgroup descriptor inherited'"
+                  "\ntry:\n open(p,'w').write('max')"
+                  "\nexcept OSError:\n print('PROTECTED')"
+                  "\nelse:\n sys.exit(3)")
+        c = sb.prepare([PY, "-c", script], TMP, dict(os.environ),
+                       Limits(memory_bytes=64 * 1024 ** 2, network=True,
+                              writable_dirs=["/", "/proc", "/sys"]))
+        try:
+            self.assertEqual(c.level.get("memory_mechanism"), "cgroup-v2", c.level)
+            cp = subprocess.run(c.argv + [c.level["memory_cgroup"], f"/proc/{os.getpid()}/root"], cwd=c.cwd, env=c.env,
+                                capture_output=True, text=True, timeout=20, **c.popen_kwargs)
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            self.assertIn("PROTECTED", cp.stdout)
+        finally:
+            c.cleanup()
+        self.assertEqual(c.level["memory_cgroup_cleanup"], "removed")
+
+    def test_powershell_starts_with_unchanged_two_gib_physical_budget(self):
+        pwsh = os.environ.get("FLEXFACTOR_TEST_PWSH")
+        if not pwsh:
+            self.skipTest("BLOCKED: FLEXFACTOR_TEST_PWSH portable test executable not configured")
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"POWERSHELL_TELEMETRY_OPTOUT": "1", "POWERSHELL_UPDATECHECK": "Off"}
+            for kind in ("CACHE", "CONFIG", "DATA"):
+                env["XDG_" + kind + "_HOME"] = directory
+            cp = self.run_guarded([pwsh, "-NoProfile", "-NonInteractive", "-Command", "Write-Output CGROUP_OK"],
+                                  memory=2 * 1024 ** 3, extra_env=env, timeout=60)
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertIn("CGROUP_OK", cp.stdout)
 
 
 class RunContainedTests(unittest.TestCase):

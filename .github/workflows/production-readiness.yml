@@ -44,6 +44,24 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: cloud/package-lock.json
+      - name: Provision managed physical-memory containment
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          receipt="$RUNNER_TEMP/flexfactor-memory-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB.json"
+          root="$(sudo "$(command -v python)" .github/scripts/managed_memory.py setup \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --job "$GITHUB_JOB" \
+            --receipt "$receipt" --uid "$(id -u)" --gid "$(id -g)")"
+          export FLEXFACTOR_MEMORY_CGROUP_ROOT="$root"
+          printf 'FLEXFACTOR_MEMORY_CGROUP_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+          echo "$$" | sudo tee "$FLEXFACTOR_MEMORY_CGROUP_ROOT/.supervisor/cgroup.procs" >/dev/null
+          python .github/scripts/managed_memory.py probe
+          pwsh_path="$(command -v pwsh)"
+          test -x "$pwsh_path" || { echo "Required Linux PowerShell runtime is missing" >&2; exit 1; }
+          printf 'FLEXFACTOR_TEST_PWSH=%s\n' "$pwsh_path" >> "$GITHUB_ENV"
       - name: Managed cloud API contract
         shell: bash
         run: |
@@ -141,6 +159,10 @@ jobs:
         shell: bash
         run: |
           set -e
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "$$" | sudo tee "$FLEXFACTOR_MEMORY_CGROUP_ROOT/.supervisor/cgroup.procs" >/dev/null
+            python .github/scripts/managed_memory.py probe
+          fi
           python flexfactor_release_policy.py
           for t in flexfactor_tests.py \
                    flexfactor_execution_contract_tests.py \
@@ -202,6 +224,7 @@ jobs:
                    test_flexfactor_partial.py \
                    test_flexfactor_wip.py \
                    test_flexfactor_sandbox.py \
+                   test_managed_memory_workflow.py \
                    test_flexfactor_ledger.py \
                    test_flexfactor_coverage.py \
                    test_flexfactor_purpose.py \
@@ -236,10 +259,19 @@ jobs:
         shell: bash
         env:
           FLEXFACTOR_ROTATION_EXTENSIONS: "1"
-        run: python tests/test_rotation_extensions.py
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "$$" | sudo tee "$FLEXFACTOR_MEMORY_CGROUP_ROOT/.supervisor/cgroup.procs" >/dev/null
+          fi
+          python tests/test_rotation_extensions.py
       - name: Forced verifier-outage regression (fail-closed proof)
         shell: bash
         run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "$$" | sudo tee "$FLEXFACTOR_MEMORY_CGROUP_ROOT/.supervisor/cgroup.procs" >/dev/null
+          fi
           python -m unittest \
             flexfactor_tests.AdversarialFixLoopTests.test_c_transport_failure_rolls_back_fail_closed \
             flexfactor_tests.AuditDirtyAbortCommitGuardTests.test_verifier_outage_skips_success_commit \
@@ -262,6 +294,18 @@ jobs:
           import json, flexfactor_sandbox as sb
           print(json.dumps(sb.capability_report(), indent=2))
           PY
+
+      - name: Clean up managed memory delegation
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt="$RUNNER_TEMP/flexfactor-memory-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB.json"
+          if [ -f "$receipt" ]; then
+            sudo "$(command -v python)" .github/scripts/managed_memory.py cleanup \
+              --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --job "$GITHUB_JOB" \
+              --receipt "$receipt"
+          fi
 
   package-artifact:
     name: package-artifact
