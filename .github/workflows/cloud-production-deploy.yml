@@ -3,8 +3,20 @@ name: cloud-production-deploy
 on:
   workflow_dispatch:
     inputs:
+      action:
+        description: Stage for README acceptance, or promote an already accepted deployment
+        required: true
+        default: stage
+        type: choice
+        options:
+          - stage
+          - promote
+      deployment_url:
+        description: Exact immutable staged URL; required only for promote after README acceptance
+        required: false
+        type: string
       expected_sha:
-        description: Exact current main commit authorized for production
+        description: Exact current main commit authorized for staging or promotion
         required: true
         type: string
 
@@ -57,10 +69,11 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$VERCEL_TOKEN"
-          vercel project inspect flexfactor-cloud --token "$VERCEL_TOKEN" >/dev/null
-          vercel link --yes --project flexfactor-cloud --token "$VERCEL_TOKEN"
+          vercel project inspect flexfactor-cloud --scope buckeye7066-7954s-projects --token "$VERCEL_TOKEN" >/dev/null
+          vercel link --yes --project flexfactor-cloud --scope buckeye7066-7954s-projects --token "$VERCEL_TOKEN"
 
       - name: Build an immutable staged production deployment
+        if: inputs.action == 'stage'
         id: preview
         working-directory: cloud
         env:
@@ -75,10 +88,57 @@ jobs:
             | grep -Eq '^https://[A-Za-z0-9.-]+\.vercel\.app$'
           printf 'deployment_url=%s\n' "$deployment_url" >> "$GITHUB_OUTPUT"
 
+      - name: Select and validate the immutable deployment URL
+        id: selected
+        working-directory: cloud
+        env:
+          DEPLOY_ACTION: ${{ inputs.action }}
+          REQUESTED_URL: ${{ inputs.deployment_url }}
+          STAGED_URL: ${{ steps.preview.outputs.deployment_url }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from "node:assert/strict";
+          import { appendFileSync } from "node:fs";
+          const action = process.env.DEPLOY_ACTION;
+          assert.ok(action === "stage" || action === "promote", "Unknown deployment action");
+          if (action === "stage") assert.equal(process.env.REQUESTED_URL || "", "");
+          const url = action === "stage" ? process.env.STAGED_URL : process.env.REQUESTED_URL;
+          assert.equal(url, (url || "").trim());
+          assert.match(url || "", /^https:\/\/flexfactor-cloud-[a-z0-9]+-buckeye7066-7954s-projects\.vercel\.app$/);
+          appendFileSync(process.env.GITHUB_OUTPUT, `deployment_url=${url}\n`);
+          JS
+
+      - name: Verify Vercel deployment ownership and immutable identity
+        working-directory: cloud
+        env:
+          DEPLOYMENT_URL: ${{ steps.selected.outputs.deployment_url }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          team_id=$(node -p 'JSON.parse(require("fs").readFileSync(".vercel/project.json", "utf8")).orgId')
+          curl --fail --silent --show-error --get \
+            --header "Authorization: Bearer $VERCEL_TOKEN" \
+            --data-urlencode "teamId=$team_id" \
+            "https://api.vercel.com/v13/deployments/${DEPLOYMENT_URL#https://}" \
+            > deployment-metadata.json
+          node --input-type=module <<'JS'
+          import assert from "node:assert/strict";
+          import { readFileSync } from "node:fs";
+          const linked = JSON.parse(readFileSync(".vercel/project.json", "utf8"));
+          const deployment = JSON.parse(readFileSync("deployment-metadata.json", "utf8"));
+          assert.match(linked.projectId || "", /^prj_[A-Za-z0-9]+$/);
+          assert.match(linked.orgId || "", /^team_[A-Za-z0-9]+$/);
+          assert.equal(deployment.projectId, linked.projectId);
+          assert.equal(deployment.name, "flexfactor-cloud");
+          assert.equal(deployment.url, process.env.DEPLOYMENT_URL.slice("https://".length));
+          assert.equal(deployment.readyState, "READY");
+          assert.equal(deployment.target, "production");
+          JS
+
       - name: Prove staged production health and engine identity
         working-directory: cloud
         env:
-          DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
+          DEPLOYMENT_URL: ${{ steps.selected.outputs.deployment_url }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
           set -euo pipefail
@@ -109,10 +169,21 @@ jobs:
           echo "Preview did not serve the expected healthy engine" >&2
           exit 1
 
+      - name: Record the immutable staged deployment for acceptance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cloud-staged-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cloud/preview-health.json
+          if-no-files-found: error
+          retention-days: 30
+
+      # Manual promotion is authorized only after cloud/README.md acceptance.
+      # Health and ownership checks here do not replace OAuth, modes, or in-app acceptance.
       - name: Reauthorize and promote the tested deployment
+        if: inputs.action == 'promote'
         working-directory: cloud
         env:
-          DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
+          DEPLOYMENT_URL: ${{ steps.selected.outputs.deployment_url }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           GH_TOKEN: ${{ github.token }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -125,9 +196,10 @@ jobs:
             --scope buckeye7066-7954s-projects --token "$VERCEL_TOKEN"
 
       - name: Prove the production alias serves the tested engine
+        if: inputs.action == 'promote'
         working-directory: cloud
         env:
-          DEPLOYMENT_URL: ${{ steps.preview.outputs.deployment_url }}
+          DEPLOYMENT_URL: ${{ steps.selected.outputs.deployment_url }}
         run: |
           set -euo pipefail
           export CLOUD_SOURCE_SHA="$(git log -1 --format=%H -- .)"

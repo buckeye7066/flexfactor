@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import io
+import email.parser
+import shutil
+import subprocess
 import json
 import os
 from pathlib import Path
@@ -80,7 +83,130 @@ def record_live_result(result, request, run_id, terminal, save):
          source_before=result['source_before'], source_after=result['source_after'])
 
 
-BASE = "https://flexfactor-cloud.vercel.app"
+def select_cloud_base(value):
+    """Production remains the default; staging accepts only this owner's immutable URL."""
+    if value == "https://flexfactor-cloud.vercel.app":
+        return value
+    if not isinstance(value, str) or not re.fullmatch(
+            r"https://flexfactor-cloud-[a-z0-9]+-buckeye7066-7954s-projects\.vercel\.app", value):
+        raise ValueError("Expected the exact owner project's immutable HTTPS deployment URL")
+    return value
+
+
+def _native_vercel(arguments, payload=None):
+    """Native login/env authentication; never put application credentials in argv."""
+    scope = "buckeye7066-7954s-projects"
+    if (len(arguments) == 7 and arguments[0] == "api"
+            and arguments[2:] == ["--method", "GET", "--raw", "--scope", scope]
+            and payload is None
+            and re.fullmatch(r"/v13/deployments/flexfactor-cloud-[a-z0-9]+-buckeye7066-7954s-projects\.vercel\.app\?teamId=team_[A-Za-z0-9]+", arguments[1])):
+        pass
+    elif (len(arguments) == 10 and arguments[0] == "curl"
+          and arguments[2] == "--deployment"
+          and arguments[4:] == ["--scope", scope, "--", "--disable", "--config", "-"]
+          and isinstance(payload, bytes)
+          and re.fullmatch(r"/api/[A-Za-z0-9_/?=&%.-]+", arguments[1])):
+        select_cloud_base(arguments[3])
+    else:
+        raise ValueError("Unsupported native release-verification command")
+    executable = shutil.which("vercel")
+    if not executable:
+        raise RuntimeError("Native Vercel CLI is required for staged acceptance")
+    command = [executable]
+    if os.name == "nt" and Path(executable).suffix.lower() in (".cmd", ".bat", ".ps1"):
+        # Bypass npm's batch wrapper: query ampersands must remain one argv value.
+        entrypoint = Path(executable).parent / "node_modules/vercel/dist/vc.js"
+        node = shutil.which("node")
+        if not node or Path(node).suffix.lower() != ".exe" or not entrypoint.is_file():
+            raise RuntimeError("Native Vercel Node entrypoint could not be resolved safely")
+        command = [node, str(entrypoint)]
+    environment = dict(os.environ)
+    for key in ("DEBUG", "VERCEL_DEBUG", "NODE_DEBUG", "NODE_OPTIONS"):
+        environment.pop(key, None)
+    # The CLI does not need the application's GitHub/OAuth bearer in its environment.
+    environment.pop("FLEXFACTOR_LIVE_PROOF_TOKEN", None)
+    try:
+        result = subprocess.run(
+            [*command, *arguments], cwd=Path.cwd() / "cloud", input=payload,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+            timeout=350, check=False, shell=False)
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("Native Vercel request failed or timed out (details suppressed)") from None
+    if result.returncode:
+        raise RuntimeError("Native Vercel request failed (details suppressed)")
+    return result.stdout
+
+
+def verify_staged_project(base):
+    """Require native CLI owner metadata before sending application credentials."""
+    select_cloud_base(base)
+    linked = json.loads((Path.cwd() / "cloud/.vercel/project.json").read_text(encoding="utf-8"))
+    if (not isinstance(linked, dict)
+            or not isinstance(linked.get("orgId"), str)
+            or not re.fullmatch(r"team_[A-Za-z0-9]+", linked["orgId"])
+            or not isinstance(linked.get("projectId"), str)
+            or not re.fullmatch(r"prj_[A-Za-z0-9]+", linked["projectId"])):
+        raise ValueError("Linked owner project/team identity was not verified")
+    endpoint = "/v13/deployments/" + base.removeprefix("https://") + "?teamId=" + linked["orgId"]
+    raw = _native_vercel(["api", endpoint, "--method", "GET", "--raw", "--scope", "buckeye7066-7954s-projects"])
+    try:
+        deployment = json.loads(raw)
+        valid = (isinstance(deployment, dict) and isinstance(linked.get("projectId"), str)
+                 and re.fullmatch(r"prj_[A-Za-z0-9]+", linked["projectId"])
+                 and deployment.get("projectId") == linked["projectId"]
+                 and deployment.get("name") == "flexfactor-cloud"
+                 and deployment.get("url") == base.removeprefix("https://")
+                 and deployment.get("readyState") == "READY"
+                 and deployment.get("target") == "production")
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        raise ValueError("Staged deployment owner/project identity was not verified")
+
+
+def staged_request(base, method, path, headers, body=None, expected_health=None):
+    """Send application headers/body through stdin, capture output only in memory.
+
+    Native vercel curl manages deployment protection itself, including its own
+    bypass-token child arguments. Application tokens are never CLI arguments.
+    """
+    select_cloud_base(base)
+    if method not in ("GET", "POST") or not re.fullmatch(r"/api/[A-Za-z0-9_/?=&%.-]+", path):
+        raise ValueError("Unsupported staged API request")
+    def quoted(value):
+        return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('\r', '\\r').replace('\n', '\\n') + '"'
+    configuration = ["silent", "show-error", "include", "suppress-connect-headers", "no-location", "no-location-trusted", "max-redirs = 0", "max-time = 330", "request = " + quoted(method)]
+    for name, value in headers.items():
+        if not re.fullmatch(r"[A-Za-z0-9-]+", name) or '\r' in value or '\n' in value:
+            raise ValueError("Invalid staged request header")
+        configuration.append("header = " + quoted(name + ": " + value))
+    if body is not None:
+        configuration.append("data-binary = " + quoted(json.dumps(body)))
+    raw = _native_vercel(["curl", path, "--deployment", base, "--scope", "buckeye7066-7954s-projects",
+                          "--", "--disable", "--config", "-"],
+                         ("\n".join(configuration) + "\n").encode())
+    # Explicitly disable redirects, including any inherited curlrc location setting.
+    while True:
+        header_block, separator, payload = raw.partition(b"\r\n\r\n")
+        if not separator:
+            raise RuntimeError("Staged API response omitted HTTP headers")
+        status_line, _, header_bytes = header_block.partition(b"\r\n")
+        match = re.fullmatch(rb"HTTP/[12](?:\.[01])? ([0-9]{3})(?: [^\r\n]*)?", status_line)
+        if not match:
+            raise RuntimeError("Staged API response has an invalid HTTP status")
+        status = int(match[1])
+        response_headers = email.parser.BytesHeaderParser().parsebytes(header_bytes)
+        if status == 100:
+            raw = payload
+            continue
+        if not 200 <= status < 300:
+            raise RuntimeError(f"{method} {path} returned HTTP {status}")
+        if expected_health is not None:
+            verify_cloud_response(response_headers, expected_health)
+        return status, payload, response_headers
+
+
+BASE = select_cloud_base(os.environ.get("FLEXFACTOR_LIVE_PROOF_BASE", "https://flexfactor-cloud.vercel.app"))
 TOKEN = os.environ["FLEXFACTOR_LIVE_PROOF_TOKEN"].strip()
 REPOSITORY = os.environ["TARGET_REPOSITORY"]
 REQUEST_ID = str(uuid.uuid4())
@@ -110,9 +236,16 @@ if CLIENT_VERSION != SOURCE_VERSION:
 
 identity = verify_release_identity(
     Path.cwd(), os.environ["EXPECTED_SHA"], released, SOURCE_VERSION)
-with urllib.request.urlopen(BASE + "/api/health", timeout=30) as response:
-    deployed_health = json.load(response)
-    deployed_headers = response.headers
+if BASE == "https://flexfactor-cloud.vercel.app":
+    with urllib.request.urlopen(BASE + "/api/health", timeout=30) as response:
+        deployed_health = json.load(response)
+        deployed_headers = response.headers
+else:
+    verify_staged_project(BASE)
+    _, raw_health, deployed_headers = staged_request(BASE, "GET", "/api/health", {})
+    deployed_health = json.loads(raw_health)
+    if deployed_health.get("deployment_url") != BASE:
+        raise ValueError("Staged health identifies a different deployment")
 verify_cloud_health(deployed_health, identity)
 verify_cloud_response(deployed_headers, deployed_health)
 HEADERS = {
@@ -149,6 +282,9 @@ save_proof()
 
 
 def request(method: str, path: str, body: object | None = None) -> tuple[int, bytes, str]:
+    if BASE != "https://flexfactor-cloud.vercel.app":
+        status, raw, response_headers = staged_request(BASE, method, path, HEADERS, body, deployed_health)
+        return status, raw, response_headers.get("Content-Type", "")
     payload = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(BASE + path, data=payload, method=method, headers=HEADERS)
     try:
@@ -156,8 +292,7 @@ def request(method: str, path: str, body: object | None = None) -> tuple[int, by
             verify_cloud_response(response.headers, deployed_health)
             return response.status, response.read(), response.headers.get("Content-Type", "")
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", "replace")[:1000]
-        raise RuntimeError(f"{method} {path} returned HTTP {error.code}: {detail}") from None
+        raise RuntimeError(f"{method} {path} returned HTTP {error.code}") from None
 
 
 def json_request(method: str, path: str, body: object | None = None) -> dict:

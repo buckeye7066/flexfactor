@@ -6,6 +6,7 @@ import subprocess
 # Proof maintenance is not an Android/engine release. Every other non-cloud
 # change, including runner workflows and release tooling, requires publication.
 PROOF_MAINTENANCE = frozenset({
+    ".github/scripts/staged_phone_acceptance.py",
     ".github/scripts/mobile_cloud_live_proof.py",
     ".github/scripts/mobile_release_identity.py",
     ".github/workflows/mobile-cloud-live-proof.yml",
