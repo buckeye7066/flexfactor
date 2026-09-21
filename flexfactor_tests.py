@@ -13632,9 +13632,9 @@ class TrustedRepoBuildNetworkTests(unittest.TestCase):
         ff._ff_sandbox.run_contained = self._saved_run
         ff._execution_authorization = self._saved_auth
 
-    def _run_with(self, basis_kind, classes):
+    def _run_with(self, basis_kind, classes, owner_allowed=None):
         ff._execution_authorization = lambda cwd: (
-            {"basis": basis_kind, "trust": {}}, "")
+            {"basis": basis_kind, "trust": {"allowed": owner_allowed}}, "")
         ff._run_target_code(["npm", "run", "build"], os.getcwd(), 60, None,
                             set(classes), lambda rc, o, e: subprocess.
                             CompletedProcess(["x"], rc, o, e))
@@ -13648,6 +13648,16 @@ class TrustedRepoBuildNetworkTests(unittest.TestCase):
 
     def test_a_trusted_repo_TEST_gets_the_network(self):
         self.assertTrue(self._run_with("trusted-repo", {"test"}).network)
+
+    def test_owner_trust_is_preserved_when_os_sandbox_is_available(self):
+        for command_class in ("build", "test"):
+            with self.subTest(command_class=command_class):
+                self.assertTrue(self._run_with("os-sandbox", {command_class}, owner_allowed=True).network)
+
+    def test_os_sandbox_does_not_grant_network_without_explicit_owner_trust(self):
+        for allowed in (False, None, "false", "true", 1):
+            with self.subTest(allowed=allowed):
+                self.assertFalse(self._run_with("os-sandbox", {"build"}, owner_allowed=allowed).network)
 
     def test_an_install_ALWAYS_gets_the_network(self):
         # Unchanged behaviour, both bases.
@@ -21326,10 +21336,8 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
         ff._RUN_TRUST_OVERRIDE.clear()
         ff._EXECUTION_LEDGER.clear()
 
-    def test_untrusted_repo_install_build_test_are_refused_before_running(self):
-        import flexfactor_sandbox as sb
-        if sb.os_sandbox_sufficient():
-            self.skipTest("host HAS an OS sandbox: the trust refusal path is not reachable here")
+    @mock.patch("flexfactor_sandbox.os_sandbox_sufficient", return_value=False)
+    def test_untrusted_repo_install_build_test_are_refused_before_running(self, _sandbox_sufficient):
         self._untrusted()
         with _tempfile.TemporaryDirectory() as d:
             for cmd in (["npm", "install"], ["npm", "run", "build"], ["npm", "test"],
@@ -21342,10 +21350,8 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
         refused = [e for e in ff._EXECUTION_LEDGER if e.get("refused")]
         self.assertEqual(len(refused), 4)
 
-    def test_untrusted_dev_server_spawn_is_refused(self):
-        import flexfactor_sandbox as sb
-        if sb.os_sandbox_sufficient():
-            self.skipTest("host HAS an OS sandbox: the trust refusal path is not reachable here")
+    @mock.patch("flexfactor_sandbox.os_sandbox_sufficient", return_value=False)
+    def test_untrusted_dev_server_spawn_is_refused(self, _sandbox_sufficient):
         self._untrusted()
         with _tempfile.TemporaryDirectory() as d:
             proc, err = ff._spawn(["npm", "run", "dev"], d)
@@ -21363,33 +21369,34 @@ class ExecutionBrokerWiringTests(unittest.TestCase):
         self.assertEqual([e for e in ff._EXECUTION_LEDGER if e.get("refused")], [])
 
     def test_trusted_repo_runs_through_the_broker_with_a_recorded_basis(self):
-        ff._EXECUTION_LEDGER.clear()
-        with _tempfile.TemporaryDirectory() as d:  # under gettempdir -> trusted by the suite
-            with open(os.path.join(d, "package.json"), "w", encoding="utf-8") as fh:
-                fh.write('{"name":"x","scripts":{"test":"node -e \"console.log(123)\""}}')
-            cp = ff._run(["npm", "test"], d, timeout=120)
-        # npm may be absent on a CI box: rc 127 with launch_error is still
-        # "crossed the broker". What is asserted is the LEDGER, not npm.
-        entries = [e for e in ff._EXECUTION_LEDGER if "test" in e["classes"]]
-        self.assertEqual(len(entries), 1, ff._EXECUTION_LEDGER)
-        self.assertFalse(entries[0]["refused"])
-        self.assertEqual(entries[0]["basis"], "trusted-repo")
-        # POLICY CHANGED 2026-08-29: a TRUSTED repository's build/test now gets
-        # the network. This assertion used to read `(False,)`. It is updated,
-        # not deleted, because the value is still worth pinning - see
-        # TrustedRepoBuildNetworkTests for the measured reason (FlexFactor
-        # blackholed its own build's proxy, next/font and electron-builder
-        # could not fetch, and both failures were then filed as the audited
-        # repository's defect and blocked publication). An UNTRUSTED tree still
-        # asserts False, which is where the containment property still means
-        # something.
-        self.assertIs(entries[0]["network"], True)
-        self.assertIsNotNone(getattr(cp, "flexfactor_execution_basis", None))
-
-    def test_run_level_trust_repo_flag_authorizes_one_repository_only(self):
         import flexfactor_sandbox as sb
-        if sb.os_sandbox_sufficient():
-            self.skipTest("host HAS an OS sandbox: the trust refusal path is not reachable here")
+        for sufficient, expected_basis in ((False, "trusted-repo"), (True, "os-sandbox")):
+            with self.subTest(os_sandbox_sufficient=sufficient), _tempfile.TemporaryDirectory() as d:
+                ff._EXECUTION_LEDGER.clear()
+                with open(os.path.join(d, "package.json"), "w", encoding="utf-8") as fh:
+                    json.dump({"name": "x", "scripts": {"test": "node -e \"console.log(123)\""}}, fh)
+                with mock.patch.object(sb, "os_sandbox_sufficient", return_value=sufficient), \
+                     mock.patch.dict(os.environ, {"FLEXFACTOR_TRUSTED_REPOS": d}):
+                    cp = ff._run(["npm", "test"], d, timeout=120)
+                if shutil.which("npm"):
+                    self.assertEqual(cp.returncode, 0, cp.stderr)
+                    self.assertIn("123", cp.stdout)
+                else:
+                    self.assertEqual(cp.returncode, 127)
+                    self.assertTrue(getattr(cp, "flexfactor_launch_error", False))
+                # The wiring contract is the broker receipt, independently of
+                # local npm availability. Real kernel tests live in sandbox tests.
+                entries = [e for e in ff._EXECUTION_LEDGER if "test" in e["classes"]]
+                self.assertEqual(len(entries), 1, ff._EXECUTION_LEDGER)
+                self.assertFalse(entries[0]["refused"])
+                self.assertEqual(entries[0]["basis"], expected_basis)
+                # Owner trust permits build network even when strong OS isolation
+                # is what authorized execution; these are separate decisions.
+                self.assertIs(entries[0]["network"], True)
+                self.assertIsNotNone(getattr(cp, "flexfactor_execution_basis", None))
+
+    @mock.patch("flexfactor_sandbox.os_sandbox_sufficient", return_value=False)
+    def test_run_level_trust_repo_flag_authorizes_one_repository_only(self, _sandbox_sufficient):
         self._untrusted()
         with _tempfile.TemporaryDirectory() as d, _tempfile.TemporaryDirectory() as other:
             ff._RUN_TRUST_OVERRIDE[os.path.normcase(os.path.abspath(d))] = True

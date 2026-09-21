@@ -8244,7 +8244,10 @@ def _run_target_code(cmd: list[str], cwd: str, timeout: int, env: dict | None,
     # in policy.json trusted_repos / FLEXFACTOR_TRUSTED_REPOS / --trust-repo)
     # its build and test get it too. An UNTRUSTED tree running only because an
     # OS sandbox contains it keeps the old behaviour exactly.
-    _owner_trusted = basis.get("basis") == "trusted-repo"
+    # A stronger OS sandbox changes the recorded execution basis, not the
+    # owner's separate trust decision. Preserve authorized dependency access.
+    _owner_trusted = (basis.get("basis") == "trusted-repo"
+                      or basis.get("trust", {}).get("allowed") is True)
     limits = _ff_sandbox.Limits(
         timeout_s=int(timeout),
         network=("install" in classes) or _owner_trusted)
