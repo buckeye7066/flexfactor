@@ -4417,7 +4417,7 @@ def _judge_intent(provider, schema: dict) -> dict:
                 FINAL_REVIEW_SCHEMA,
         ):
             return _intent_kw(provider, "reviewer", "code_review", "structured_json", "honest")
-        if schema is AUDIT_FINDINGS_SCHEMA:
+        if schema is AUDIT_FINDINGS_SCHEMA or schema is AUDIT_BATCH_SCHEMA:
             return _intent_kw(provider, "reviewer", "code_review", "structured_json")
     except NameError:
         pass
@@ -14143,6 +14143,23 @@ def review_file(provider, rel_path: str, text: str,
     return findings, " | ".join(summaries)
 
 
+def _verified_numbered_excerpt(excerpt: str, lines: list[str]) -> str | None:
+    """Undo our display labels only when every line exactly matches its source."""
+    restored: list[str] = []
+    previous = None
+    for rendered in excerpt.splitlines():
+        match = re.fullmatch(r"([1-9][0-9]*): (.*)", rendered)
+        if match is None or len(match.group(1)) > len(str(len(lines))):
+            return None
+        number = int(match.group(1))
+        if (number > len(lines) or (previous is not None and number != previous + 1)
+                or match.group(2) != lines[number - 1]):
+            return None
+        restored.append(lines[number - 1])
+        previous = number
+    return "\n".join(restored) if restored else None
+
+
 def _postprocess_review_findings(findings: list[dict], rel_path: str,
                                  project_dir: str | None = None) -> list[dict]:
     """Normalize and evidence-filter one file's model findings.
@@ -14182,7 +14199,8 @@ def _postprocess_review_findings(findings: list[dict], rel_path: str,
                     line = int(finding.get("line", -1))
                 except (TypeError, ValueError):
                     line = -1
-                excerpt = str(finding.get("source_excerpt") or "").strip()
+                raw_excerpt = str(finding.get("source_excerpt") or "")
+                excerpt = raw_excerpt.strip()
                 trigger = str(finding.get("trigger") or "").strip()
                 failure = str(finding.get("observable_failure") or "").strip()
                 line_valid = line == 0 or 1 <= line <= len(lines)
@@ -14192,6 +14210,14 @@ def _postprocess_review_findings(findings: list[dict], rel_path: str,
                     nearby = "\n".join(lines[max(0, line - 4):min(len(lines), line + 3)])
                 else:
                     nearby = ""
+                if excerpt and excerpt not in nearby:
+                    # Local models sometimes quote the exact numbered display.
+                    # Never guess away a prefix: verify every claimed source
+                    # line and still require proximity to the finding's citation.
+                    restored = _verified_numbered_excerpt(raw_excerpt, lines)
+                    if restored and restored.strip() and restored in nearby:
+                        excerpt = restored
+                        finding["source_excerpt"] = restored
                 if (line_valid and excerpt and excerpt in nearby and trigger and failure):
                     grounded.append(finding)
                 else:

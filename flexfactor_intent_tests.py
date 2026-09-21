@@ -74,6 +74,36 @@ class FitBeforePools(_Base):
         self.assertIn("lacks code_author for role author", str(cm.exception.reasons))
 
 
+class AuditReviewEntryPoint(_Base):
+    def test_batch_review_skips_a_known_author_only_route(self):
+        from flexfactor_tests import ff
+        rot = self.rotator([
+            route("a/author", "pool-a", caps=(R.CAP_CODE_AUTHOR, R.CAP_STRUCTURED_JSON)),
+            route("b/reviewer", "pool-b", caps=(R.CAP_CODE_REVIEW, R.CAP_STRUCTURED_JSON)),
+        ])
+        selected = []
+        class Provider:
+            def set_purpose(self, purpose): pass
+            def structured(self, system, prompt, schema, **kwargs):
+                selected.append(rot.next_route(tier=R.STRONG, intent=kwargs["intent"]).route.id)
+                return {"reviews": []}
+        ff._judge(Provider(), "Review source", "source", ff.AUDIT_BATCH_SCHEMA)
+        self.assertEqual(selected, ["b/reviewer"])
+
+    def test_batch_review_refuses_when_only_known_nonreviewers_exist(self):
+        from flexfactor_tests import ff
+        rot = self.rotator([
+            route("a/author", "pool-a", caps=(R.CAP_CODE_AUTHOR, R.CAP_STRUCTURED_JSON)),
+        ])
+        class Provider:
+            def set_purpose(self, purpose): pass
+            def structured(self, system, prompt, schema, **kwargs):
+                rot.next_route(tier=R.STRONG, intent=kwargs["intent"])
+                return {"reviews": []}
+        with self.assertRaises(R.RotationError):
+            ff._judge(Provider(), "Review source", "source", ff.AUDIT_BATCH_SCHEMA)
+
+
 class FamilyIndependence(_Base):
     def test_reviewer_avoids_the_authors_family_when_it_can(self):
         rot = self.rotator([
