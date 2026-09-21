@@ -62,6 +62,13 @@ jobs:
           pwsh_path="$(command -v pwsh)"
           test -x "$pwsh_path" || { echo "Required Linux PowerShell runtime is missing" >&2; exit 1; }
           printf 'FLEXFACTOR_TEST_PWSH=%s\n' "$pwsh_path" >> "$GITHUB_ENV"
+      - name: Diagnose a refused Linux sandbox
+        if: failure() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo journalctl -k --no-pager --since '-5 minutes' | grep -E 'apparmor=.*(bwrap|userns)' | tail -n 20 || true
+          sudo cat /sys/kernel/security/apparmor/profiles | grep -E 'bwrap|unprivileged_userns' || true
+          ls -l /etc/apparmor.d/*bwrap* 2>/dev/null || true
       - name: Managed cloud API contract
         shell: bash
         run: |
