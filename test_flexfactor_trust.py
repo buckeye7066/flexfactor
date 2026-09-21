@@ -5,15 +5,32 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import flexfactor_trust as trust
+import flexfactor_sandbox as sandbox
 
 
 class TrustBoundaryTests(unittest.TestCase):
     def test_containment_claim_denies_os_sandbox(self):
-        claim = trust.containment_claim().lower()
+        # Exercise the weak-host case even when this runner has Bubblewrap.
+        with mock.patch.object(sandbox, "_probe_cmd", return_value=(False, "test: unavailable")), \
+             mock.patch.object(sandbox, "_probe_windows_job", return_value=(False, "test: unavailable")):
+            report = sandbox._build_report()
+        with mock.patch.object(sandbox, "capability_report", return_value=report):
+            claim = trust.containment_claim().lower()
         self.assertIn("not", claim)
         self.assertIn("sandbox", claim)
+
+    def test_containment_claim_identifies_this_hosts_measured_boundary(self):
+        report = sandbox.capability_report()
+        claim = trust.containment_claim()
+        self.assertEqual(claim, report["claim"])
+        if sandbox.os_sandbox_sufficient(report):
+            self.assertIn("contained by " + report["strongest"], claim)
+            self.assertIn("OS-enforced", claim)
+        else:
+            self.assertIn("NOT an OS sandbox", claim)
 
     def test_unknown_tree_refused_without_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
