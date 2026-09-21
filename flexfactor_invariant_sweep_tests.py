@@ -523,6 +523,12 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    ".github/scripts/managed_bwrap_profile.py::run": (
+        "Hosted CI provisioning, before the execution broker can operate: fixed "
+        "Bubblewrap capability probes and distro AppArmor package/parser commands. "
+        "No target repository command or generated shell is accepted; ordinary-user "
+        "probes bracket the narrowly privileged profile setup and fail closed."
+    ),
     ".github/scripts/mobile_release_identity.py::_git": (
         "Protected owner-only CI release verifier, before the app engine or "
         "provider dependencies are loaded. Calls only read-only Git rev-parse "

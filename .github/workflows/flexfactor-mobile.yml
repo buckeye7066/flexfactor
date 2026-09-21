@@ -62,7 +62,7 @@ permissions:
 
 jobs:
   flexfactor:
-    uses: buckeye7066/flexfactor/.github/workflows/mobile-run.yml@android-v3.5.15
+    uses: buckeye7066/flexfactor/.github/workflows/mobile-run.yml@android-v3.5.16
     with:
       request_id: ${{ inputs.request_id }}
       steering_release_id: ${{ inputs.steering_release_id }}

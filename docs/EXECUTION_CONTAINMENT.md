@@ -87,6 +87,32 @@ install/build/test on this host requires trust. A refusal returns rc 126,
 
 ## 5. Limits defaults (`flexfactor_sandbox.Limits`)
 
+Linux runners can opt into physical-memory enforcement with
+`FLEXFACTOR_MEMORY_CGROUP_ROOT`, a delegated cgroup-v2 subtree. With a working
+bubblewrap sandbox, each child receives its own `memory.max` limit using the
+existing memory budget, and `pids.max` using the existing process-count budget.
+The latter counts the task tree, including its sandbox processes and threads,
+instead of unrelated processes owned by the runner user. Both controllers must
+already be enabled on the host parent; setup delegates them only within its
+own subtree. The child joins before target code executes; its
+cgroup controls remain read-only inside the sandbox. No .NET heap settings
+are changed. Other hosts retain the address-space limit, with the actual
+mechanism and any fallback reason recorded in containment evidence.
+
+On managed Ubuntu runners, sandbox provisioning probes Bubblewrap as the
+ordinary job user. When AppArmor blocks namespace setup, provisioning may load
+only Ubuntu's packaged `bwrap-userns-restrict` profile from `apparmor-profiles`.
+Existing profile conflicts fail provisioning. The profile restricts executed
+children; the engine still runs unprivileged, and target tests verify no retained
+capabilities. Global namespace and AppArmor settings are not changed.
+
+This distinction matters for PowerShell: the matching 7.6.5 runtime failed
+under a 2 GiB virtual-address limit while starting successfully under the same
+physical-memory budget. The kernel also killed a diagnostic allocation that
+exceeded its physical limit. The five memory integration tests passed on both
+WSL and the hosted Ubuntu runner. Release still requires all memory, process,
+protection and application checks to pass on the exact candidate.
+
 Target child processes do not inherit `FLEXFACTOR_QUEUE_ID` or
 `FLEXFACTOR_QUEUE_STATE`. Those identify the parent request; inheriting them
 caused a managed self-audit's tests to resume the parent's mobile queue.

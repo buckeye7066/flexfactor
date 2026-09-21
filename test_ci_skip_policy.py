@@ -30,11 +30,27 @@ class SkipPolicyTests(unittest.TestCase):
         got = policy.verify("Linux", "test_x ... skipped 'network flaky today'")
         self.assertEqual(got, ["unapproved skip: network flaky today"])
 
+    def test_cgroup_cases_are_opposite_platform_only(self):
+        line = "test_cgroup ... skipped 'BLOCKED: Linux cgroup-v2 tests'"
+        self.assertEqual(policy.verify("Windows", "\n".join([line] * 5)), [])
+        self.assertTrue(policy.verify("Windows", "\n".join([line] * 6)))
+        self.assertTrue(policy.verify("Linux", line))
+        self.assertTrue(policy.verify("Linux", "test_cgroup ... skipped "
+                        "'BLOCKED: opt-in delegated cgroup root and bwrap required'"))
+
     def test_duplicate_skip_beyond_limit_fails(self):
         line = "test_x ... skipped 'Windows junction test'"
         got = policy.verify("Linux", line + "\n" + line)
         self.assertEqual(len(got), 1)
         self.assertIn("exceeds 1", got[0])
+
+    def test_bubblewrap_allows_only_existing_unreachable_trust_cases(self):
+        trust = "test_trust ... skipped 'BLOCKED: host HAS a sufficient OS sandbox; trust basis not chosen on this host (strongest=bwrap, platform=linux)'"
+        refusal = "test_refusal ... skipped 'BLOCKED: host HAS a sufficient OS sandbox; refusal path unreachable on this host (strongest=bwrap, platform=linux)'"
+        self.assertEqual(policy.verify("Linux", "\n".join([trust, trust, refusal])), [])
+        self.assertTrue(policy.verify("Linux", "\n".join([trust] * 3)))
+        self.assertTrue(policy.verify("Linux", "\n".join([refusal] * 2)))
+        self.assertTrue(policy.verify("Windows", trust))
 
     def test_unknown_runner_fails_closed(self):
         self.assertEqual(policy.verify("macOS", ""), ["unsupported runner OS: macOS"])

@@ -57,6 +57,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -617,8 +619,143 @@ def _prepare_windows_job(argv, env, cwd, limits, level) -> Contained:
                      attach=attach, kill_tree=kill_tree)
 
 
+class _MemoryCgroup:
+    """One broker-owned cgroup; never remove or configure the delegated parent."""
+
+    def __init__(self, parent: str, memory_bytes: int, max_processes: int | None = None):
+        self.parent_fd = self.fd = None
+        self.cleanup_error = None
+        self.name = "flexfactor-" + uuid.uuid4().hex
+        self.created = False
+        root = os.path.realpath(parent)
+        mount = "/sys/fs/cgroup"
+        if os.path.commonpath([root, mount]) != mount:
+            raise ValueError("delegation must be under /sys/fs/cgroup")
+        with open("/proc/self/mountinfo") as fh:
+            actual_v2 = any(line.split()[4] == mount and
+                            line.split(" - ", 1)[1].split()[0] == "cgroup2"
+                            for line in fh if " - " in line)
+        if not actual_v2 or os.stat(root).st_dev != os.stat(mount).st_dev:
+            raise ValueError("delegation is not on the cgroup-v2 filesystem")
+        self.path = os.path.join(root, self.name)
+        try:
+            self.parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            os.mkdir(self.name, mode=0o700, dir_fd=self.parent_fd)
+            self.created = True
+            self.fd = os.open(self.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=self.parent_fd)
+            self._write("memory.max", str(memory_bytes))
+            if self._read("memory.max").strip() != str(memory_bytes):
+                raise OSError("memory.max readback did not match the requested limit")
+            self.max_processes = None
+            if max_processes:
+                self._write("pids.max", str(max_processes))
+                if self._read("pids.max").strip() != str(max_processes):
+                    raise OSError("pids.max readback did not match the requested limit")
+                self.max_processes = max_processes
+            try:
+                self._write("memory.swap.max", "0")
+                if self._read("memory.swap.max").strip() != "0":
+                    raise OSError("memory.swap.max readback did not match")
+                self.swap = "disabled"
+            except FileNotFoundError:
+                self.swap = "unsupported"
+        except Exception as exc:
+            cleanup_error = self.cleanup()
+            if cleanup_error:
+                raise OSError(f"{exc}; task cgroup cleanup failed ({self.path}): {cleanup_error}") from exc
+            raise
+
+    def _write(self, name: str, value: str) -> None:
+        fd = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(value)
+
+    def _read(self, name: str) -> str:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        with os.fdopen(fd) as fh:
+            return fh.read()
+
+    def join(self) -> None:
+        # Runs before exec, outside the best-effort CPU/process-limit block.
+        # A refused join must never execute the target without either guard.
+        self._write("cgroup.procs", str(os.getpid()))
+
+    def kill(self) -> None:
+        try:
+            self._write("cgroup.kill", "1")
+        except FileNotFoundError:
+            # bwrap's PID namespace plus the existing killpg path still kills
+            # descendants on kernels predating cgroup.kill. Never kill raw PIDs
+            # read from cgroup.procs, which may have been recycled in the interim.
+            pass
+
+    def cleanup(self) -> str | None:
+        if self.parent_fd is None:
+            return self.cleanup_error
+        if not self.created:
+            if self.parent_fd is not None:
+                os.close(self.parent_fd)
+                self.parent_fd = None
+            return None
+        error = None
+        try:
+            if self.fd is not None:
+                try:
+                    self.kill()
+                except OSError:
+                    pass  # an empty group can still be removed without kill permission
+            for attempt in range(30):
+                try:
+                    if self.fd is not None and os.stat(self.name, dir_fd=self.parent_fd,
+                            follow_symlinks=False).st_ino != os.fstat(self.fd).st_ino:
+                        raise OSError("task cgroup identity changed; refusing removal")
+                    os.rmdir(self.name, dir_fd=self.parent_fd)
+                    self.created = False
+                    break
+                except FileNotFoundError:
+                    self.created = False
+                    break
+                except OSError:
+                    if attempt == 29:
+                        raise
+                    time.sleep(0.01)
+        except OSError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            for name in ("fd", "parent_fd"):
+                value = getattr(self, name)
+                if value is not None:
+                    os.close(value)
+                    setattr(self, name, None)
+        self.cleanup_error = error
+        return error
+
+
 def _prepare_posix(argv, env, cwd, limits, level, rep, source_root) -> Contained:
     mech = rep["strongest"] or "process-group"
+    memory_group = None
+    level["memory_mechanism"] = "rlimit-as" if limits.memory_bytes else "off"
+    level["process_count_mechanism"] = "rlimit-nproc" if limits.max_processes else "off"
+    # Delegation belongs to the supervisor, never to target builds or nested
+    # self-tests. Copy even when called directly; preserve owner billing policy.
+    env = dict(env)
+    delegation = env.pop("FLEXFACTOR_MEMORY_CGROUP_ROOT", None)
+    if delegation and limits.memory_bytes:
+        if not sys.platform.startswith("linux") or mech != "bwrap":
+            level["memory_fallback_reason"] = "cgroup controls require Linux bwrap read-only mount protection"
+        else:
+            try:
+                memory_group = _MemoryCgroup(delegation, limits.memory_bytes, limits.max_processes)
+                level.update(memory="os-enforced", memory_mechanism="cgroup-v2",
+                             memory_cgroup=memory_group.path, memory_swap=memory_group.swap)
+                if memory_group.max_processes is not None:
+                    level.update(process_count="os-enforced", process_count_mechanism="cgroup-v2",
+                                 process_cgroup_limit=memory_group.max_processes)
+            except (OSError, ValueError) as exc:
+                level["memory_fallback_reason"] = f"cgroup setup unavailable: {type(exc).__name__}: {exc}"
+        if limits.max_processes and "memory_fallback_reason" in level:
+            level["process_count_fallback_reason"] = level["memory_fallback_reason"]
     wrapped = list(argv)
     if mech == "bwrap":
         bw = [shutil.which("bwrap"), "--unshare-all" if not limits.network else "--unshare-pid",
@@ -633,17 +770,27 @@ def _prepare_posix(argv, env, cwd, limits, level, rep, source_root) -> Contained
             rw.append(os.path.abspath(source_root))
         for d in dict.fromkeys(rw):
             bw += ["--bind", d, d]
+        if memory_group:
+            # Last mount wins even if a requested writable directory overlaps
+            # / or /proc: a host proc mount exposes the supervisor's root.
+            # Reinstall private proc and drop capabilities before protecting sys.
+            bw += ["--proc", "/proc", "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup",
+                   "--cap-drop", "ALL"]
         bw += ["--chdir", cwd, "--"]
         wrapped = bw + wrapped
     elif mech == "unshare-user-net" and not limits.network:
         wrapped = [shutil.which("unshare"), "-rn", "--"] + wrapped
 
     def preexec():
+        import resource
+        if memory_group:
+            memory_group.join()
+        elif limits.memory_bytes:
+            # Memory enforcement is required. A failed setrlimit must refuse
+            # launch instead of silently executing with unlimited memory.
+            resource.setrlimit(resource.RLIMIT_AS, (limits.memory_bytes, limits.memory_bytes))
         try:
-            import resource
-            if limits.memory_bytes:
-                resource.setrlimit(resource.RLIMIT_AS, (limits.memory_bytes, limits.memory_bytes))
-            if limits.max_processes:
+            if limits.max_processes and not (memory_group and memory_group.max_processes is not None):
                 resource.setrlimit(resource.RLIMIT_NPROC,
                                    (limits.max_processes, limits.max_processes))
             if limits.cpu_seconds:
@@ -653,6 +800,11 @@ def _prepare_posix(argv, env, cwd, limits, level, rep, source_root) -> Contained
 
     def kill_tree(proc: subprocess.Popen) -> None:
         import signal
+        if memory_group:
+            try:
+                memory_group.kill()
+            except OSError:
+                pass  # still run the existing process-group kill below
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
@@ -662,8 +814,13 @@ def _prepare_posix(argv, env, cwd, limits, level, rep, source_root) -> Contained
         except OSError:
             pass
 
+    def cleanup():
+        if memory_group:
+            error = memory_group.cleanup()
+            level["memory_cgroup_cleanup"] = error or "removed"
+
     return Contained(argv=wrapped, env=env, cwd=cwd, mechanism=mech, level=level,
-                     cleanup=lambda: None,
+                     cleanup=cleanup,
                      popen_kwargs={"start_new_session": True, "preexec_fn": preexec},
                      kill_tree=kill_tree)
 

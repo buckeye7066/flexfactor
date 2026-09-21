@@ -942,6 +942,10 @@ class Rotator:
                                 set(intent.avoid_families)
                                 | set(_OPAQUE_MODEL_FAMILIES))):
                         return "excluded reviewer model family"
+                    if intent is not None and intent.needs and r.capabilities:
+                        missing = [need for need in intent.needs if need not in r.capabilities]
+                        if missing:
+                            return "missing required capabilities: " + ", ".join(missing)
                     if _cooling(state, f"allowance:{allowance_key(r)}", now):
                         return (f"{allowance_key(r)} allowance exhausted "
                                 "(account-wide)")
@@ -951,7 +955,7 @@ class Rotator:
                 why = "; ".join(f"{r.id}: {_why(r)}" for r in matches[:4])
                 raise PinUnavailable(
                     f"pinned target {pin!r} cannot serve right now -- {why}. "
-                    f"Unset the pin to let rotation choose, or wait for the reset.")
+                    f"Unset the pin to let rotation choose an eligible route.")
             start = TIER_CHAIN.index(tier if tier in TIER_CHAIN else LIGHT)
             for candidate_tier in TIER_CHAIN[start:]:
                 fallback = self._pick_in_tier(
@@ -1975,9 +1979,9 @@ class RotatingProvider:
 
     # -- provider surface --------------------------------------------------
     def complete(self, *args, **kwargs):
-        kwargs.setdefault(
-            "intent", CallIntent(ROLE_AUTHOR, (CAP_CODE_AUTHOR,))
-        )
+        intent = kwargs.get("intent") or CallIntent(ROLE_AUTHOR)
+        kwargs["intent"] = intent.with_purpose(
+            intent.purpose, (CAP_CODE_AUTHOR,) if intent.role == ROLE_AUTHOR else ())
         return self._run("complete", self._tier, *args, **kwargs)
 
     def _structured_call(self, args, kwargs, result_validator=None):
@@ -1992,9 +1996,10 @@ class RotatingProvider:
             kwargs.pop("model")
             if requested == ROTATING_JUDGE_MODEL:
                 tier = self._judge_tier
-        kwargs.setdefault(
-            "intent", CallIntent(ROLE_AUTHOR, (CAP_CODE_AUTHOR, CAP_STRUCTURED_JSON))
-        )
+        intent = kwargs.get("intent") or CallIntent(ROLE_AUTHOR)
+        needs = ((CAP_CODE_AUTHOR, CAP_STRUCTURED_JSON) if intent.role == ROLE_AUTHOR
+                 else (CAP_STRUCTURED_JSON,))
+        kwargs["intent"] = intent.with_purpose(intent.purpose, needs)
         if result_validator is not None:
             kwargs["_result_validator"] = result_validator
         return self._run("structured", tier, *args, **kwargs)
