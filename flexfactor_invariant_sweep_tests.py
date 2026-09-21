@@ -523,6 +523,14 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    ".github/scripts/staged_phone_acceptance.py::run": (
+        "Owner-invoked isolated phone acceptance tooling, not audited target execution. "
+        "Fixed read-only Git release export, local ephemeral TLS certificate generation, "
+        "and native Vercel metadata/API calls to a validated owner deployment. "
+        "Literal argv, no shell, bounded timeout and suppressed credential-bearing errors; "
+        "application credentials use stdin. The relay permits only fixed API routes "
+        "and limits mutations to the dedicated acceptance repository."
+    ),
     ".github/scripts/mobile_cloud_live_proof.py::_native_vercel": (
         "Owner-invoked release acceptance transport, not target execution. Runs "
         "only native Vercel deployment API GET/curl against the fixed owner project and "

@@ -112,6 +112,28 @@ The live proof script accepts that exact URL through
 sending application credentials. It requires the native Vercel CLI and a
 linked `cloud` directory. API proof does not replace the device checks below.
 
+For device acceptance, use `.github/scripts/staged_phone_acceptance.py` to
+prepare an isolated APK from the exact signed release tag and source revision.
+Its `com.firer.console.flexfactor.staged` package leaves the installed production
+app intact. The exported Java source is unchanged; the recorded overlays change
+only the package, label, endpoint, and trust for a fresh localhost certificate.
+Build that export's debug APK with the installed Android SDK/JDK and Gradle,
+install it, and use `adb reverse tcp:18443 tcp:18443`. Run the helper's `serve`
+command with the accepted deployment URL, cloud source SHA, and engine tag.
+It verifies project and response identity, then relays localhost HTTPS through
+the authenticated native Vercel CLI. No deployment-protection token goes into
+the APK. The relay permits dispatch only to `flexfactor-demo-tinystats` without
+phone-supplied provider keys; verify its subscription/local model policy before
+running modes. Its redacted request log proves which deployment the phone used.
+
+Example preparation and relay commands (substitute the recorded release and
+deployment identities; output must be a fresh directory outside the checkout):
+
+```powershell
+python .github/scripts/staged_phone_acceptance.py prepare --repo . --output ../phone-acceptance --version 3.5.16 --release-sha <release-source-sha>
+python .github/scripts/staged_phone_acceptance.py serve --repo . --output ../phone-acceptance --deployment <immutable-url> --cloud-source-sha <cloud-source-sha> --engine-ref android-v3.5.16
+```
+
 1. Confirm `/api/health` is HTTP 200 and names the expected `android-v*` engine.
 2. Complete one fresh device sign-in and one forced token refresh.
 3. Run Refactor, Scout, Audit, and Production Ready against the release test repository.

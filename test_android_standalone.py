@@ -295,6 +295,116 @@ class StagedCloudTransportTests(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
 
 
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location(
+    "staged_phone_acceptance", Path(__file__).resolve().parent / ".github/scripts/staged_phone_acceptance.py")
+_staged_phone_subject = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(_staged_phone_subject)
+
+BASE = "https://flexfactor-cloud-a1b2c3-buckeye7066-7954s-projects.vercel.app"
+
+
+class StagedPhoneRelayTests(unittest.TestCase):
+    def test_exact_owner_origin(self):
+        self.assertEqual(BASE, _staged_phone_subject.deployment_url(BASE))
+        for value in ["https://flexfactor-cloud.vercel.app", BASE + "/", BASE + ".evil.com",
+                      BASE.replace("https:", "http:"), BASE.replace("buckeye7066", "other")]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _staged_phone_subject.deployment_url(value)
+
+    def test_preserves_non_success_body_and_identity_headers(self):
+        raw = (b"HTTP/2 400\r\nContent-Type: application/json\r\n"
+               b"X-FlexFactor-Cloud-Source: abc\r\n\r\n"
+               b'{"error":"authorization_pending"}')
+        status, body, headers = _staged_phone_subject.parse_response(raw)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"], "authorization_pending")
+        self.assertEqual(headers["X-FlexFactor-Cloud-Source"], "abc")
+
+    def test_binary_zip_preserved(self):
+        payload = b"PK\x03\x04\xff\x00\r\n\r\n"
+        status, body, headers = _staged_phone_subject.parse_response(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\n\r\n" + payload)
+        self.assertEqual((status, body, headers["Content-Type"]), (200, payload, "application/zip"))
+
+    def test_bounded_requests(self):
+        accepted = "repository=buckeye7066%2Fflexfactor-demo-tinystats&request_id=123&run_id=1"
+        _staged_phone_subject.validate_request("GET", "/api/runs/details?" + accepted, None)
+        for method, path, body in [
+            ("GET", "/api/../secret", None),
+            ("GET", "/api/health?token=secret", None),
+            ("GET", "/api/runs/details?" + accepted + "&run_id=2", None),
+            ("GET", "/api/runs/details?" + accepted.replace("tinystats", "production"), None),
+            ("DELETE", "/api/repositories?page=1", None),
+            ("POST", "/api/runs/dispatch", {"request": {"repository": _staged_phone_subject.TARGET}, "encrypted_secrets": {"openai": "sealed"}}),
+            ("POST", "/api/runs/steer", {"repository": "buckeye7066/production"}),
+        ]:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                _staged_phone_subject.validate_request(method, path, body)
+
+    def test_credentials_only_in_stdin_and_redirects_disabled(self):
+        token = "test-bearer-secret"
+        refresh = "test-refresh-secret"
+        with patch.object(_staged_phone_subject, "native_vercel", return_value=b"HTTP/2 200\r\n\r\n{}") as native:
+            _staged_phone_subject.forward(Path("repo"), BASE, "POST", "/api/oauth/refresh",
+                            {"Authorization": "Bearer " + token}, {"refresh_token": refresh})
+        args = native.call_args.args
+        self.assertNotIn(token, repr(args[:2]))
+        self.assertNotIn(refresh, repr(args[:2]))
+        self.assertIn(token.encode(), args[2])
+        self.assertIn(refresh.encode(), args[2])
+        self.assertIn(b"no-location", args[2])
+        self.assertIn("--disable", args[1])
+
+    def test_header_injection_refused_before_native_request(self):
+        with patch.object(_staged_phone_subject, "native_vercel") as native:
+            with self.assertRaises(ValueError):
+                _staged_phone_subject.forward(Path("repo"), BASE, "GET", "/api/health",
+                                {"Authorization": "abc\r\nHost: evil"})
+            native.assert_not_called()
+
+    def test_owner_project_and_deployment_identity_are_required(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            link = repo / "cloud/.vercel/project.json"
+            link.parent.mkdir(parents=True)
+            link.write_text(json.dumps({"orgId": "team_owner", "projectId": "prj_owner"}))
+            metadata = {"projectId": "prj_owner", "name": "flexfactor-cloud",
+                        "url": BASE.removeprefix("https://"), "readyState": "READY",
+                        "target": "production"}
+            with patch.object(_staged_phone_subject, "native_vercel", return_value=json.dumps(metadata).encode()):
+                _staged_phone_subject.verify_owner(repo, BASE)
+            for field, bad in [("projectId", "prj_other"), ("url", "other.vercel.app"),
+                               ("readyState", "BUILDING"), ("target", "preview")]:
+                with self.subTest(field=field), patch.object(_staged_phone_subject, "native_vercel",
+                        return_value=json.dumps({**metadata, field: bad}).encode()):
+                    with self.assertRaises(ValueError):
+                        _staged_phone_subject.verify_owner(repo, BASE)
+
+    def test_cloud_identity_mismatch_refuses_before_listening(self):
+        source = "a" * 40
+        health = {"ok": True, "oauth_device_configured": True, "source_revision": source,
+                  "engine_ref": "android-v3.5.16", "deployment_url": BASE}
+        headers = {"X-FlexFactor-Cloud-Source": source, "X-FlexFactor-Deployment": BASE}
+        for key, wrong in [("source_revision", "b" * 40),
+                           ("engine_ref", "android-v3.5.15"),
+                           ("deployment_url", BASE.replace("a1b2c3", "other"))]:
+            with self.subTest(field=key), patch.object(_staged_phone_subject, "verify_owner"), patch.object(
+                    _staged_phone_subject, "forward", return_value=(200, json.dumps({**health, key: wrong}).encode(), headers)), patch.object(
+                    _staged_phone_subject.http.server, "ThreadingHTTPServer") as server:
+                with self.assertRaises(ValueError):
+                    _staged_phone_subject.relay(Path("repo"), Path("output"), BASE, source, "android-v3.5.16")
+                server.assert_not_called()
+
+
+
+
 class CloudStagePromotionTests(unittest.TestCase):
     URL = "https://flexfactor-cloud-a1b2c3-buckeye7066-7954s-projects.vercel.app"
 
