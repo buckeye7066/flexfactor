@@ -5180,7 +5180,10 @@ def _builtin_route_catalog(fr):
             model="deepseek-coder:6.7b", wire_model="deepseek-coder:6.7b",
             api="ollama", base_url="", pool="ollama:deepseek-local",
             cost_class=fr.LOCAL_UNLIMITED, tier=fr.LIGHT,
-            capabilities=model_capabilities, capabilities_source="declared",
+            # Keep the second local family available for independent review:
+            # author fallback must not consume its only remaining reviewer.
+            capabilities=(fr.CAP_CODE_REVIEW, fr.CAP_STRUCTURED_JSON, fr.CAP_HONEST),
+            capabilities_source="declared",
         ),
     ]
     from providers.owner_subscription import owner_subscription_only
