@@ -1638,6 +1638,35 @@ class RotationDefaultProviderTests(unittest.TestCase):
         self.assertNotIn("builtin/openai-gpt-5-6-sol", ids)
         self.assertNotIn("builtin/anthropic-fable-5-1", ids)
 
+    def test_reviewer_only_catalog_is_rejected_before_announcing_rotation(self):
+        import contextlib, io
+        import flexfactor_rotation as fr
+        review = self._route("ollama/deepseek-review", tier="light", api="ollama", auth_env=None)
+        review["capabilities"] = [fr.CAP_CODE_REVIEW, fr.CAP_STRUCTURED_JSON, fr.CAP_HONEST]
+        self._write_catalog([review])
+        stderr = io.StringIO()
+        with mock.patch.object(ff, "_route_unusable_reason", return_value=""), \
+             mock.patch.object(ff, "_refresh_ai_time_catalog", return_value=(True, "isolated test")), \
+             contextlib.redirect_stderr(stderr):
+            provider = ff._build_rotating_provider(self.Args, None, "best")
+        self.assertIsNone(provider)
+        self.assertNotIn("[rotation] ON:", stderr.getvalue())
+        self.assertIn("code_author", stderr.getvalue())
+
+    def test_startup_author_tier_ignores_stronger_reviewer_only_routes(self):
+        import flexfactor_rotation as fr
+        review = self._route("ollama/deepseek-review", api="ollama", auth_env=None)
+        review["capabilities"] = [fr.CAP_CODE_REVIEW, fr.CAP_STRUCTURED_JSON, fr.CAP_HONEST]
+        author = self._route("ollama/qwen-author", tier="light", api="ollama", auth_env=None)
+        author["capabilities"] = [fr.CAP_CODE_AUTHOR, fr.CAP_STRUCTURED_JSON]
+        self._write_catalog([review, author])
+        with mock.patch.object(ff, "_route_unusable_reason", return_value=""):
+            provider = ff._build_rotating_provider(self.Args, None, "best", quiet=True)
+        self.assertIsNotNone(provider)
+        self.assertEqual(provider._tier, fr.LIGHT)
+        self.assertEqual(provider._judge_tier, fr.FRONTIER)
+        self.assertEqual({r.id for r in provider.rotator.catalog.routes}, {review["id"], author["id"]})
+
     def test_sensitive_repository_filters_cloud_routes_before_selection(self):
         self._write_catalog([self._route("groq/llama-x"),
                              self._route("ollama/qwen-local", api="ollama", auth_env=None)])

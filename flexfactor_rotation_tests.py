@@ -707,11 +707,44 @@ class BuiltinIndependentReviewerTests(RotationTestCase):
         self.assertEqual(self.provider.role_coordinator.author_families, set())
 
     def test_author_pin_cannot_bypass_review_route_capabilities(self):
-        with self.assertRaises(R.PinUnavailable):
+        with self.assertRaisesRegex(R.PinUnavailable, "missing required capabilities: code_author") as caught:
             self.provider.rotator.next_route(
                 tier=R.STRONG, pin="builtin/ollama-deepseek-review",
                 intent=R.CallIntent(R.ROLE_AUTHOR, (R.CAP_CODE_AUTHOR,)),
             )
+        self.assertNotIn("cooling down", str(caught.exception))
+        self.assertNotIn("wait for the reset", str(caught.exception))
+
+    def _assert_explicit_author_failover(self, method):
+        self.adapters["builtin/ollama"].fail_with = TimeoutError("offline timeout")
+        intent = R.CallIntent(R.ROLE_AUTHOR, purpose="repair arithmetic",
+                              avoid_family="openai", avoid_families=("anthropic",))
+        args = ("repair",) if method == "complete" else ("system", "repair", {})
+        with self.assertRaises(R.RotationError):
+            getattr(self.provider, method)(*args, intent=intent)
+        self.assertEqual(self.adapters["builtin/ollama-deepseek-review"].calls, [])
+        self.assertEqual(self.provider.role_coordinator.author_families, set())
+
+    def test_explicit_complete_author_intent_cannot_spend_review_capacity_on_failover(self):
+        self._assert_explicit_author_failover("complete")
+
+    def test_explicit_structured_author_intent_cannot_spend_review_capacity_on_failover(self):
+        self._assert_explicit_author_failover("structured")
+
+    def test_method_needs_preserve_explicit_purpose_role_and_exclusions(self):
+        from unittest.mock import patch
+        for method in ("complete", "structured"):
+            for role in (R.ROLE_AUTHOR, R.ROLE_REVIEWER):
+                original = R.CallIntent(role, (R.CAP_HONEST,), "openai", "repair arithmetic", ("anthropic",))
+                with self.subTest(method=method, role=role), patch.object(self.provider, "_run") as run:
+                    getattr(self.provider, method)("request", intent=original)
+                intent = run.call_args.kwargs["intent"]
+                self.assertEqual((intent.role, intent.purpose, intent.avoid_family, intent.avoid_families),
+                                 (original.role, original.purpose, original.avoid_family, original.avoid_families))
+                self.assertIn(R.CAP_HONEST, intent.needs)
+                self.assertEqual(R.CAP_CODE_AUTHOR in intent.needs, role == R.ROLE_AUTHOR)
+                self.assertEqual(R.CAP_STRUCTURED_JSON in intent.needs, method == "structured")
+                self.assertEqual(original.needs, (R.CAP_HONEST,))
 
     def test_independence_still_fails_when_both_families_authored(self):
         self.provider.role_coordinator.author_families.update({"qwen", "deepseek"})

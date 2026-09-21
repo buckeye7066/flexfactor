@@ -5274,18 +5274,24 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
         _say(f"catalog has {len(catalog.enabled())} enabled routes but none are "
              f"usable here ({detail})")
         return None
+    # Preserve unknown legacy capability metadata, as the selector does, but
+    # never announce an authoring provider backed only by declared reviewers.
+    author_needs = {fr.CAP_CODE_AUTHOR, fr.CAP_STRUCTURED_JSON}
+    author_routes = [r for r in usable if r.tier in fr.TIER_CHAIN
+                     and (not r.capabilities or author_needs.issubset(r.capabilities))]
+    if not author_routes:
+        _say("usable routes have no supported author tier with the "
+             "code_author and structured_json capabilities")
+        return None
     filtered = fr.Catalog(routes=usable, generated_at=catalog.generated_at,
                           age_seconds=catalog.age_seconds, path=catalog.path)
     rotator = fr.Rotator(catalog=filtered, store=fr.StateStore(), app="flexfactor")
     # One quality-first policy: both authoring and judging begin at the
     # strongest paid tier. Exhaustion advances the shared ladder.
-    author_tier = fr.FRONTIER
-    if not any(r.tier == author_tier for r in usable):
-        # A catalog with no route in the requested author tier would make every
-        # authoring call fail; fall back to whichever author-capable tier exists.
-        author_tier = fr.FRONTIER if author_tier != fr.FRONTIER else fr.STRONG
-        if not any(r.tier == author_tier for r in usable):
-            author_tier = fr.LIGHT
+    author_tier = next(tier for tier in fr.TIER_CHAIN
+                       if any(r.tier == tier for r in author_routes))
+    judge_tier = next(tier for tier in fr.TIER_CHAIN
+                      if any(r.tier == tier for r in usable))
     announced: set[str] = set()
     paid_first = normalize_model_mode(model_mode) == "best"
 
@@ -5329,7 +5335,7 @@ def _build_rotating_provider(args, meter: "CostMeter | None", model_mode: str,
     global _LAST_ROTATION_USABLE
     _LAST_ROTATION_USABLE = len(usable)
     provider = fr.RotatingProvider(rotator, _rotation_route_provider,
-                               tier=author_tier, judge_tier=author_tier,
+                               tier=author_tier, judge_tier=judge_tier,
                                allow_paid=True, meter=meter,
                                on_route=_announce,
                                # every route failure lands in the run's error

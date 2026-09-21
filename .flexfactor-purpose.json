@@ -307,15 +307,15 @@
     {
       "kind": "source",
       "locator": "flexfactor_rotation.py",
-      "content_hash": "c625546dca564044237212254af04ea6abbf564335becd634b80cd1e9a7629db",
-      "observed_at": "2026-09-20T03:00:37.364688+00:00",
+      "content_hash": "3f77619941b4669e050fa7f82572435dd429f3b3de1d341f21e85ffa2acbc2be",
+      "observed_at": "2026-09-21T21:53:53.566390+00:00",
       "excerpt": "Subscription-first ladder and author exclusion."
     },
     {
       "kind": "source",
       "locator": "flexfactor.py",
-      "content_hash": "9646fa5dfe0d152a40580965e8e512619b10c19edc8ef6bad4e1d0e55bb23301",
-      "observed_at": "2026-09-21T21:09:09.574289+00:00",
+      "content_hash": "6c1d93d3ba7e936770e09d9b9e752f94d472ceb894077261f36f7fab519f5334",
+      "observed_at": "2026-09-21T21:53:53.570042+00:00",
       "excerpt": "Modes, verification, review and publication."
     },
     {
