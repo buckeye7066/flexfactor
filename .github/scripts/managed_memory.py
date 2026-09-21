@@ -129,8 +129,10 @@ def probe():
     # Exercise the exact engine wrapper rather than assuming an installed bwrap works.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     import flexfactor_sandbox as sandbox
-    if sandbox.capability_report()["strongest"] != "bwrap":
-        raise RuntimeError("managed memory requires a successful bubblewrap namespace probe")
+    report = sandbox.capability_report()
+    if report["strongest"] != "bwrap":
+        raise RuntimeError("managed memory requires a successful bubblewrap namespace probe: "
+                           + json.dumps(report, sort_keys=True))
     code = "import pathlib; assert 'NoNewPrivs:\\t1' in pathlib.Path('/proc/self/status').read_text(); print('MEMORY_CONTAINED')"
     result = sandbox.run_contained([sys.executable, "-c", code], os.getcwd(),
                                    limits=sandbox.Limits(memory_bytes=128 * 1024 ** 2))
