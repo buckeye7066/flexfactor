@@ -116,7 +116,8 @@ class _FakeProvider:
 
 class ProviderAttributesResults(_Base):
     def test_result_is_attributed_to_the_route_that_authored(self):
-        a, b = route("a/one", "pool-a"), route("b/two", "pool-b")
+        caps = (R.CAP_CODE_AUTHOR, R.CAP_STRUCTURED_JSON)
+        a, b = route("a/one", "pool-a", caps), route("b/two", "pool-b", caps)
         rot = self.rot([a, b])
         seen = []
         p = R.RotatingProvider(rot, _FakeProvider, tier=R.STRONG, judge_tier=R.STRONG,

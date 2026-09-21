@@ -127,7 +127,8 @@ class ProviderWrapperCarriesPurpose(_Base):
         return p, seen
 
     def test_purpose_rides_on_every_selection(self):
-        p, seen = self._prov([route("a/coder", "pool-a", caps=(R.CAP_CODE_AUTHOR,))])
+        p, seen = self._prov([route("a/coder", "pool-a",
+                                   caps=(R.CAP_CODE_AUTHOR, R.CAP_STRUCTURED_JSON))])
         p.set_purpose("sermonsmith: exact scripture text", needs=())
         p.structured("s", "u", {}, intent=R.CallIntent(R.ROLE_AUTHOR, (R.CAP_CODE_AUTHOR,)))
         self.assertEqual(seen[-1].purpose, "sermonsmith: exact scripture text")
@@ -138,8 +139,11 @@ class ProviderWrapperCarriesPurpose(_Base):
         # "needs vision" and every code author call was narrowed to
         # image-capable models. Purpose needs now bind only to ROLE_VISION.
         p, seen = self._prov([
-            route("a/text-coder", "pool-a", caps=(R.CAP_CODE_AUTHOR,)),
-            route("b/vision-coder", "pool-b", caps=(R.CAP_CODE_AUTHOR, R.CAP_VISION)),
+            # Both adapters return structured responses; vision remains the
+            # only capability difference relevant to purpose-based routing.
+            route("a/text-coder", "pool-a", caps=(R.CAP_CODE_AUTHOR, R.CAP_STRUCTURED_JSON)),
+            route("b/vision-coder", "pool-b",
+                  caps=(R.CAP_CODE_AUTHOR, R.CAP_STRUCTURED_JSON, R.CAP_VISION)),
         ])
         p.set_purpose("ui-app", needs=(R.CAP_VISION,))
         authors = set()
