@@ -545,6 +545,13 @@ def prepare(cmd: list[str], cwd: str, env: dict | None, limits: Limits, *,
             source_root: str | None = None) -> Contained:
     base = dict(env if env is not None else os.environ)
     clean, stripped = scrub_env(base)
+    # The caller owns this queue. Target builds/tests (including FlexFactor's
+    # own suite) must not resume or overwrite it when they launch an engine.
+    # Keep policy controls, especially owner billing restrictions, intact.
+    queue_context = [name for name in clean
+                     if name.upper() in {"FLEXFACTOR_QUEUE_ID", "FLEXFACTOR_QUEUE_STATE"}]
+    for name in queue_context:
+        del clean[name]
     if not limits.network:
         clean = poison_network_env(clean)
     rep = capability_report()
@@ -559,6 +566,7 @@ def prepare(cmd: list[str], cwd: str, env: dict | None, limits: Limits, *,
              "process_count": rep["process_count"] if limits.max_processes else "off",
              "cpu_time": rep["cpu_time"] if limits.cpu_seconds else "off",
              "credentials_stripped": stripped,
+             "queue_context_stripped": sorted(queue_context),
              "limits": {"timeout_s": limits.timeout_s, "memory_bytes": limits.memory_bytes,
                         "max_processes": limits.max_processes,
                         "cpu_seconds": limits.cpu_seconds, "network": limits.network}}

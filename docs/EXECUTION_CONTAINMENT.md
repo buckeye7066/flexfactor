@@ -87,6 +87,13 @@ install/build/test on this host requires trust. A refusal returns rc 126,
 
 ## 5. Limits defaults (`flexfactor_sandbox.Limits`)
 
+Target child processes do not inherit `FLEXFACTOR_QUEUE_ID` or
+`FLEXFACTOR_QUEUE_STATE`. Those identify the parent request; inheriting them
+caused a managed self-audit's tests to resume the parent's mobile queue.
+`prepare()` records removed names under `queue_context_stripped` and leaves
+the parent environment and owner billing-policy controls unchanged. A real
+child-process regression covers this boundary on Windows and Linux.
+
 | Field | Default | Broker override |
 |---|---|---|
 | timeout_s | 900 | `_run` timeout argument (1800 for verify/e2e/coverage, 2400 for suite) |
