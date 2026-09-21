@@ -129,6 +129,274 @@ class CloudDeploymentIntegrityTests(unittest.TestCase):
         self.assertIn("exit 1", verify)
 
 
+class StagedCloudTransportTests(unittest.TestCase):
+    BASE = "https://flexfactor-cloud-a1b2c3-buckeye7066-7954s-projects.vercel.app"
+
+    def setUp(self):
+        import ast
+        source = (ROOT / ".github/scripts/mobile_cloud_live_proof.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        names = {"select_cloud_base", "_native_vercel", "verify_staged_project", "staged_request"}
+        nodes = [node for node in tree.body if isinstance(node, ast.Import)
+                 or isinstance(node, ast.ImportFrom) and node.module in ("pathlib", "__future__")
+                 or isinstance(node, ast.FunctionDef) and node.name in names]
+        self.scope = {}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<staged-transport>", "exec"), self.scope)
+
+    def test_default_and_only_exact_owner_staging_urls(self):
+        choose = self.scope["select_cloud_base"]
+        for url in ("https://flexfactor-cloud.vercel.app", self.BASE):
+            self.assertEqual(choose(url), url)
+        for url in (self.BASE + "/", self.BASE + "\n", self.BASE + "?x=y", self.BASE + ".evil.test",
+                    self.BASE.replace("https:", "http:"), self.BASE.replace("flexfactor-cloud-", "foreign-")):
+            with self.assertRaises(ValueError): choose(url)
+
+    def test_auth_and_payload_use_stdin_and_binary_response_is_preserved(self):
+        calls = []
+        def native(args, payload):
+            calls.append((args, payload))
+            return b"HTTP/2 200\r\nContent-Type: application/zip\r\n\r\nPK\x00\xff"
+        self.scope["_native_vercel"] = native
+        self.scope["verify_cloud_response"] = lambda headers, expected: calls.append((headers, expected))
+        result = self.scope["staged_request"](self.BASE, "POST", "/api/configure", {
+            "Authorization": "Bearer app-secret", "Content-Type": "application/json"},
+            {"refresh_token": 'payload-secret"\\\n'}, {"deployment_url": self.BASE})
+        args, payload = calls[0]
+        self.assertNotIn("app-secret", repr(args))
+        self.assertNotIn("payload-secret", repr(args))
+        self.assertIn(b"no-location\n", payload)
+        self.assertIn(b"max-redirs = 0\n", payload)
+        self.assertIn(b"app-secret", payload)
+        self.assertIn(b"payload-secret", payload)
+        self.assertEqual(args[-4:], ["--", "--disable", "--config", "-"])
+        self.assertEqual(result[0:2], (200, b"PK\x00\xff"))
+        self.assertEqual(len(calls), 2)
+
+    def test_http_errors_and_malformed_output_do_not_echo_secrets(self):
+        for raw in (b"HTTP/2 403\r\n\r\nsecret-body", b"secret-body", b"HTTP/2 302\r\nLocation: https://evil.test\r\n\r\nsecret-body"):
+            self.scope["_native_vercel"] = lambda *args: raw
+            with self.assertRaises(RuntimeError) as raised:
+                self.scope["staged_request"](self.BASE, "GET", "/api/health", {})
+            self.assertNotIn("secret-body", str(raised.exception))
+            self.assertNotIn("evil.test", str(raised.exception))
+
+    def test_response_identity_mismatch_is_not_returned_as_success(self):
+        self.scope["_native_vercel"] = lambda *args: b"HTTP/2 200\r\n\r\n{}"
+        def refuse(headers, expected): raise ValueError("Changed deployment")
+        self.scope["verify_cloud_response"] = refuse
+        with self.assertRaisesRegex(ValueError, "Changed deployment"):
+            self.scope["staged_request"](self.BASE, "GET", "/api/health", {}, expected_health={})
+
+    def test_bad_paths_headers_and_native_commands_never_launch(self):
+        from unittest.mock import Mock
+        self.scope["_native_vercel"] = Mock(side_effect=AssertionError("must not launch"))
+        for path in ("https://evil.test", "/api/health\n", "/api/health --debug", "/elsewhere"):
+            with self.assertRaises(ValueError): self.scope["staged_request"](self.BASE, "GET", path, {})
+        with self.assertRaises(ValueError):
+            self.scope["staged_request"](self.BASE, "GET", "/api/health", {"Authorization": "Bearer x\r\nInjected: y"})
+        self.setUp()
+        with self.assertRaises(ValueError): self.scope["_native_vercel"](["deploy", "--prod"])
+
+    def test_native_launcher_sanitizes_environment_captures_errors_and_bounds_execution(self):
+        import os
+        import subprocess
+        import types
+        from unittest.mock import patch
+        native = self.scope["_native_vercel"]
+        args = ["curl", "/api/health", "--deployment", self.BASE, "--scope", "buckeye7066-7954s-projects", "--", "--disable", "--config", "-"]
+        with patch.dict(os.environ, {"FLEXFACTOR_LIVE_PROOF_TOKEN": "app-secret", "VERCEL_TOKEN": "platform-secret", "DEBUG": "*"}), \
+             patch.object(self.scope["shutil"], "which", return_value="vercel"), \
+             patch.object(subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=b"ok")) as run:
+            self.assertEqual(native(args, b"app-secret"), b"ok")
+            positional, kwargs = run.call_args
+            self.assertNotIn("secret", repr(positional))
+            self.assertEqual(kwargs["input"], b"app-secret")
+            self.assertFalse(kwargs["shell"])
+            self.assertEqual(kwargs["timeout"], 350)
+            self.assertNotIn("DEBUG", kwargs["env"])
+            self.assertNotIn("FLEXFACTOR_LIVE_PROOF_TOKEN", kwargs["env"])
+            self.assertEqual(kwargs["env"]["VERCEL_TOKEN"], "platform-secret")
+            run.return_value = types.SimpleNamespace(returncode=1, stdout=b"secret", stderr=b"secret")
+            with self.assertRaises(RuntimeError) as raised: native(args, b"app-secret")
+            self.assertNotIn("secret", str(raised.exception))
+            run.side_effect = subprocess.TimeoutExpired(args, 350, output=b"secret", stderr=b"secret")
+            with self.assertRaises(RuntimeError) as raised: native(args, b"app-secret")
+            self.assertNotIn("secret", str(raised.exception))
+
+    def test_staged_project_requires_matching_native_owner_metadata(self):
+        import json
+        import tempfile
+        from unittest.mock import patch
+        deployment = {"projectId": "prj_expected", "name": "flexfactor-cloud", "url": self.BASE[8:],
+                      "readyState": "READY", "target": "production"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cloud/.vercel").mkdir(parents=True)
+            (root / "cloud/.vercel/project.json").write_text(json.dumps({"projectId": "prj_expected", "orgId": "team_expected"}))
+            with patch.object(Path, "cwd", return_value=root):
+                calls = []
+                def native(args):
+                    calls.append(args)
+                    return json.dumps(deployment).encode()
+                self.scope["_native_vercel"] = native
+                self.scope["verify_staged_project"](self.BASE)
+                self.assertEqual(calls, [["api", "/v13/deployments/" + self.BASE[8:] + "?teamId=team_expected",
+                                         "--method", "GET", "--raw", "--scope", "buckeye7066-7954s-projects"]])
+                for key in deployment:
+                    changed = {**deployment, key: "wrong"}
+                    self.scope["_native_vercel"] = lambda args: json.dumps(changed).encode()
+                    with self.assertRaises(ValueError): self.scope["verify_staged_project"](self.BASE)
+
+    def test_windows_uses_node_entrypoint_and_preserves_query_ampersands(self):
+        import subprocess
+        import types
+        from unittest.mock import patch
+        query = "/api/runs/status?repository=owner%2Frepo&request_id=uuid&run_id=123"
+        args = ["curl", query, "--deployment", self.BASE, "--scope", "buckeye7066-7954s-projects", "--", "--disable", "--config", "-"]
+        fake_os = types.SimpleNamespace(name="nt", environ={})
+        self.scope["os"] = fake_os
+        with patch.object(self.scope["shutil"], "which", side_effect=lambda name: "C:/npm/vercel.cmd" if name == "vercel" else "C:/node/node.exe"), \
+             patch.object(Path, "is_file", return_value=True), \
+             patch.object(subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=b"ok")) as run:
+            self.scope["_native_vercel"](args, b"config")
+            launched = run.call_args.args[0]
+            self.assertEqual(launched[0], "C:/node/node.exe")
+            self.assertTrue(launched[1].replace("\\", "/").endswith("node_modules/vercel/dist/vc.js"))
+            self.assertEqual(launched[2:], args)
+            self.assertEqual(launched.count(query), 1)
+            self.assertFalse(any(item.lower().endswith(".cmd") for item in launched))
+
+    def test_missing_or_invalid_linked_team_is_refused_before_native_request(self):
+        import json
+        import tempfile
+        from unittest.mock import Mock, patch
+        self.scope["_native_vercel"] = Mock(side_effect=AssertionError("must not launch"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cloud/.vercel").mkdir(parents=True)
+            with patch.object(Path, "cwd", return_value=root):
+                for team in (None, "", "team_expected&other=1", "user_123"):
+                    (root / "cloud/.vercel/project.json").write_text(json.dumps({"projectId": "prj_expected", "orgId": team}))
+                    with self.assertRaises(ValueError): self.scope["verify_staged_project"](self.BASE)
+        self.scope["_native_vercel"].assert_not_called()
+
+    def test_native_api_boundary_accepts_only_owner_deployment_get(self):
+        import subprocess
+        import types
+        from unittest.mock import patch
+        args = ["api", "/v13/deployments/" + self.BASE[8:] + "?teamId=team_expected", "--method", "GET", "--raw", "--scope", "buckeye7066-7954s-projects"]
+        with patch.object(self.scope["shutil"], "which", return_value="vercel"), \
+             patch.object(subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=b"{}")) as run:
+            self.assertEqual(self.scope["_native_vercel"](args), b"{}")
+            self.assertEqual(run.call_args.args[0][1:], args)
+            for changed in ([*args[:3], "POST", *args[4:]], [args[0], "/v2/user", *args[2:]],
+                            [args[0], args[1] + "&extra=1", *args[2:]]):
+                with self.assertRaises(ValueError): self.scope["_native_vercel"](changed)
+            self.assertEqual(run.call_count, 1)
+
+
+class CloudStagePromotionTests(unittest.TestCase):
+    URL = "https://flexfactor-cloud-a1b2c3-buckeye7066-7954s-projects.vercel.app"
+
+    def _workflow(self):
+        return (ROOT / ".github/workflows/cloud-production-deploy.yml").read_text(encoding="utf-8")
+
+    def _step(self, name):
+        return self._workflow().split("      - name: " + name + "\n", 1)[1].split("      - name: ", 1)[0]
+
+    def _run_js(self, step, env, files=None):
+        import json
+        import os
+        import subprocess
+        import tempfile
+        import textwrap
+        script = self._step(step).split("<<'JS'\n", 1)[1].split("\n          JS", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, content in (files or {}).items():
+                destination = root / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(json.dumps(content), encoding="utf-8")
+            output = root / "output"
+            result = subprocess.run(["node", "--input-type=module", "-e", textwrap.dedent(script)],
+                                    cwd=root, env={**os.environ, **env, "GITHUB_OUTPUT": str(output)},
+                                    capture_output=True, text=True, timeout=20)
+            return result, output.read_text(encoding="utf-8") if output.exists() else ""
+
+    def test_stage_default_cannot_promote_or_check_production_alias(self):
+        source = self._workflow()
+        self.assertIn("default: stage", source)
+        self.assertIn("if: inputs.action == 'stage'", self._step("Build an immutable staged production deployment"))
+        steps = source.split("      - name: ")
+        mutations = [step for step in steps if "vercel promote " in step]
+        self.assertEqual(len(mutations), 1)
+        self.assertIn("if: inputs.action == 'promote'", mutations[0])
+        self.assertNotIn("vercel deploy", mutations[0])
+        self.assertIn("if: inputs.action == 'promote'", self._step("Prove the production alias serves the tested engine"))
+        self.assertIn("path: cloud/preview-health.json", source)
+        self.assertIn("if-no-files-found: error", source)
+
+    def test_selects_only_explicit_stage_or_exact_promote_url(self):
+        for action in ("stage", "promote"):
+            result, output = self._run_js("Select and validate the immutable deployment URL", {
+                "DEPLOY_ACTION": action, "STAGED_URL": self.URL if action == "stage" else "",
+                "REQUESTED_URL": self.URL if action == "promote" else ""})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output, "deployment_url=" + self.URL + "\n")
+
+    def test_rejects_alias_foreign_project_credentials_query_and_unknown_action(self):
+        invalid = ["", "https://flexfactor-cloud.vercel.app", self.URL.replace("https:", "http:"),
+                   self.URL.replace("flexfactor-cloud-", "foreign-"), self.URL + "/",
+                   self.URL + "?x=y", self.URL + "#x", self.URL.replace("https://", "https://user@"),
+                   self.URL + ".evil.test", self.URL + "\n", self.URL + "\ndeployment_url=evil"]
+        for url in invalid:
+            with self.subTest(url=url):
+                result, output = self._run_js("Select and validate the immutable deployment URL", {
+                    "DEPLOY_ACTION": "promote", "REQUESTED_URL": url, "STAGED_URL": self.URL})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(output, "")
+        for action, requested in (("unknown", ""), ("stage", self.URL)):
+            result, output = self._run_js("Select and validate the immutable deployment URL", {
+                "DEPLOY_ACTION": action, "REQUESTED_URL": requested, "STAGED_URL": self.URL})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(output, "")
+
+    def test_vercel_identity_fails_closed(self):
+        linked = {"projectId": "prj_expected", "orgId": "team_expected"}
+        deployment = {"projectId": "prj_expected", "name": "flexfactor-cloud",
+                      "url": self.URL.removeprefix("https://"), "readyState": "READY", "target": "production"}
+        def check(candidate, project=linked):
+            return self._run_js("Verify Vercel deployment ownership and immutable identity", {
+                "DEPLOYMENT_URL": self.URL}, {".vercel/project.json": project,
+                "deployment-metadata.json": candidate})[0]
+        self.assertEqual(check(deployment).returncode, 0)
+        for key in deployment:
+            for value in (None, "wrong"):
+                with self.subTest(field=key, value=value):
+                    self.assertNotEqual(check({**deployment, key: value}).returncode, 0)
+            missing = dict(deployment)
+            del missing[key]
+            self.assertNotEqual(check(missing).returncode, 0)
+        self.assertNotEqual(check({}, {}).returncode, 0)
+        self.assertNotEqual(check(deployment, {"projectId": "", "orgId": ""}).returncode, 0)
+
+    def test_both_actions_keep_current_main_source_engine_and_owner_checks(self):
+        source = self._workflow()
+        authorize = self._step("Authorize the exact main revision")
+        for guard in ('test "$GITHUB_ACTOR" = "$GITHUB_REPOSITORY_OWNER"',
+                      'test "$GITHUB_TRIGGERING_ACTOR" = "$GITHUB_REPOSITORY_OWNER"',
+                      'test "$GITHUB_REF" = "refs/heads/main"', 'test "$EXPECTED_SHA" = "$live_main"'):
+            self.assertIn(guard, authorize)
+        health = self._step("Prove staged production health and engine identity")
+        self.assertNotIn("if: inputs.action", health)
+        for check in ("health.source_revision, process.env.CLOUD_SOURCE_SHA", "health.engine_ref, ENGINE_REF",
+                      "health.deployment_url, process.env.DEPLOYMENT_URL"):
+            self.assertIn(check, health)
+        promote = self._step("Reauthorize and promote the tested deployment")
+        self.assertLess(promote.index('test "$EXPECTED_SHA" = "$live_main"'), promote.index("vercel promote"))
+        self.assertIn("cloud/README.md acceptance", source)
+
+
 class ManagedAndroidInvariants(unittest.TestCase):
     def test_launcher_declares_no_termux_runtime_permission(self):
         manifest = (ANDROID / "AndroidManifest.xml").read_text(encoding="utf-8")

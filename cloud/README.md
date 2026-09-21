@@ -101,12 +101,29 @@ are checked for exact agreement.
 
 Before promoting a deployment:
 
+Run `cloud-production-deploy` with `action=stage` and the exact current main
+commit as `expected_sha`. This creates an immutable deployment without changing
+the production alias. Its `cloud-staged-deployment-*` artifact records the
+deployment URL and health identity. Deployment protection remains enabled;
+use the authenticated native Vercel CLI for protected API verification.
+
+The live proof script accepts that exact URL through
+`FLEXFACTOR_LIVE_PROOF_BASE` and verifies its linked Vercel project before
+sending application credentials. It requires the native Vercel CLI and a
+linked `cloud` directory. API proof does not replace the device checks below.
+
 1. Confirm `/api/health` is HTTP 200 and names the expected `android-v*` engine.
 2. Complete one fresh device sign-in and one forced token refresh.
 3. Run Refactor, Scout, Audit, and Production Ready against the release test repository.
 4. Confirm each correlated run completes, its in-app artifact opens, and steering is consumed by an
    active Audit or Production Ready run.
 5. Scan deployment runtime errors, then promote the already-tested deployment without rebuilding.
+
+After those checks pass, run the same workflow with `action=promote`, the
+accepted immutable `deployment_url`, and the exact current main commit as
+`expected_sha`. It verifies deployment ownership and source identity again
+before promoting that deployment. If main's cloud source changes during
+acceptance, stage and verify the new source before promotion.
 
 Rollback by restoring the previous production deployment alias. The Android release stays pinned to
 its exact engine tag, so rolling back the control plane cannot silently change the engine source.

@@ -523,6 +523,13 @@ def scan_launcher_imports(source: str) -> list[tuple[int, str]]:
 #
 # Key is "<path relative to the repo root>::<enclosing function>".
 _PROCESS_LAUNCH_SITES = {
+    ".github/scripts/mobile_cloud_live_proof.py::_native_vercel": (
+        "Owner-invoked release acceptance transport, not target execution. Runs "
+        "only native Vercel deployment API GET/curl against the fixed owner project and "
+        "validated immutable deployment; application auth and JSON use stdin. "
+        "No shell/target commands; bounded timeout, captured redacted failures. "
+        "Native CLI owns its existing login and deployment-protection lifecycle."
+    ),
     ".github/scripts/managed_bwrap_profile.py::run": (
         "Hosted CI provisioning, before the execution broker can operate: fixed "
         "Bubblewrap capability probes and distro AppArmor package/parser commands. "
