@@ -9,6 +9,7 @@ drives a REAL child process.
 from __future__ import annotations
 
 import os
+import json
 import sys
 import tempfile
 import textwrap
@@ -206,6 +207,24 @@ class PrepareTests(unittest.TestCase):
 
 
 class RunContainedTests(unittest.TestCase):
+    def test_target_child_cannot_resume_parent_mobile_queue(self):
+        env = dict(os.environ, FLEXFACTOR_QUEUE_ID="parent-mobile-request",
+                   FLEXFACTOR_QUEUE_STATE="parent-queue.json",
+                   FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY="1")
+        script = (
+            "import os,json; print(json.dumps({k:os.environ.get(k) for k in "
+            "['FLEXFACTOR_QUEUE_ID','FLEXFACTOR_QUEUE_STATE',"
+            "'FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY']}))"
+        )
+        cp = sb.run_contained([PY, "-c", script], TMP, env=env,
+                              limits=Limits(timeout_s=60))
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertEqual(json.loads(cp.stdout), {
+            "FLEXFACTOR_QUEUE_ID": None, "FLEXFACTOR_QUEUE_STATE": None,
+            "FLEXFACTOR_OWNER_SUBSCRIPTION_ONLY": "1"})
+        self.assertEqual(env["FLEXFACTOR_QUEUE_ID"], "parent-mobile-request")
+        self.assertEqual(env["FLEXFACTOR_QUEUE_STATE"], "parent-queue.json")
+
     def test_hello_rc0_with_containment_attribute(self):
         cp = sb.run_contained([PY, "-c", "print('hi')"], TMP, limits=Limits(timeout_s=60))
         self.assertEqual(cp.returncode, 0, cp.stderr)
