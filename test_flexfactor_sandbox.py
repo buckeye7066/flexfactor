@@ -209,11 +209,11 @@ class PrepareTests(unittest.TestCase):
 
 
 class MemoryCgroupPreparationTests(unittest.TestCase):
-    def _prepare(self, mechanism="bwrap"):
+    def _prepare(self, mechanism="bwrap", limits=None):
         level = {}
         contained = sb._prepare_posix([PY, "-c", "pass"],
             {"FLEXFACTOR_MEMORY_CGROUP_ROOT": "/sys/fs/cgroup/delegated"},
-            TMP, Limits(), level, {"strongest": mechanism}, None)
+            TMP, limits or Limits(), level, {"strongest": mechanism}, None)
         self.addCleanup(contained.cleanup)
         return contained
 
@@ -228,6 +228,9 @@ class MemoryCgroupPreparationTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"resource": resource}):
             contained.popen_kwargs["preexec_fn"]()
         resource.setrlimit.assert_any_call(9, (2 * 1024 ** 3, 2 * 1024 ** 3))
+        resource.setrlimit.assert_any_call(6, (256, 256))
+        self.assertEqual(contained.level["process_count_mechanism"], "rlimit-nproc")
+        self.assertIn("no delegation", contained.level["process_count_fallback_reason"])
 
     def test_weaker_backend_cannot_expose_writable_controls(self):
         with mock.patch.object(sb.sys, "platform", "linux"), \
@@ -238,7 +241,7 @@ class MemoryCgroupPreparationTests(unittest.TestCase):
         self.assertIn("read-only", contained.level["memory_fallback_reason"])
 
     def test_join_precedes_exec_and_failure_is_not_swallowed(self):
-        guard = mock.Mock(path="/sys/fs/cgroup/delegated/flexfactor-test", swap="disabled")
+        guard = mock.Mock(path="/sys/fs/cgroup/delegated/flexfactor-test", swap="disabled", max_processes=256)
         guard.cleanup.return_value = None
         with mock.patch.object(sb.sys, "platform", "linux"), \
              mock.patch.object(sb, "_MemoryCgroup", return_value=guard):
@@ -249,6 +252,9 @@ class MemoryCgroupPreparationTests(unittest.TestCase):
         guard.join.assert_called_once()
         self.assertNotIn(mock.call(9, (2 * 1024 ** 3, 2 * 1024 ** 3)), resource.setrlimit.call_args_list)
         self.assertEqual(contained.level["memory_mechanism"], "cgroup-v2")
+        self.assertEqual(contained.level["process_count_mechanism"], "cgroup-v2")
+        self.assertEqual(contained.level["process_cgroup_limit"], 256)
+        self.assertNotIn(mock.call(6, (256, 256)), resource.setrlimit.call_args_list)
         ro = ["--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup", "--cap-drop", "ALL"]
         start = contained.argv.index("--cap-drop") - 3
         self.assertEqual(contained.argv[start:start + 5], ro)
@@ -263,6 +269,38 @@ class MemoryCgroupPreparationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sb._MemoryCgroup(directory, 64 * 1024 ** 2)
             self.assertEqual(os.listdir(directory), [])
+
+    def test_process_limit_off_keeps_cpu_limit_and_memory_guard(self):
+        guard = mock.Mock(path="/sys/fs/cgroup/delegated/flexfactor-test", swap="disabled", max_processes=None)
+        guard.cleanup.return_value = None
+        with mock.patch.object(sb.sys, "platform", "linux"), \
+             mock.patch.object(sb, "_MemoryCgroup", return_value=guard) as factory:
+            contained = self._prepare(limits=Limits(max_processes=None, cpu_seconds=3))
+        factory.assert_called_once_with("/sys/fs/cgroup/delegated", 2 * 1024 ** 3, None)
+        resource = mock.Mock(RLIMIT_AS=9, RLIMIT_NPROC=6, RLIMIT_CPU=0)
+        with mock.patch.dict(sys.modules, {"resource": resource}):
+            contained.popen_kwargs["preexec_fn"]()
+        resource.setrlimit.assert_called_once_with(0, (3, 3))
+        self.assertEqual(contained.level["process_count_mechanism"], "off")
+        self.assertEqual(contained.level["memory_mechanism"], "cgroup-v2")
+
+    def test_process_limit_readback_mismatch_cleans_group_and_refuses_it(self):
+        mount = "1 0 0:1 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=mount)), \
+             mock.patch.object(sb.os.path, "realpath", side_effect=lambda p: p), \
+             mock.patch.object(sb.os.path, "commonpath", return_value="/sys/fs/cgroup"), \
+             mock.patch.object(sb.os, "O_DIRECTORY", 0, create=True), \
+             mock.patch.object(sb.os, "O_NOFOLLOW", 0, create=True), \
+             mock.patch.object(sb.os, "stat", return_value=mock.Mock(st_dev=1)), \
+             mock.patch.object(sb.os, "open", return_value=61), \
+             mock.patch.object(sb.os, "mkdir"), \
+             mock.patch.object(sb._MemoryCgroup, "_write") as write, \
+             mock.patch.object(sb._MemoryCgroup, "_read", side_effect=["1024", "max"]), \
+             mock.patch.object(sb._MemoryCgroup, "cleanup", return_value=None) as cleanup:
+            with self.assertRaisesRegex(OSError, "pids.max readback"):
+                sb._MemoryCgroup("/sys/fs/cgroup/delegated", 1024, 5)
+        write.assert_any_call("pids.max", "5")
+        cleanup.assert_called_once()
 
     def test_failed_cleanup_is_idempotent_and_never_removes_relative_to_cwd(self):
         guard = sb._MemoryCgroup.__new__(sb._MemoryCgroup)
@@ -320,7 +358,7 @@ class LinuxMemoryCgroupTests(unittest.TestCase):
         self.assertEqual(cp.returncode, 124, cp.stderr)
 
     def test_target_cannot_raise_limit_or_access_host_proc_with_writable_mounts(self):
-        script = ("import os,sys; p=sys.argv[1]+'/memory.max'; "
+        script = ("import os,sys; "
                   "\nassert not os.path.exists(sys.argv[2]), 'host supervisor root exposed'"
                   "\nstatus=open('/proc/self/status').read()"
                   "\nassert any(line.split()==['NoNewPrivs:', '1'] for line in status.splitlines()), 'privilege elevation permitted'"
@@ -330,9 +368,10 @@ class LinuxMemoryCgroupTests(unittest.TestCase):
                   "\n try: target=os.readlink('/proc/self/fd/'+fd)"
                   "\n except FileNotFoundError: continue"
                   "\n assert not target.startswith('/sys/fs/cgroup'), 'supervisor cgroup descriptor inherited'"
-                  "\ntry:\n open(p,'w').write('max')"
-                  "\nexcept OSError:\n print('PROTECTED')"
-                  "\nelse:\n sys.exit(3)")
+                  "\nfor name in ('memory.max', 'pids.max'):"
+                  "\n try:\n  open(sys.argv[1]+'/'+name,'w').write('max')"
+                  "\n except OSError:\n  print('PROTECTED', name)"
+                  "\n else:\n  sys.exit(3)")
         c = sb.prepare([PY, "-c", script], TMP, dict(os.environ),
                        Limits(memory_bytes=64 * 1024 ** 2, network=True,
                               writable_dirs=["/", "/proc", "/sys"]))
@@ -341,7 +380,8 @@ class LinuxMemoryCgroupTests(unittest.TestCase):
             cp = subprocess.run(c.argv + [c.level["memory_cgroup"], f"/proc/{os.getpid()}/root"], cwd=c.cwd, env=c.env,
                                 capture_output=True, text=True, timeout=20, **c.popen_kwargs)
             self.assertEqual(cp.returncode, 0, cp.stderr)
-            self.assertIn("PROTECTED", cp.stdout)
+            self.assertIn("PROTECTED memory.max", cp.stdout)
+            self.assertIn("PROTECTED pids.max", cp.stdout)
         finally:
             c.cleanup()
         self.assertEqual(c.level["memory_cgroup_cleanup"], "removed")
@@ -487,6 +527,11 @@ class ResourceAbuseTests(unittest.TestCase):
         """)
         cp = sb.run_contained([PY, "-c", child], TMP,
                               limits=Limits(timeout_s=120, max_processes=5))
+        level = cp.flexfactor_containment["level"]
+        if not IS_WIN and os.environ.get("FLEXFACTOR_MEMORY_CGROUP_ROOT") and REP["strongest"] == "bwrap":
+            self.assertEqual(level["process_count_mechanism"], "cgroup-v2", level)
+            self.assertEqual(level["process_cgroup_limit"], 5)
+            self.assertEqual(level["memory_cgroup_cleanup"], "removed")
         self.assertIn("SPAWNED", cp.stdout, f"rc={cp.returncode} err={cp.stderr}")
         parts = cp.stdout.split()
         spawned, failed, alive = int(parts[1]), int(parts[3]), int(parts[5])

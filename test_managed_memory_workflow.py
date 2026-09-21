@@ -37,6 +37,45 @@ class ManagedMemoryWorkflowTests(unittest.TestCase):
                              Path("unused.json"), 1000, 1000)
         mkdir.assert_not_called()
 
+    def test_setup_refuses_missing_parent_pids_without_creating_group(self):
+        helper = self.helper()
+        with mock.patch.object(helper, "verify_cgroup_mount"), \
+             mock.patch.object(Path, "read_text", return_value="memory cpu"), \
+             mock.patch.object(Path, "mkdir") as mkdir:
+            with self.assertRaisesRegex(RuntimeError, "pids.*already enabled"):
+                helper.setup(Path("/sys/fs/cgroup/flexfactor-memory-1-1-tests"),
+                             Path("unused.json"), 1000, 1000)
+        mkdir.assert_not_called()
+
+    def test_setup_delegates_memory_and_pids_only_in_its_own_subtree(self):
+        helper = self.helper()
+        original_read = Path.read_text
+        original_exists = Path.exists
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "own-root"
+            parent_control = base / "cgroup.subtree_control"
+            parent_control.write_text("memory pids", encoding="utf-8")
+            own_control = root / "cgroup.subtree_control"
+
+            def kernel_read(path, *args, **kwargs):
+                return "memory pids" if path == own_control else original_read(path, *args, **kwargs)
+
+            def kernel_exists(path):
+                return path == root / "cgroup.kill" or original_exists(path)
+
+            with mock.patch.object(helper, "BASE", base), \
+                 mock.patch.object(helper, "verify_cgroup_mount"), \
+                 mock.patch.object(Path, "read_text", kernel_read), \
+                 mock.patch.object(Path, "exists", kernel_exists), \
+                 mock.patch.object(helper.os, "chown", create=True) as chown:
+                helper.setup(root, base / "receipt.json", 1000, 1000)
+            self.assertEqual(parent_control.read_text(), "memory pids", "host controller state must not be changed")
+            self.assertEqual(own_control.read_text().split(), ["+memory", "+pids"])
+            self.assertTrue((root / ".supervisor").is_dir())
+            self.assertEqual(chown.call_args_list, [mock.call(path, 1000, 1000) for path in
+                (root, root / "cgroup.procs", own_control, root / ".supervisor/cgroup.procs")])
+
     def test_receipt_validates_and_reads_one_nofollow_descriptor(self):
         helper = self.helper()
         import io
@@ -69,7 +108,7 @@ class ManagedMemoryWorkflowTests(unittest.TestCase):
             root = Path(directory) / "own-root"
             receipt = Path(directory) / "missing-parent" / "receipt.json"
             with mock.patch.object(helper, "verify_cgroup_mount"), \
-                 mock.patch.object(Path, "read_text", return_value="memory"):
+                 mock.patch.object(Path, "read_text", return_value="memory pids"):
                 with self.assertRaises(FileNotFoundError):
                     helper.setup(root, receipt, 1000, 1000)
             self.assertFalse(root.exists(), "failed receipt creation must not strand an unrecorded cgroup")
@@ -117,6 +156,40 @@ class ManagedMemoryWorkflowTests(unittest.TestCase):
              mock.patch.object(sys, "path", sys.path.copy()):
             with self.assertRaisesRegex(RuntimeError, "physical-memory probe failed"):
                 helper.probe()
+
+    def test_probe_refuses_missing_per_task_process_budget(self):
+        helper = self.helper()
+        sandbox = mock.Mock()
+        sandbox.capability_report.return_value = {"strongest": "bwrap"}
+        sandbox.run_contained.return_value = SimpleNamespace(
+            returncode=0, stdout="MEMORY_CONTAINED", stderr="",
+            flexfactor_containment={"level": {"memory_mechanism": "cgroup-v2",
+                "memory_cgroup_cleanup": "removed", "process_count_mechanism": "rlimit-nproc"}})
+        with mock.patch.dict(sys.modules, {"flexfactor_sandbox": sandbox}), \
+             mock.patch.object(sys, "path", sys.path.copy()):
+            with self.assertRaisesRegex(RuntimeError, "physical-memory probe failed"):
+                helper.probe()
+
+    def test_probe_matches_process_budget_to_the_requested_limits(self):
+        helper = self.helper()
+        for recorded, accepted in ((17, True), (256, False), (None, False)):
+            with self.subTest(recorded_process_limit=recorded):
+                sandbox = mock.Mock()
+                sandbox.capability_report.return_value = {"strongest": "bwrap"}
+                sandbox.Limits.return_value = SimpleNamespace(max_processes=17)
+                sandbox.run_contained.return_value = SimpleNamespace(
+                    returncode=0, stdout="MEMORY_CONTAINED", stderr="",
+                    flexfactor_containment={"level": {"memory_mechanism": "cgroup-v2",
+                        "memory_cgroup_cleanup": "removed", "process_count_mechanism": "cgroup-v2",
+                        "process_cgroup_limit": recorded}})
+                with mock.patch.dict(sys.modules, {"flexfactor_sandbox": sandbox}), \
+                     mock.patch.object(sys, "path", sys.path.copy()):
+                    if accepted:
+                        helper.probe()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "physical-memory probe failed"):
+                            helper.probe()
+                self.assertIs(sandbox.run_contained.call_args.kwargs["limits"], sandbox.Limits.return_value)
 
     def test_probe_refuses_missing_bubblewrap_before_running_target(self):
         helper = self.helper()

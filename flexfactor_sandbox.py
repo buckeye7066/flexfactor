@@ -622,7 +622,7 @@ def _prepare_windows_job(argv, env, cwd, limits, level) -> Contained:
 class _MemoryCgroup:
     """One broker-owned cgroup; never remove or configure the delegated parent."""
 
-    def __init__(self, parent: str, memory_bytes: int):
+    def __init__(self, parent: str, memory_bytes: int, max_processes: int | None = None):
         self.parent_fd = self.fd = None
         self.cleanup_error = None
         self.name = "flexfactor-" + uuid.uuid4().hex
@@ -647,6 +647,12 @@ class _MemoryCgroup:
             self._write("memory.max", str(memory_bytes))
             if self._read("memory.max").strip() != str(memory_bytes):
                 raise OSError("memory.max readback did not match the requested limit")
+            self.max_processes = None
+            if max_processes:
+                self._write("pids.max", str(max_processes))
+                if self._read("pids.max").strip() != str(max_processes):
+                    raise OSError("pids.max readback did not match the requested limit")
+                self.max_processes = max_processes
             try:
                 self._write("memory.swap.max", "0")
                 if self._read("memory.swap.max").strip() != "0":
@@ -730,6 +736,7 @@ def _prepare_posix(argv, env, cwd, limits, level, rep, source_root) -> Contained
     mech = rep["strongest"] or "process-group"
     memory_group = None
     level["memory_mechanism"] = "rlimit-as" if limits.memory_bytes else "off"
+    level["process_count_mechanism"] = "rlimit-nproc" if limits.max_processes else "off"
     # Delegation belongs to the supervisor, never to target builds or nested
     # self-tests. Copy even when called directly; preserve owner billing policy.
     env = dict(env)
@@ -739,11 +746,16 @@ def _prepare_posix(argv, env, cwd, limits, level, rep, source_root) -> Contained
             level["memory_fallback_reason"] = "cgroup controls require Linux bwrap read-only mount protection"
         else:
             try:
-                memory_group = _MemoryCgroup(delegation, limits.memory_bytes)
+                memory_group = _MemoryCgroup(delegation, limits.memory_bytes, limits.max_processes)
                 level.update(memory="os-enforced", memory_mechanism="cgroup-v2",
                              memory_cgroup=memory_group.path, memory_swap=memory_group.swap)
+                if memory_group.max_processes is not None:
+                    level.update(process_count="os-enforced", process_count_mechanism="cgroup-v2",
+                                 process_cgroup_limit=memory_group.max_processes)
             except (OSError, ValueError) as exc:
                 level["memory_fallback_reason"] = f"cgroup setup unavailable: {type(exc).__name__}: {exc}"
+        if limits.max_processes and "memory_fallback_reason" in level:
+            level["process_count_fallback_reason"] = level["memory_fallback_reason"]
     wrapped = list(argv)
     if mech == "bwrap":
         bw = [shutil.which("bwrap"), "--unshare-all" if not limits.network else "--unshare-pid",
@@ -778,7 +790,7 @@ def _prepare_posix(argv, env, cwd, limits, level, rep, source_root) -> Contained
             # launch instead of silently executing with unlimited memory.
             resource.setrlimit(resource.RLIMIT_AS, (limits.memory_bytes, limits.memory_bytes))
         try:
-            if limits.max_processes:
+            if limits.max_processes and not (memory_group and memory_group.max_processes is not None):
                 resource.setrlimit(resource.RLIMIT_NPROC,
                                    (limits.max_processes, limits.max_processes))
             if limits.cpu_seconds:

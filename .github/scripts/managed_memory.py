@@ -44,8 +44,10 @@ def read_receipt(receipt):
 
 def setup(root, receipt, uid, gid):
     verify_cgroup_mount()
-    if "memory" not in (BASE / "cgroup.subtree_control").read_text().split():
-        raise RuntimeError("host memory controller must be already enabled; refusing host-wide changes")
+    required = {"memory", "pids"}
+    missing = required - set((BASE / "cgroup.subtree_control").read_text().split())
+    if missing:
+        raise RuntimeError(f"host {', '.join(sorted(missing))} controller must be already enabled; refusing host-wide changes")
     if uid <= 0 or gid < 0:
         raise ValueError("delegation requires an unprivileged supervisor UID")
     if receipt.exists() or receipt.is_symlink():
@@ -62,9 +64,9 @@ def setup(root, receipt, uid, gid):
         root.rmdir()
         raise
     # The delegated parent remains empty; only leaves may contain processes.
-    (root / "cgroup.subtree_control").write_text("+memory")
-    if "memory" not in (root / "cgroup.subtree_control").read_text().split():
-        raise RuntimeError("memory delegation readback failed")
+    (root / "cgroup.subtree_control").write_text("+memory +pids")
+    if not required.issubset((root / "cgroup.subtree_control").read_text().split()):
+        raise RuntimeError("memory/pids delegation readback failed")
     if not (root / "cgroup.kill").exists():
         raise RuntimeError("managed cleanup requires cgroup.kill")
     supervisor = root / ".supervisor"
@@ -134,10 +136,12 @@ def probe():
         raise RuntimeError("managed memory requires a successful bubblewrap namespace probe: "
                            + json.dumps(report, sort_keys=True))
     code = "import pathlib; assert 'NoNewPrivs:\\t1' in pathlib.Path('/proc/self/status').read_text(); print('MEMORY_CONTAINED')"
-    result = sandbox.run_contained([sys.executable, "-c", code], os.getcwd(),
-                                   limits=sandbox.Limits(memory_bytes=128 * 1024 ** 2))
+    limits = sandbox.Limits(memory_bytes=128 * 1024 ** 2)
+    result = sandbox.run_contained([sys.executable, "-c", code], os.getcwd(), limits=limits)
     level = result.flexfactor_containment["level"]
     if (result.returncode != 0 or level.get("memory_mechanism") != "cgroup-v2"
+            or level.get("process_count_mechanism") != "cgroup-v2"
+            or level.get("process_cgroup_limit") != limits.max_processes
             or level.get("memory_cgroup_cleanup") != "removed"
             or "MEMORY_CONTAINED" not in result.stdout):
         raise RuntimeError(f"managed physical-memory probe failed: {level}; {result.stderr}")
