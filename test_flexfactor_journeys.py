@@ -4,11 +4,12 @@
 
 Unit tests need nothing but Python. The integration tests start the fixture app
 (eval_fixtures/journeys/app.js) and drive the real explorer under Playwright;
-when no usable playwright install exists they skip with a BLOCKED reason that
-names every path tried - never a silent pass.
+when no usable Playwright runtime exists they fail with a BLOCKED reason that
+names every path tried. A missing browser is a failed required gate, never a skip or pass.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import shutil
@@ -41,6 +42,11 @@ class ExplorerScriptPathTests(unittest.TestCase):
         self.assertEqual(os.path.basename(p), "flexfactor_explorer.js")
         # Shipped as package data of flexfactor_assets (one source, in the wheel).
         self.assertEqual(os.path.basename(os.path.dirname(p)), "flexfactor_assets")
+
+    def test_missing_playwright_is_a_failure_not_a_skip(self):
+        setup = inspect.getsource(ExplorerIntegrationTests.setUp)
+        self.assertIn("self.fail(self.blocked)", setup)
+        self.assertNotIn("self.skipTest(self.blocked)", setup)
 
     def test_script_parses_as_javascript(self):
         node = shutil.which("node")
@@ -259,7 +265,7 @@ class ExplorerIntegrationTests(unittest.TestCase):
 
     def setUp(self):
         if self.blocked:
-            self.skipTest(self.blocked)
+            self.fail(self.blocked)
         self.fixture = _Fixture(self.node)
         self.addCleanup(self.fixture.stop)
         self.artifacts = tempfile.mkdtemp(prefix="flexfactor-journeys-")
