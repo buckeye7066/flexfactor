@@ -37,6 +37,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from providers.owner_subscription import owner_route_allowed, owner_subscription_only
 
