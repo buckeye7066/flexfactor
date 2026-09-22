@@ -1446,6 +1446,22 @@ def rotation_enabled() -> bool:
         "off", "0", "false", "no")
 
 
+def local_only_enabled() -> bool:
+    """Owner directive: local inference is the default unless explicitly disabled."""
+    return (os.environ.get("FLEXFACTOR_LOCAL_ONLY") or "true").strip().lower() not in (
+        "off", "0", "false", "no")
+
+
+def _is_local_route(route: Route) -> bool:
+    if route.backend.lower() == "ollama" or route.api.lower() == "ollama":
+        return True
+    try:
+        host = urlparse(route.base_url).hostname
+    except Exception:
+        host = None
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 def build_rotator(app: str = "flexfactor",
                   catalog_file: Optional[str] = None,
                   state_file: Optional[str] = None) -> Optional[Rotator]:
@@ -1458,7 +1474,16 @@ def build_rotator(app: str = "flexfactor",
     if not rotation_enabled():
         return None
     catalog = load_catalog(catalog_file)
-    if catalog is None or not catalog.enabled():
+    if catalog is None:
+        return None
+    if local_only_enabled():
+        catalog = Catalog(
+            routes=[route for route in catalog.routes if _is_local_route(route)],
+            generated_at=catalog.generated_at,
+            age_seconds=catalog.age_seconds,
+            path=catalog.path,
+        )
+    if not catalog.enabled():
         return None
     return Rotator(catalog=catalog, store=StateStore(state_file), app=app)
 
